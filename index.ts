@@ -430,6 +430,27 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const replyTracker = new ReplyTracker();
   const pendingIdleMessages: InboundMessageEntry[] = [];
   let inboundFlushTimer: NodeJS.Timeout | null = null;
+  // Asks whose reply waiter timed out or was cancelled. A late inbound message with
+  // `replyTo` set to one of these is a stale answer to a question the agent has already
+  // moved past; surfacing it as a fresh inbound risks the agent acting on stale guidance
+  // (e.g. a worker whose contact_supervisor timed out and re-asked, then receives the
+  // supervisor's reply to the original ask after composing its fallback). Bounded by
+  // STALE_ASKS_MAX_ENTRIES with FIFO eviction so the set cannot grow unboundedly across
+  // a long session.
+  const staleAsks = new Map<string, number>();
+  const STALE_ASKS_MAX_ENTRIES = 256;
+  function recordStaleAsk(replyTo: string): void {
+    if (!replyTo) return;
+    if (staleAsks.has(replyTo)) {
+      staleAsks.delete(replyTo);
+    }
+    staleAsks.set(replyTo, Date.now());
+    while (staleAsks.size > STALE_ASKS_MAX_ENTRIES) {
+      const oldest = staleAsks.keys().next();
+      if (oldest.done) break;
+      staleAsks.delete(oldest.value);
+    }
+  }
   let replyWaiter: {
     from: string;
     replyTo: string;
@@ -445,6 +466,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        // Mark the ask stale so a late reply gets dropped instead of injected as a fresh
+        // inbound after the agent has already moved on.
+        recordStaleAsk(replyTo);
         rejectReplyWaiter(new Error(`No reply from "${from}" within 10 minutes`));
       }, 10 * 60 * 1000);
       const cleanup = () => {
@@ -455,6 +479,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
       };
       const onAbort = () => {
+        // A cancelled ask is just as stale as a timed-out one for the purpose of late-reply
+        // delivery: the agent has decided it is no longer waiting on this answer.
+        recordStaleAsk(replyTo);
         cleanup();
         reject(new Error("Cancelled"));
       };
@@ -651,6 +678,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         replyWaiter.resolve(message);
         return;
       }
+    }
+    // Drop late replies that target an ask whose waiter already timed out or was cancelled.
+    // The agent has moved on; injecting a stale answer as a fresh inbound risks acting on
+    // outdated guidance.
+    if (message.replyTo && staleAsks.has(message.replyTo)) {
+      staleAsks.delete(message.replyTo);
+      return;
     }
     const attachmentText = message.content.attachments?.length
       ? formatAttachments(message.content.attachments)

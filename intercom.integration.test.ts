@@ -815,6 +815,91 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
   }
 });
 
+test("late replies to a cancelled supervisor ask are dropped", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    await withChildOrchestratorEnv({
+      orchestratorTarget: "orchestrator",
+      runId: "abc12345",
+      agent: "worker",
+      index: "0",
+      sessionName: "subagent-worker-abc12345-1",
+    }, async () => {
+      const harness = createExtensionHarness("subagent-worker-abc12345-1");
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
+
+      // Worker asks a supervisor question, then cancels (simulating an internal timeout
+      // that fires before the orchestrator answers).
+      const controller = new AbortController();
+      const supervisorReceives = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const askResultPromise = supervisorTool.execute(
+        "stale-ask",
+        { reason: "need_decision", message: "Should I continue?" },
+        controller.signal,
+        undefined,
+        harness.ctx,
+      );
+      const [askFrom, askMessage] = await supervisorReceives;
+      controller.abort();
+      const askResult = await askResultPromise;
+      assert.equal(askResult.isError, true);
+      assert.match(askResult.content[0]?.text ?? "", /Cancelled/);
+
+      // Snapshot the worker's pi.sendMessage history *before* the late reply lands so we
+      // can assert nothing new gets injected.
+      const sentBefore = harness.sentMessages.length;
+
+      // Orchestrator now answers the (now-stale) ask. Without the stale-ask drop, this
+      // would be injected as a fresh inbound intercom_message turn on the worker side and
+      // could cause the worker to act on the stale answer.
+      const lateReplyDelivered = await orchestrator.send(askFrom.id, {
+        text: "Yes, proceed with option A.",
+        replyTo: askMessage.id,
+      });
+      assert.equal(lateReplyDelivered.delivered, true);
+
+      // Give the worker a moment to process the inbound. The stale-ask drop is synchronous
+      // inside handleIncomingMessage, but the broker round-trip is async.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // No new intercom_message-styled sendMessage should have been injected.
+      const newMessages = harness.sentMessages.slice(sentBefore);
+      const newIntercomInbounds = newMessages.filter((entry) => entry.message.customType === "intercom_message");
+      assert.equal(
+        newIntercomInbounds.length,
+        0,
+        `expected no late intercom_message inbound, got ${newIntercomInbounds.length}: ${JSON.stringify(newIntercomInbounds.map((m) => m.message.content?.slice(0, 80)))}`,
+      );
+
+      // A *fresh* ask after the cancel should still work (regression: the stale-ask set
+      // doesn't poison the next ask cycle).
+      const nextSupervisorReceives = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const nextResultPromise = supervisorTool.execute(
+        "fresh-ask",
+        { reason: "need_decision", message: "Round 2: continue?" },
+        new AbortController().signal,
+        undefined,
+        harness.ctx,
+      );
+      const [from, nextMessage] = await nextSupervisorReceives;
+      assert.match(nextMessage.content.text, /Round 2/);
+      const reply = await orchestrator.send(from.id, { text: "Yes.", replyTo: nextMessage.id });
+      assert.equal(reply.delivered, true);
+      const nextResult = await nextResultPromise;
+      assert.equal(nextResult.isError, false);
+      assert.match(nextResult.content[0]?.text ?? "", /Yes\./);
+
+      await harness.emitLifecycle("session_shutdown");
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
 test("full ask/reply round-trip works with reply target resolved from current turn context", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const replyTracker = new ReplyTracker();
