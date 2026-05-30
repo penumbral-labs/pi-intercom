@@ -5,6 +5,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { ReplyTracker } from "./reply-tracker.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
@@ -129,6 +130,7 @@ function createExtensionHarness(sessionName = "child-worker", options: {
   ui?: unknown;
 } = {}) {
   const events = new EventEmitter();
+  const emittedEvents: Array<{ channel: string; payload: unknown }> = [];
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const tools: CapturedTool[] = [];
@@ -141,7 +143,10 @@ function createExtensionHarness(sessionName = "child-worker", options: {
         events.on(channel, handler);
         return () => events.off(channel, handler);
       },
-      emit: (channel: string, payload: unknown) => events.emit(channel, payload),
+      emit: (channel: string, payload: unknown) => {
+        emittedEvents.push({ channel, payload });
+        return events.emit(channel, payload);
+      },
     },
     on: (event: string, handler: (payload: unknown, ctx: unknown) => unknown) => {
       const handlers = lifecycleHandlers.get(event) ?? [];
@@ -177,6 +182,8 @@ function createExtensionHarness(sessionName = "child-worker", options: {
     commands,
     entries,
     sentMessages,
+    emittedEvents,
+    emitEvent: (channel: string, payload: unknown) => events.emit(channel, payload),
     async emitLifecycle(event: string, payload: unknown = {}, eventContext: unknown = ctx) {
       for (const handler of lifecycleHandlers.get(event) ?? []) {
         await handler(payload, eventContext);
@@ -229,6 +236,25 @@ async function setupClients() {
     await once(broker, "exit").catch(() => undefined);
     throw error;
   }
+}
+
+function waitForCondition(assertion: () => void, timeoutMs = 1000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = () => {
+      try {
+        assertion();
+        resolve();
+      } catch (error) {
+        if (Date.now() >= deadline) {
+          reject(error);
+          return;
+        }
+        setTimeout(check, 10);
+      }
+    };
+    check();
+  });
 }
 
 function waitForReply(client: InstanceType<typeof IntercomClient>, replyTo: string, timeoutMs = 5000): Promise<{ from: SessionInfo; message: Message; }> {
@@ -286,6 +312,39 @@ async function waitForSessionModel(client: InstanceType<typeof IntercomClient>, 
   }
   const sessions = await client.listSessions();
   throw new Error(`Timed out waiting for ${name} model ${model}; saw ${JSON.stringify(sessions.map((session) => ({ name: session.name, model: session.model })))}`);
+}
+
+function liveChildLifecyclePayload(overrides: Partial<{
+  runId: string;
+  agent: string;
+  index: number;
+  intercomSession: string;
+  allowIntercomDetach: boolean;
+}> = {}) {
+  return {
+    runId: "run-detach-1",
+    agent: "worker",
+    index: 0,
+    intercomSession: "subagent-worker-run-detach-1-0",
+    allowIntercomDetach: true,
+    ...overrides,
+  };
+}
+
+function childRegistration(name: string): Omit<SessionInfo, "id"> {
+  return {
+    name,
+    cwd: repoDir,
+    model: "worker-model",
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+    status: "needs_attention",
+  };
+}
+
+function detachRequests(harness: ReturnType<typeof createExtensionHarness>): Array<{ channel: string; payload: unknown }> {
+  return harness.emittedEvents.filter((event) => event.channel === "pi-intercom:detach-request");
 }
 
 test("intercom tool renders compact call and result rows", async () => {
@@ -434,6 +493,248 @@ test("busy interactive sessions idle-gate top-level asks without aborting", { co
     await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
+});
+
+test("busy orchestrator detaches live child broker messages and delivers mid-run", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("orchestrator-detach-accept", { hasUI: true, isIdle: () => false });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "orchestrator-detach-accept");
+    await harness.emitLifecycle("agent_start");
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+    const child = liveChildLifecyclePayload();
+    harness.emitEvent("subagent:foreground-started", child);
+    harness.pi.events.on("pi-intercom:detach-request", (payload: unknown) => {
+      const request = payload as { requestId?: string };
+      if (typeof request.requestId === "string") {
+        harness.emitEvent("pi-intercom:detach-response", { requestId: request.requestId, accepted: true });
+      }
+    });
+
+    harness.emitEvent("pi-intercom:detach-response", { requestId: "unrelated-before-send", accepted: true });
+    const childClient = new IntercomClient();
+    await childClient.connect(childRegistration(child.intercomSession));
+    const orchestrator = await waitForSessionByName(childClient, "orchestrator-detach-accept");
+    const delivered = await childClient.send(orchestrator.id, { text: "Child progress while still working." });
+    assert.equal(delivered.delivered, true);
+
+    await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+    await childClient.disconnect();
+
+    const requests = detachRequests(harness);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0]?.payload, {
+      requestId: (requests[0]?.payload as { requestId: string }).requestId,
+      runId: child.runId,
+      agent: child.agent,
+      index: child.index,
+      intercomSession: child.intercomSession,
+    });
+    assert.equal(typeof (requests[0]?.payload as { requestId?: unknown }).requestId, "string");
+    assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Child progress while still working/);
+    assert.equal(harness.sentMessages[0]?.options?.triggerTurn, true);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("busy orchestrator records detach refusal and falls back to idle queue", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let idle = false;
+  const harness = createExtensionHarness("orchestrator-detach-refused", { hasUI: true, isIdle: () => idle });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "orchestrator-detach-refused");
+    await harness.emitLifecycle("agent_start");
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+    const child = liveChildLifecyclePayload({ intercomSession: "subagent-worker-refused" });
+    harness.emitEvent("subagent:foreground-started", child);
+    harness.pi.events.on("pi-intercom:detach-request", (payload: unknown) => {
+      const request = payload as { requestId?: string };
+      if (typeof request.requestId === "string") {
+        harness.emitEvent("pi-intercom:detach-response", { requestId: request.requestId, accepted: false, reason: "not_started" });
+      }
+    });
+
+    const childClient = new IntercomClient();
+    await childClient.connect(childRegistration(child.intercomSession));
+    const orchestrator = await waitForSessionByName(childClient, "orchestrator-detach-refused");
+    const delivered = await childClient.send(orchestrator.id, { text: "Queue me after refusal." });
+    assert.equal(delivered.delivered, true);
+
+    await waitForCondition(() => assert.equal(harness.entries.length, 1));
+    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(harness.entries[0]?.type, "intercom_detach_refused");
+    assert.equal((harness.entries[0]?.data as { reason?: string }).reason, "not_started");
+    idle = true;
+    await harness.emitLifecycle("agent_end");
+    await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Queue me after refusal/);
+    await childClient.disconnect();
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("busy orchestrator records detach timeout and falls back to idle queue", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let idle = false;
+  const harness = createExtensionHarness("orchestrator-detach-timeout", { hasUI: true, isIdle: () => idle });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "orchestrator-detach-timeout");
+    await harness.emitLifecycle("agent_start");
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+    const child = liveChildLifecyclePayload({ intercomSession: "subagent-worker-timeout" });
+    harness.emitEvent("subagent:foreground-started", child);
+
+    const childClient = new IntercomClient();
+    await childClient.connect(childRegistration(child.intercomSession));
+    const orchestrator = await waitForSessionByName(childClient, "orchestrator-detach-timeout");
+    const delivered = await childClient.send(orchestrator.id, { text: "Queue me after timeout." });
+    assert.equal(delivered.delivered, true);
+
+    await waitForCondition(() => assert.equal(harness.entries.length, 1), 1000);
+    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(harness.entries[0]?.type, "intercom_detach_timeout");
+    assert.equal((harness.entries[0]?.data as { reason?: string }).reason, undefined);
+    idle = true;
+    await harness.emitLifecycle("agent_end");
+    await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Queue me after timeout/);
+    await childClient.disconnect();
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("busy orchestrator does not detach non-child broker peers", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let idle = false;
+  const harness = createExtensionHarness("orchestrator-non-child", { hasUI: true, isIdle: () => idle });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "orchestrator-non-child");
+    await harness.emitLifecycle("agent_start");
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+
+    const peerClient = new IntercomClient();
+    await peerClient.connect(childRegistration("human-peer"));
+    const orchestrator = await waitForSessionByName(peerClient, "orchestrator-non-child");
+    const delivered = await peerClient.send(orchestrator.id, { text: "Peer should still queue." });
+    assert.equal(delivered.delivered, true);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(detachRequests(harness).length, 0);
+    assert.equal(harness.sentMessages.length, 0);
+    idle = true;
+    await harness.emitLifecycle("agent_end");
+    await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Peer should still queue/);
+    await peerClient.disconnect();
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("busy orchestrator stops detaching child after foreground-ended and tool end eviction", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let idle = false;
+  const harness = createExtensionHarness("orchestrator-detach-evict", { hasUI: true, isIdle: () => idle });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "orchestrator-detach-evict");
+    await harness.emitLifecycle("agent_start");
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+    const endedChild = liveChildLifecyclePayload({ intercomSession: "subagent-worker-ended" });
+    harness.emitEvent("subagent:foreground-started", endedChild);
+    harness.emitEvent("subagent:foreground-ended", endedChild);
+
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-2", toolName: "subagent" });
+    const toolEndedChild = liveChildLifecyclePayload({ runId: "run-detach-2", intercomSession: "subagent-worker-tool-ended" });
+    harness.emitEvent("subagent:foreground-started", toolEndedChild);
+    await harness.emitLifecycle("tool_execution_end", { toolCallId: "subagent-tool-2", toolName: "subagent" });
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-3", toolName: "subagent" });
+
+    const endedClient = new IntercomClient();
+    const toolEndedClient = new IntercomClient();
+    await endedClient.connect(childRegistration(endedChild.intercomSession));
+    await toolEndedClient.connect(childRegistration(toolEndedChild.intercomSession));
+    const orchestrator = await waitForSessionByName(endedClient, "orchestrator-detach-evict");
+    assert.equal((await endedClient.send(orchestrator.id, { text: "Ended child should queue." })).delivered, true);
+    assert.equal((await toolEndedClient.send(orchestrator.id, { text: "Tool-ended child should queue." })).delivered, true);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(detachRequests(harness).length, 0);
+    assert.equal(harness.sentMessages.length, 0);
+    idle = true;
+    await harness.emitLifecycle("agent_end");
+    await waitForCondition(() => assert.equal(harness.sentMessages.length, 2));
+    await endedClient.disconnect();
+    await toolEndedClient.disconnect();
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("local subagent relay requests detach before delivery", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("orchestrator-local-relay", { hasUI: true, isIdle: () => false });
+  piIntercomExtension(harness.pi as never);
+  await harness.emitLifecycle("session_start");
+  await harness.emitLifecycle("agent_start");
+  await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+  const child = liveChildLifecyclePayload({ runId: "run-relay", intercomSession: "subagent-worker-run-relay-0" });
+  harness.emitEvent("subagent:foreground-started", child);
+  harness.pi.events.on("pi-intercom:detach-request", (payload: unknown) => {
+    const request = payload as { requestId?: string };
+    if (typeof request.requestId === "string") {
+      harness.emitEvent("pi-intercom:detach-response", { requestId: request.requestId, accepted: true });
+    }
+  });
+
+  harness.emitEvent("subagent:result-intercom", {
+    to: "orchestrator-local-relay",
+    requestId: "result-ack-1",
+    runId: child.runId,
+    agent: child.agent,
+    index: child.index,
+    message: "Local relay progress while busy.",
+  });
+
+  await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+  const requests = detachRequests(harness);
+  assert.equal(requests.length, 1);
+  assert.equal((requests[0]?.payload as { runId?: string }).runId, child.runId);
+  assert.equal((requests[0]?.payload as { intercomSession?: string }).intercomSession, child.intercomSession);
+  assert.match(harness.sentMessages[0]?.message.content ?? "", /Local relay progress while busy/);
+  assert.deepEqual(
+    harness.emittedEvents.filter((event) => event.channel === "subagent:result-intercom-delivery").map((event) => event.payload),
+    [{ requestId: "result-ack-1", delivered: true }],
+  );
+  await harness.emitLifecycle("session_shutdown");
 });
 
 test("deferred startup connect is cancelled on shutdown", { concurrency: false }, async () => {
