@@ -14,6 +14,10 @@ import { ReplyTracker } from "./reply-tracker.ts";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
+const INTERCOM_DETACH_REQUEST_EVENT = "pi-intercom:detach-request";
+const INTERCOM_DETACH_RESPONSE_EVENT = "pi-intercom:detach-response";
+const SUBAGENT_FOREGROUND_STARTED_EVENT = "subagent:foreground-started";
+const SUBAGENT_FOREGROUND_ENDED_EVENT = "subagent:foreground-ended";
 const INBOUND_FLUSH_DELAY_MS = 200;
 const INBOUND_IDLE_RETRY_MS = 500;
 const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
@@ -36,6 +40,41 @@ interface InboundMessageEntry {
   message: Message;
   replyCommand?: string;
   bodyText: string;
+}
+
+interface ParsedSubagentIntercomPayload {
+  to: string;
+  message: string;
+  requestId?: string;
+  runId?: string;
+  agent?: string;
+  index?: number;
+}
+
+type IntercomDetachRefusalReason = "not_allowed" | "not_started" | "already_detached" | "already_closed" | "target_mismatch";
+
+interface IntercomDetachRequest {
+  requestId: string;
+  runId?: string;
+  agent?: string;
+  index?: number;
+  intercomSession?: string;
+}
+
+type IntercomDetachResponse =
+  | { requestId: string; accepted: true }
+  | { requestId: string; accepted: false; reason: IntercomDetachRefusalReason };
+
+interface SubagentForegroundLifecycle {
+  runId: string;
+  agent: string;
+  index?: number;
+  intercomSession: string;
+  allowIntercomDetach: boolean;
+}
+
+interface LiveSubagentChild extends SubagentForegroundLifecycle {
+  toolCallId: string;
 }
 
 type ContactSupervisorReason = "need_decision" | "progress_update" | "interview_request";
@@ -357,7 +396,7 @@ function duplicateSessionNames(sessions: SessionInfo[]): Set<string> {
 function shortSessionId(sessionId: string): string {
   return sessionId.slice(0, 8);
 }
-function parseSubagentIntercomPayload(payload: unknown): { to: string; message: string; requestId?: string } | null {
+function parseSubagentIntercomPayload(payload: unknown): ParsedSubagentIntercomPayload | null {
   if (typeof payload !== "object" || payload === null) {
     return null;
   }
@@ -366,7 +405,17 @@ function parseSubagentIntercomPayload(payload: unknown): { to: string; message: 
     return null;
   }
   const requestId = typeof record.requestId === "string" ? record.requestId : undefined;
-  return { to: record.to, message: record.message, ...(requestId ? { requestId } : {}) };
+  const runId = typeof record.runId === "string" ? record.runId : undefined;
+  const agent = typeof record.agent === "string" ? record.agent : undefined;
+  const index = typeof record.index === "number" && Number.isFinite(record.index) ? record.index : undefined;
+  return {
+    to: record.to,
+    message: record.message,
+    ...(requestId ? { requestId } : {}),
+    ...(runId ? { runId } : {}),
+    ...(agent ? { agent } : {}),
+    ...(index !== undefined ? { index } : {}),
+  };
 }
 function resolveIntercomPresenceName(sessionName: string | undefined, sessionId: string): string {
   const trimmedName = sessionName?.trim();
@@ -427,6 +476,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let runtimeGeneration = 0;
   let agentRunning = false;
   const activeTools = new Map<string, string>();
+  const activeSubagentCalls = new Set<string>();
+  const liveSubagentChildren = new Map<string, LiveSubagentChild>();
   const replyTracker = new ReplyTracker();
   const pendingIdleMessages: InboundMessageEntry[] = [];
   let inboundFlushTimer: NodeJS.Timeout | null = null;
@@ -588,6 +639,73 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     client.updatePresence({ status: currentStatus() });
   }
+  function resetSubagentDetachState(): void {
+    activeSubagentCalls.clear();
+    liveSubagentChildren.clear();
+  }
+  function childSessionName(from: SessionInfo): string | null {
+    const trimmed = from.name?.trim();
+    return trimmed || null;
+  }
+  function lookupLiveSubagentChild(fromOrSession: SessionInfo | string): LiveSubagentChild | null {
+    const intercomSession = typeof fromOrSession === "string" ? fromOrSession.trim() : childSessionName(fromOrSession);
+    if (!intercomSession) {
+      return null;
+    }
+    return liveSubagentChildren.get(intercomSession) ?? null;
+  }
+  function lookupRelaySubagentChild(parsed: ParsedSubagentIntercomPayload): LiveSubagentChild | null {
+    if (!parsed.runId) {
+      return null;
+    }
+    for (const child of liveSubagentChildren.values()) {
+      if (
+        child.runId === parsed.runId
+        && (parsed.agent === undefined || child.agent === parsed.agent)
+        && (parsed.index === undefined || child.index === parsed.index)
+      ) {
+        return child;
+      }
+    }
+    return null;
+  }
+  function findActiveSubagentToolCallId(): string | null {
+    const assignedToolCallIds = new Set(Array.from(liveSubagentChildren.values(), child => child.toolCallId));
+    const newestFirst = Array.from(activeSubagentCalls).reverse();
+    for (const toolCallId of newestFirst) {
+      if (!assignedToolCallIds.has(toolCallId) && activeTools.get(toolCallId) === "subagent") {
+        return toolCallId;
+      }
+    }
+    return null;
+  }
+  function canRequestSubagentDetach(child: LiveSubagentChild | null): child is LiveSubagentChild {
+    return Boolean(
+      child
+      && activeSubagentCalls.size > 0
+      && child.allowIntercomDetach
+      && activeSubagentCalls.has(child.toolCallId)
+      && activeTools.get(child.toolCallId) === "subagent"
+    );
+  }
+  function evictLiveSubagentChildByToolCall(toolCallId: string): void {
+    for (const [intercomSession, child] of liveSubagentChildren) {
+      if (child.toolCallId === toolCallId) {
+        liveSubagentChildren.delete(intercomSession);
+      }
+    }
+  }
+  function isSubagentForegroundLifecycle(payload: unknown): payload is SubagentForegroundLifecycle {
+    if (typeof payload !== "object" || payload === null) {
+      return false;
+    }
+    const record = payload as Record<string, unknown>;
+    return typeof record.runId === "string"
+      && typeof record.agent === "string"
+      && (record.index === undefined || (typeof record.index === "number" && Number.isFinite(record.index)))
+      && typeof record.intercomSession === "string"
+      && typeof record.allowIntercomDetach === "boolean";
+  }
   function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: IntercomClient): boolean {
     const targets = new Set<string>();
     const addTarget = (target: string | undefined | null) => {
@@ -663,6 +781,72 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     pendingIdleMessages.push(entry);
     scheduleInboundFlush();
   }
+  async function requestSubagentDetach(
+    target: { runId: string; agent?: string; index?: number; intercomSession: string },
+    timeoutMs = 250,
+  ): Promise<{ accepted: boolean; reason?: IntercomDetachRefusalReason; requestId: string }> {
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result: { accepted: boolean; reason?: IntercomDetachRefusalReason; requestId: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        off();
+        resolve(result);
+      };
+      const off = pi.events.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload: unknown) => {
+        if (typeof payload !== "object" || payload === null) return;
+        const response = payload as Partial<IntercomDetachResponse>;
+        if (response.requestId !== requestId) return;
+        if (response.accepted === true) {
+          finish({ accepted: true, requestId });
+          return;
+        }
+        if (response.accepted === false && typeof response.reason === "string") {
+          if (response.reason === "target_mismatch") {
+            return;
+          }
+          finish({ accepted: false, reason: response.reason as IntercomDetachRefusalReason, requestId });
+        }
+      });
+      const timer = setTimeout(() => {
+        finish({ accepted: false, requestId });
+      }, timeoutMs);
+      const request: IntercomDetachRequest = { requestId, ...target };
+      pi.events.emit(INTERCOM_DETACH_REQUEST_EVENT, request);
+    });
+  }
+  function recordSubagentDetachFallback(
+    entryType: "intercom_detach_refused" | "intercom_detach_timeout",
+    result: { reason?: IntercomDetachRefusalReason; requestId: string },
+    target: { runId: string; agent?: string; index?: number; intercomSession: string },
+  ): void {
+    pi.appendEntry(entryType, {
+      ...(result.reason ? { reason: result.reason } : {}),
+      requestId: result.requestId,
+      target,
+      timestamp: Date.now(),
+    });
+  }
+  async function requestDetachForLiveChild(child: LiveSubagentChild): Promise<{ accepted: true } | { accepted: false }> {
+    const target = {
+      runId: child.runId,
+      ...(child.agent ? { agent: child.agent } : {}),
+      ...(child.index !== undefined ? { index: child.index } : {}),
+      intercomSession: child.intercomSession,
+    };
+    const result = await requestSubagentDetach(target);
+    if (!result.accepted) {
+      recordSubagentDetachFallback(
+        result.reason ? "intercom_detach_refused" : "intercom_detach_timeout",
+        result,
+        target,
+      );
+      return { accepted: false };
+    }
+    return { accepted: true };
+  }
   function handleIncomingMessage(ctx: ExtensionContext, from: SessionInfo, message: Message): void {
     const messageGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, messageGeneration);
@@ -701,6 +885,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (!activeContext.isIdle()) {
+        const liveChild = lookupLiveSubagentChild(from);
+        if (canRequestSubagentDetach(liveChild)) {
+          const detach = await requestDetachForLiveChild(liveChild);
+          if (!getLiveContext(liveContext, messageGeneration)) {
+            return;
+          }
+          if (detach.accepted) {
+            sendIncomingMessage(entry, "trigger", messageGeneration);
+            return;
+          }
+        }
         if (!activeContext.hasUI) {
           const activeClient = client;
           if (!message.replyTo && activeClient?.isConnected()) {
@@ -883,6 +1078,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (currentSessionTargetMatches(parsed.to)) {
+        const liveChild = lookupRelaySubagentChild(parsed);
+        if (canRequestSubagentDetach(liveChild)) {
+          await requestDetachForLiveChild(liveChild);
+          if (!relayStillLive()) {
+            return;
+          }
+        }
         deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
         return;
@@ -904,6 +1106,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (currentSessionTargetMatches(parsed.to, target, activeClient)) {
+        const liveChild = lookupRelaySubagentChild(parsed);
+        if (canRequestSubagentDetach(liveChild)) {
+          await requestDetachForLiveChild(liveChild);
+          if (!relayStillLive()) {
+            return;
+          }
+        }
         deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
         return;
@@ -941,6 +1150,22 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       acknowledge: true,
     });
   });
+  pi.events.on(SUBAGENT_FOREGROUND_STARTED_EVENT, (payload) => {
+    if (!isSubagentForegroundLifecycle(payload)) {
+      return;
+    }
+    const toolCallId = findActiveSubagentToolCallId();
+    if (!toolCallId) {
+      return;
+    }
+    liveSubagentChildren.set(payload.intercomSession, { ...payload, toolCallId });
+  });
+  pi.events.on(SUBAGENT_FOREGROUND_ENDED_EVENT, (payload) => {
+    if (!isSubagentForegroundLifecycle(payload)) {
+      return;
+    }
+    liveSubagentChildren.delete(payload.intercomSession);
+  });
   pi.on("session_start", (_event, ctx) => {
     if (!config.enabled) {
       return;
@@ -958,6 +1183,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     sessionStartedAt = Date.now();
     agentRunning = false;
     activeTools.clear();
+    resetSubagentDetachState();
     const startupGeneration = runtimeGeneration;
     startupConnectTimer = setTimeout(() => {
       startupConnectTimer = null;
@@ -986,6 +1212,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     clearInboundFlushTimer();
     agentRunning = false;
     activeTools.clear();
+    resetSubagentDetachState();
     if (client) {
       await client.disconnect();
       client = null;
@@ -1007,6 +1234,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     agentRunning = true;
     activeTools.clear();
+    resetSubagentDetachState();
     syncPresenceStatus();
   });
   pi.on("tool_execution_start", (event) => {
@@ -1014,6 +1242,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     activeTools.set(event.toolCallId, event.toolName);
+    if (event.toolName === "subagent") {
+      activeSubagentCalls.add(event.toolCallId);
+    }
     syncPresenceStatus();
   });
   pi.on("tool_execution_end", (event) => {
@@ -1021,6 +1252,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     activeTools.delete(event.toolCallId);
+    activeSubagentCalls.delete(event.toolCallId);
+    evictLiveSubagentChildByToolCall(event.toolCallId);
     syncPresenceStatus();
   });
   pi.on("agent_end", () => {
@@ -1029,6 +1262,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     agentRunning = false;
     activeTools.clear();
+    resetSubagentDetachState();
     syncPresenceStatus();
     scheduleInboundFlush(0);
   });

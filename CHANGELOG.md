@@ -4,6 +4,9 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Foreground subagent intercom messages now request the pi-subagents detach handshake so eligible child updates can wake the orchestrator mid-run instead of waiting behind the active `subagent` tool call.
+
 ## [0.6.0] - 2026-05-03
 
 ### Added
