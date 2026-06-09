@@ -669,11 +669,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return null;
   }
-  function findActiveSubagentToolCallId(): string | null {
-    const assignedToolCallIds = new Set(Array.from(liveSubagentChildren.values(), child => child.toolCallId));
+  function resolveSubagentToolCallId(runId: string): string | null {
+    // Parallel children of one `subagent({ tasks: [...] })` call share a runId and a
+    // single tool call, but each emits its own foreground-started event. Siblings must
+    // map to the same tool call so every parallel child becomes detach-eligible.
+    for (const child of liveSubagentChildren.values()) {
+      if (child.runId === runId) {
+        return child.toolCallId;
+      }
+    }
+    // A genuinely new run claims the newest active subagent tool call not already owned
+    // by another run, so overlapping single-child calls stay disambiguated.
+    const claimedByOtherRun = new Set(Array.from(liveSubagentChildren.values(), child => child.toolCallId));
     const newestFirst = Array.from(activeSubagentCalls).reverse();
     for (const toolCallId of newestFirst) {
-      if (!assignedToolCallIds.has(toolCallId) && activeTools.get(toolCallId) === "subagent") {
+      if (!claimedByOtherRun.has(toolCallId) && activeTools.get(toolCallId) === "subagent") {
         return toolCallId;
       }
     }
@@ -1154,7 +1164,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!isSubagentForegroundLifecycle(payload)) {
       return;
     }
-    const toolCallId = findActiveSubagentToolCallId();
+    const toolCallId = resolveSubagentToolCallId(payload.runId);
     if (!toolCallId) {
       return;
     }

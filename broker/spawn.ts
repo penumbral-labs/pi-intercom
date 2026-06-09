@@ -101,6 +101,19 @@ export function getBrokerLaunchSpec(
     };
   }
 
+  if (usesDefaultBrokerCommand(brokerCommand, brokerArgs)) {
+    // Launch tsx through node's --import loader instead of `npx --no-install tsx`.
+    // npx routes through `npm exec`, which forks an extra npm process plus a tsx
+    // CLI process before the broker ever starts. `node --import tsx broker.ts`
+    // runs the broker as a single node process (plus tsx's esbuild child), so the
+    // broker stops presenting as an ownerless multi-process swarm.
+    return {
+      kind: "direct",
+      command: nodePath,
+      args: ["--import", "tsx", brokerPath],
+    };
+  }
+
   return {
     kind: "direct",
     command: brokerCommand,
