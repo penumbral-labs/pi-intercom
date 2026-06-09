@@ -23,6 +23,7 @@ const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
 const { IntercomClient } = await import("./broker/client.ts");
+const { getBrokerLaunchSpec, getTsxCliPath } = await import("./broker/spawn.ts");
 process.on("exit", () => {
   process.env.HOME = previousHome;
   process.env.USERPROFILE = previousUserProfile;
@@ -192,8 +193,21 @@ function createExtensionHarness(sessionName = "child-worker", options: {
   };
 }
 
+function brokerSpawnArgs(brokerPath: string): { command: string; args: string[] } {
+  // Exercise the production launch path so this suite catches launch-spec
+  // regressions instead of hardcoding its own command.
+  const launch = getBrokerLaunchSpec(brokerPath, "npx", ["--no-install", "tsx"], repoDir);
+  if (launch.kind === "direct") {
+    return { command: launch.command, args: launch.args };
+  }
+  // Windows production uses a hidden VBS launcher whose stdout this harness
+  // cannot read; run the same node + tsx CLI command the launcher wraps.
+  return { command: process.execPath, args: [getTsxCliPath(repoDir), brokerPath] };
+}
+
 async function setupClients() {
-  const broker = spawn("npx", ["--no-install", "tsx", path.join(repoDir, "broker", "broker.ts")], {
+  const { command, args } = brokerSpawnArgs(path.join(repoDir, "broker", "broker.ts"));
+  const broker = spawn(command, args, {
     cwd: repoDir,
     env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
     stdio: ["ignore", "pipe", "pipe"],
@@ -734,6 +748,93 @@ test("local subagent relay requests detach before delivery", async () => {
     harness.emittedEvents.filter((event) => event.channel === "subagent:result-intercom-delivery").map((event) => event.payload),
     [{ requestId: "result-ack-1", delivered: true }],
   );
+  await harness.emitLifecycle("session_shutdown");
+});
+
+test("busy orchestrator detaches every parallel child sharing one subagent tool call", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("orchestrator-detach-parallel", { hasUI: true, isIdle: () => false });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "orchestrator-detach-parallel");
+    await harness.emitLifecycle("agent_start");
+    // One parallel `subagent({ tasks: [...] })` call = one toolCallId, two children
+    // sharing a runId, each emitting its own foreground-started event.
+    await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+    const firstChild = liveChildLifecyclePayload({ runId: "run-parallel", index: 0, intercomSession: "subagent-worker-run-parallel-1" });
+    const secondChild = liveChildLifecyclePayload({ runId: "run-parallel", index: 1, intercomSession: "subagent-worker-run-parallel-2" });
+    harness.emitEvent("subagent:foreground-started", firstChild);
+    harness.emitEvent("subagent:foreground-started", secondChild);
+    harness.pi.events.on("pi-intercom:detach-request", (payload: unknown) => {
+      const request = payload as { requestId?: string };
+      if (typeof request.requestId === "string") {
+        harness.emitEvent("pi-intercom:detach-response", { requestId: request.requestId, accepted: true });
+      }
+    });
+
+    // Message from the SECOND sibling: pre-fix this child never registered (its
+    // toolCallId was already claimed by the first), so it could not detach.
+    const secondClient = new IntercomClient();
+    await secondClient.connect(childRegistration(secondChild.intercomSession));
+    const orchestrator = await waitForSessionByName(secondClient, "orchestrator-detach-parallel");
+    assert.equal((await secondClient.send(orchestrator.id, { text: "Second parallel child progress." })).delivered, true);
+
+    await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+    await secondClient.disconnect();
+
+    const requests = detachRequests(harness);
+    assert.equal(requests.length, 1);
+    assert.equal((requests[0]?.payload as { intercomSession?: string }).intercomSession, secondChild.intercomSession);
+    assert.equal((requests[0]?.payload as { index?: number }).index, secondChild.index);
+    assert.equal((requests[0]?.payload as { runId?: string }).runId, secondChild.runId);
+    assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Second parallel child progress/);
+    assert.equal(harness.sentMessages[0]?.options?.triggerTurn, true);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("local subagent relay still delivers and records fallback when detach is refused", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("orchestrator-relay-refused", { hasUI: true, isIdle: () => false });
+  piIntercomExtension(harness.pi as never);
+  await harness.emitLifecycle("session_start");
+  await harness.emitLifecycle("agent_start");
+  await harness.emitLifecycle("tool_execution_start", { toolCallId: "subagent-tool-1", toolName: "subagent" });
+  const child = liveChildLifecyclePayload({ runId: "run-relay-refused", intercomSession: "subagent-worker-run-relay-refused-1" });
+  harness.emitEvent("subagent:foreground-started", child);
+  harness.pi.events.on("pi-intercom:detach-request", (payload: unknown) => {
+    const request = payload as { requestId?: string };
+    if (typeof request.requestId === "string") {
+      harness.emitEvent("pi-intercom:detach-response", { requestId: request.requestId, accepted: false, reason: "already_detached" });
+    }
+  });
+
+  harness.emitEvent("subagent:result-intercom", {
+    to: "orchestrator-relay-refused",
+    requestId: "result-ack-refused",
+    runId: child.runId,
+    agent: child.agent,
+    index: child.index,
+    message: "Relay progress despite refused detach.",
+  });
+
+  // Relays deliver regardless of detach outcome; refusal only records a fallback entry.
+  await waitForCondition(() => assert.equal(harness.sentMessages.length, 1));
+  assert.equal(detachRequests(harness).length, 1);
+  assert.match(harness.sentMessages[0]?.message.content ?? "", /Relay progress despite refused detach/);
+  assert.deepEqual(
+    harness.emittedEvents.filter((event) => event.channel === "subagent:result-intercom-delivery").map((event) => event.payload),
+    [{ requestId: "result-ack-refused", delivered: true }],
+  );
+  const fallbackEntries = harness.entries.filter((entry) => entry.type === "intercom_detach_refused");
+  assert.equal(fallbackEntries.length, 1);
+  assert.equal((fallbackEntries[0]?.data as { reason?: string }).reason, "already_detached");
   await harness.emitLifecycle("session_shutdown");
 });
 
