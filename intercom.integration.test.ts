@@ -14,6 +14,7 @@ const childEnvKeys = [
   "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID",
   "PI_INTERCOM_SESSION_ID",
   "PI_INTERCOM_NAME_POLL_MS",
+  "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
   "PI_SUBAGENT_RUN_ID",
   "PI_SUBAGENT_CHILD_AGENT",
   "PI_SUBAGENT_CHILD_INDEX",
@@ -65,6 +66,7 @@ async function withChildOrchestratorEnv<T>(metadata: {
   orchestratorSessionId?: string;
   inheritedIntercomSessionId?: string;
   namePollMs?: string;
+  supervisorChannelDir?: string;
   runId?: string;
   agent?: string;
   index?: string;
@@ -79,6 +81,7 @@ async function withChildOrchestratorEnv<T>(metadata: {
   if (metadata.orchestratorSessionId !== undefined) process.env.PI_SUBAGENT_ORCHESTRATOR_SESSION_ID = metadata.orchestratorSessionId;
   if (metadata.inheritedIntercomSessionId !== undefined) process.env.PI_INTERCOM_SESSION_ID = metadata.inheritedIntercomSessionId;
   if (metadata.namePollMs !== undefined) process.env.PI_INTERCOM_NAME_POLL_MS = metadata.namePollMs;
+  if (metadata.supervisorChannelDir !== undefined) process.env.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR = metadata.supervisorChannelDir;
   if (metadata.runId !== undefined) process.env.PI_SUBAGENT_RUN_ID = metadata.runId;
   if (metadata.agent !== undefined) process.env.PI_SUBAGENT_CHILD_AGENT = metadata.agent;
   if (metadata.index !== undefined) process.env.PI_SUBAGENT_CHILD_INDEX = metadata.index;
@@ -128,6 +131,20 @@ const renderTheme: RenderTheme = {
 
 function renderToText(component: RenderedComponent): string {
   return component.render(120).map((line) => line.trimEnd()).join("\n");
+}
+
+async function withCapturedIntercomClients<T>(fn: (clients: Array<InstanceType<typeof IntercomClient>>) => T | Promise<T>): Promise<T> {
+  const clients: Array<InstanceType<typeof IntercomClient>> = [];
+  const originalConnect = IntercomClient.prototype.connect;
+  IntercomClient.prototype.connect = async function(this: InstanceType<typeof IntercomClient>, ...args: Parameters<InstanceType<typeof IntercomClient>["connect"]>) {
+    await originalConnect.apply(this, args);
+    clients.push(this);
+  } as InstanceType<typeof IntercomClient>["connect"];
+  try {
+    return await fn(clients);
+  } finally {
+    IntercomClient.prototype.connect = originalConnect;
+  }
 }
 
 function createExtensionHarness(sessionName: string | (() => string) = "child-worker", options: {
@@ -1191,6 +1208,85 @@ test("supervisor tool registers only when child metadata is present", async () =
   });
 });
 
+test("complete native Subagents supervisor metadata leaves contact_supervisor to Subagents", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+
+  await withChildOrchestratorEnv({
+    orchestratorTarget: "orchestrator",
+    supervisorChannelDir: "/tmp/pi-subagents-supervisor",
+    orchestratorSessionId: "orchestrator-session-id",
+    runId: "78f659a3",
+    agent: "worker",
+    index: "0",
+    sessionName: "subagent-worker-78f659a3-1",
+  }, () => {
+    const harness = createExtensionHarness();
+    piIntercomExtension(harness.pi as never);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom"]);
+  });
+});
+
+test("generic intercom remains operational with complete native supervisor metadata", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    await withChildOrchestratorEnv({
+      supervisorChannelDir: "/tmp/pi-subagents-supervisor",
+      orchestratorSessionId: "orchestrator-session-id",
+      runId: "78f659a3",
+      agent: "worker",
+      index: "0",
+    }, async () => {
+      const harness = createExtensionHarness("native-child-intercom-worker");
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom"]);
+
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const received = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const result = await intercomTool.execute("send-under-native-metadata", { action: "send", to: "orchestrator", message: "Generic intercom still works." }, new AbortController().signal, undefined, harness.ctx);
+      assert.notEqual(result.details?.error, true);
+      const [, message] = await received;
+      assert.equal(message.content.text, "Generic intercom still works.");
+      await harness.emitLifecycle("session_shutdown");
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("partial native Subagents supervisor metadata keeps intercom contact_supervisor fallback", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+
+  await withChildOrchestratorEnv({
+    orchestratorTarget: "orchestrator",
+    supervisorChannelDir: "/tmp/pi-subagents-supervisor",
+    orchestratorSessionId: "orchestrator-session-id",
+    runId: "78f659a3",
+    agent: "worker",
+    index: "not-a-number",
+    sessionName: "subagent-worker-78f659a3-1",
+  }, () => {
+    const harness = createExtensionHarness();
+    piIntercomExtension(harness.pi as never);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom"]);
+  });
+
+  await withChildOrchestratorEnv({
+    orchestratorTarget: "orchestrator",
+    supervisorChannelDir: "/tmp/pi-subagents-supervisor",
+    runId: "78f659a3",
+    agent: "worker",
+    index: "0",
+    sessionName: "subagent-worker-78f659a3-1",
+  }, () => {
+    const harness = createExtensionHarness();
+    piIntercomExtension(harness.pi as never);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom"]);
+  });
+});
+
 test("child supervisor tool resolves target and includes run metadata", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
@@ -1604,6 +1700,61 @@ test("regular intercom ask cancellation clears broker mutual-ask edge", { concur
   }
 });
 
+test("late replies to a cancelled intercom ask are dropped", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    const harness = createExtensionHarness("cancelled-late-reply-worker");
+    await withCapturedIntercomClients(async (clients) => {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+      const controller = new AbortController();
+      const cancelledMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const cancelledResultPromise = intercomTool.execute("ask-cancelled", { action: "ask", to: "orchestrator", message: "Should I continue?" }, controller.signal, undefined, harness.ctx);
+      const [from, message] = await cancelledMessage;
+      controller.abort();
+      const cancelledResult = await cancelledResultPromise;
+      assert.equal(cancelledResult.details?.error, true);
+      assert.match(cancelledResult.content[0]?.text ?? "", /Cancelled/);
+
+      const workerClient = clients.find((candidate) => candidate.sessionId === from.id);
+      assert.ok(workerClient);
+
+      const sentBefore = harness.sentMessages.length;
+      const pendingBeforeReply = await intercomTool.execute("pending-before-late-reply", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+      workerClient.emit("message", {
+        id: orchestrator.sessionId!,
+        name: "orchestrator",
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      } satisfies SessionInfo, {
+        id: "late-cancelled-reply",
+        timestamp: Date.now(),
+        replyTo: message.id,
+        content: { text: "Late answer." },
+      } satisfies Message);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const pendingAfterReply = await intercomTool.execute("pending-after-late-reply", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(pendingBeforeReply.content[0]?.text ?? "", /No unresolved inbound asks/);
+      assert.match(pendingAfterReply.content[0]?.text ?? "", /No unresolved inbound asks/);
+      const newInboundMessages = harness.sentMessages
+        .slice(sentBefore)
+        .filter((entry) => entry.message.customType === "intercom_message");
+      assert.deepEqual(newInboundMessages, []);
+      await harness.emitLifecycle("session_shutdown");
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
 test("child supervisor tool clears reply waiter when cancelled", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
@@ -1642,6 +1793,127 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       await harness.emitLifecycle("session_shutdown");
     });
   } finally {
+    await cleanup();
+  }
+});
+
+test("late replies to a cancelled supervisor ask are dropped", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    await withChildOrchestratorEnv({
+      orchestratorTarget: "orchestrator",
+      runId: "78f659a3",
+      agent: "worker",
+      index: "0",
+      sessionName: "subagent-worker-78f659a3-1",
+    }, async () => {
+      const harness = createExtensionHarness("subagent-worker-78f659a3-1");
+      await withCapturedIntercomClients(async (clients) => {
+        piIntercomExtension(harness.pi as never);
+        await harness.emitLifecycle("session_start");
+        const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
+
+        const controller = new AbortController();
+        const cancelledMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+        const cancelledResultPromise = supervisorTool.execute("ask-cancelled", { reason: "need_decision", message: "Should I continue?" }, controller.signal, undefined, harness.ctx);
+        const [from, message] = await cancelledMessage;
+        controller.abort();
+        const cancelledResult = await cancelledResultPromise;
+        assert.equal(cancelledResult.details?.error, true);
+        assert.match(cancelledResult.content[0]?.text ?? "", /Cancelled/);
+
+        const workerClient = clients.find((candidate) => candidate.sessionId === from.id);
+        assert.ok(workerClient);
+
+        const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+        const sentBefore = harness.sentMessages.length;
+        const pendingBeforeReply = await intercomTool.execute("pending-before-late-supervisor-reply", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+        workerClient.emit("message", {
+          id: orchestrator.sessionId!,
+          name: "orchestrator",
+          cwd: repoDir,
+          model: "test-model",
+          pid: process.pid,
+          startedAt: Date.now(),
+          lastActivity: Date.now(),
+        } satisfies SessionInfo, {
+          id: "late-cancelled-supervisor-reply",
+          timestamp: Date.now(),
+          replyTo: message.id,
+          content: { text: "Late supervisor answer." },
+        } satisfies Message);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        const pendingAfterReply = await intercomTool.execute("pending-after-late-supervisor-reply", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+        assert.match(pendingBeforeReply.content[0]?.text ?? "", /No unresolved inbound asks/);
+        assert.match(pendingAfterReply.content[0]?.text ?? "", /No unresolved inbound asks/);
+        const newInboundMessages = harness.sentMessages
+          .slice(sentBefore)
+          .filter((entry) => entry.message.customType === "intercom_message");
+        assert.deepEqual(newInboundMessages, []);
+        await harness.emitLifecycle("session_shutdown");
+      });
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("late replies to a timed-out intercom ask are dropped", { concurrency: false }, async () => {
+  const previousAskTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "30";
+  const { default: piIntercomExtension } = await import(`./index.ts?timeout-stale-${Date.now()}`);
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    const harness = createExtensionHarness("timed-out-late-reply-worker");
+    await withCapturedIntercomClients(async (clients) => {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+      const timedOutMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const timedOutResultPromise = intercomTool.execute("ask-timeout", { action: "ask", to: "orchestrator", message: "Should I continue?" }, new AbortController().signal, undefined, harness.ctx);
+      const [from, message] = await timedOutMessage;
+      const timedOutResult = await timedOutResultPromise;
+      assert.equal(timedOutResult.details?.error, true);
+      assert.match(timedOutResult.content[0]?.text ?? "", /No reply from/);
+
+      const workerClient = clients.find((candidate) => candidate.sessionId === from.id);
+      assert.ok(workerClient);
+
+      const sentBefore = harness.sentMessages.length;
+      const pendingBeforeReply = await intercomTool.execute("pending-before-late-timeout-reply", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+      workerClient.emit("message", {
+        id: orchestrator.sessionId!,
+        name: "orchestrator",
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      } satisfies SessionInfo, {
+        id: "late-timeout-reply",
+        timestamp: Date.now(),
+        replyTo: message.id,
+        content: { text: "Late timeout answer." },
+      } satisfies Message);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const pendingAfterReply = await intercomTool.execute("pending-after-late-timeout-reply", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(pendingBeforeReply.content[0]?.text ?? "", /No unresolved inbound asks/);
+      assert.match(pendingAfterReply.content[0]?.text ?? "", /No unresolved inbound asks/);
+      const newInboundMessages = harness.sentMessages
+        .slice(sentBefore)
+        .filter((entry) => entry.message.customType === "intercom_message");
+      assert.deepEqual(newInboundMessages, []);
+      await harness.emitLifecycle("session_shutdown");
+    });
+  } finally {
+    if (previousAskTimeout === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousAskTimeout;
     await cleanup();
   }
 });

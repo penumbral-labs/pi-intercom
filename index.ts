@@ -22,10 +22,12 @@ const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
 const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
 const INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
 const NAME_POLL_MS_ENV = "PI_INTERCOM_NAME_POLL_MS";
+const SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV = "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
 const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
 const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
+const STALE_ASKS_MAX_ENTRIES = 256;
 
 interface ChildOrchestratorMetadata {
   orchestratorTarget: string;
@@ -81,6 +83,26 @@ function formatAttachments(attachments: Attachment[]): string {
   }
   return text;
 }
+function hasTrimmedEnv(name: string): boolean {
+  return Boolean(process.env[name]?.trim());
+}
+
+function hasNumericChildIndex(): boolean {
+  const raw = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
+  if (!raw) {
+    return false;
+  }
+  return Number.isSafeInteger(Number(raw));
+}
+
+function hasNativeSubagentsSupervisorEnvironment(): boolean {
+  return hasTrimmedEnv(SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV)
+    && hasTrimmedEnv(SUBAGENT_RUN_ID_ENV)
+    && hasTrimmedEnv(SUBAGENT_CHILD_AGENT_ENV)
+    && hasNumericChildIndex()
+    && hasTrimmedEnv(SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV);
+}
+
 function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
   const orchestratorTarget = process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV]?.trim();
   const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim()
@@ -451,7 +473,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
   const pendingIdleMessages: InboundMessageEntry[] = [];
+  const staleAsks = new Map<string, number>();
   let inboundFlushTimer: NodeJS.Timeout | null = null;
+  function recordStaleAsk(replyTo: string): void {
+    if (!replyTo) {
+      return;
+    }
+    if (staleAsks.has(replyTo)) {
+      staleAsks.delete(replyTo);
+    }
+    staleAsks.set(replyTo, Date.now());
+    while (staleAsks.size > STALE_ASKS_MAX_ENTRIES) {
+      const oldest = staleAsks.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      staleAsks.delete(oldest.value);
+    }
+  }
   let replyWaiter: {
     from: string;
     replyTo: string;
@@ -467,6 +506,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        recordStaleAsk(replyTo);
         onCancel?.();
         const timeoutDescription = askTimeoutMs % 60000 === 0 ? `${askTimeoutMs / 60000} minutes` : `${askTimeoutMs}ms`;
         rejectReplyWaiter(new Error(`No reply from "${from}" within ${timeoutDescription}`));
@@ -479,6 +519,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
       };
       const onAbort = () => {
+        recordStaleAsk(replyTo);
         onCancel?.();
         cleanup();
         reject(new Error("Cancelled"));
@@ -722,6 +763,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
     }
+    if (message.replyTo && staleAsks.has(message.replyTo)) {
+      staleAsks.delete(message.replyTo);
+      return;
+    }
     const attachmentText = message.content.attachments?.length
       ? formatAttachments(message.content.attachments)
       : "";
@@ -933,6 +978,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     clearInboundFlushTimer();
     rejectReplyWaiter(new Error("Session replaced"));
     replyTracker.reset();
+    staleAsks.clear();
     pendingIdleMessages.length = 0;
     runtimeContext = ctx;
     currentSessionId = ctx.sessionManager.getSessionId();
@@ -1059,6 +1105,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
+    staleAsks.clear();
     pendingIdleMessages.length = 0;
     clearInboundFlushTimer();
     agentRunning = false;
@@ -1159,7 +1206,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
   });
 
-  const childOrchestratorMetadata = readChildOrchestratorMetadata();
+  const childOrchestratorMetadata = hasNativeSubagentsSupervisorEnvironment()
+    ? null
+    : readChildOrchestratorMetadata();
   if (childOrchestratorMetadata) {
     pi.registerTool({
       name: "contact_supervisor",

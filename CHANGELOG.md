@@ -12,6 +12,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Made inline intercom messages collapse and expand with Pi's `Ctrl+O` custom-message toggle while keeping sender, preview, reply, and attachment cues visible. Thanks to RyanKim17920 for PR #32.
 
 ### Fixed
+- Let native `pi-subagents` supervisor metadata own child `contact_supervisor` while keeping broker-backed `intercom` available, and drop late replies to timed-out or cancelled asks.
 - Added broker-owned local trust metadata, clearer stable-ID trust boundaries for duplicate names, per-connection rate limiting, and no-op presence coalescing for local IPC abuse hardening.
 - Added an inbound broker frame size cap to reject oversized local IPC messages before buffering their payloads.
 - Restricted Unix intercom runtime directory, socket, PID, and spawn-lock permissions.
