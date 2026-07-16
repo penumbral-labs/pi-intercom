@@ -92,7 +92,7 @@ function hasNumericChildIndex(): boolean {
   if (!raw) {
     return false;
   }
-  return Number.isSafeInteger(Number(raw));
+  return /^\d+$/.test(raw);
 }
 
 function hasNativeSubagentsSupervisorEnvironment(): boolean {
