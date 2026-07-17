@@ -1,3 +1,4 @@
+import { getAskTimeoutMs } from "./config.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
 export interface IntercomContext {
@@ -19,7 +20,7 @@ export class ReplyTracker {
   private readonly pendingTurnContexts: IntercomContext[] = [];
   private currentTurnContext: IntercomContext | null = null;
 
-  constructor(private readonly askTimeoutMs = 10 * 60 * 1000) {}
+  constructor(private readonly askTimeoutMs = getAskTimeoutMs()) {}
 
   recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): IntercomContext {
     const context = { from, message, receivedAt };
@@ -48,8 +49,19 @@ export class ReplyTracker {
     this.currentTurnContext = null;
   }
 
-  resolveReplyTarget(options: { to?: string }, now = Date.now()): IntercomContext {
+  resolveReplyTarget(options: { to?: string; replyTo?: string }, now = Date.now()): IntercomContext {
     this.pruneExpired(now);
+
+    if (options.replyTo) {
+      const target = this.pendingAsks.get(options.replyTo);
+      if (!target) {
+        throw new Error(`No pending ask with message ID "${options.replyTo}"`);
+      }
+      if (options.to && !matchesPendingSender(target, options.to)) {
+        throw new Error(`Pending ask "${options.replyTo}" is not from "${options.to}"`);
+      }
+      return target;
+    }
 
     if (this.currentTurnContext) {
       return this.currentTurnContext;
@@ -81,7 +93,16 @@ export class ReplyTracker {
   }
 
   markReplied(replyTo: string): void {
+    this.dismissPendingAsk(replyTo);
+  }
+
+  dismissPendingAsk(replyTo: string): void {
     this.pendingAsks.delete(replyTo);
+    for (let index = this.pendingTurnContexts.length - 1; index >= 0; index -= 1) {
+      if (this.pendingTurnContexts[index]?.message.id === replyTo) {
+        this.pendingTurnContexts.splice(index, 1);
+      }
+    }
     if (this.currentTurnContext?.message.id === replyTo) {
       this.currentTurnContext = null;
     }
@@ -95,7 +116,7 @@ export class ReplyTracker {
   private pruneExpired(now: number): void {
     for (const [messageId, context] of this.pendingAsks) {
       if (now - context.receivedAt > this.askTimeoutMs) {
-        this.pendingAsks.delete(messageId);
+        this.dismissPendingAsk(messageId);
       }
     }
   }

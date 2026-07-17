@@ -4,8 +4,27 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
-### Added
-- Foreground subagent intercom messages now request the pi-subagents detach handshake so eligible child updates can wake the orchestrator mid-run instead of waiting behind the active `subagent` tool call.
+### Changed
+
+- Updated Pi runtime peer metadata and tool schemas for the `@earendil-works` package scope and Pi-bundled `typebox`/`pi-ai` packages.
+- Centralized pi-intercom runtime and config paths under `PI_CODING_AGENT_DIR` when set, defaulting to `~/.pi/agent`.
+- Hardened default broker auto-spawn to launch the resolved bundled `tsx` CLI through the current Node executable instead of resolving `npx` through `PATH`; custom `brokerCommand`/`brokerArgs` remain available as advanced trusted config.
+- Added an `inboundTrigger` policy (`always`, `replies`, or `never`) so users can reduce inbound auto-trigger risk while preserving existing behavior by default.
+- Made inline intercom messages collapse and expand with Pi's `Ctrl+O` custom-message toggle while keeping sender, preview, reply, and attachment cues visible. Thanks to RyanKim17920 for PR #32.
+
+### Fixed
+
+- Let native `pi-subagents` supervisor metadata own child `contact_supervisor` while keeping broker-backed `intercom` available, and drop late replies to timed-out or cancelled asks.
+- Added broker-owned local trust metadata, clearer stable-ID trust boundaries for duplicate names, per-connection rate limiting, and no-op presence coalescing for local IPC abuse hardening.
+- Added an inbound broker frame size cap to reject oversized local IPC messages before buffering their payloads.
+- Restricted Unix intercom runtime directory, socket, PID, and spawn-lock permissions.
+- Rechecked single-flight ask state after session target resolution so concurrent regular asks fail safely instead of crashing on an unhandled rejected reply waiter.
+- Refused broker-level mutual asks that would deadlock two sessions, and cleared outstanding ask edges when asks are replied to, cancelled, or disconnected.
+- Stabilized intercom session addressing across reconnects, idle `/name` changes, replaced Pi sessions, supervisor routing, pending replies, and short-ID targeting.
+- Aligned intercom overlay widths with their rendered modal boxes. Thanks to Cat for PR #43.
+- Marked failed `intercom` and `contact_supervisor` tool results through Pi's `tool_result` error flag path while preserving structured renderer details.
+- Limited the intercom overlay to TUI mode and gated subagent relay event delivery to active sessions.
+- Added an opt-in Windows localhost TCP transport using a dynamic port, broker protocol health checks, and a local endpoint secret instead of a fixed-port default.
 
 ## [0.6.0] - 2026-05-03
 

@@ -1,34 +1,37 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { IntercomClient } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { loadConfig, type IntercomConfig } from "./config.ts";
+import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
 import type { SessionInfo, Message, Attachment } from "./types.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
 
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
-const INTERCOM_DETACH_REQUEST_EVENT = "pi-intercom:detach-request";
-const INTERCOM_DETACH_RESPONSE_EVENT = "pi-intercom:detach-response";
-const SUBAGENT_FOREGROUND_STARTED_EVENT = "subagent:foreground-started";
-const SUBAGENT_FOREGROUND_ENDED_EVENT = "subagent:foreground-ended";
 const INBOUND_FLUSH_DELAY_MS = 200;
 const INBOUND_IDLE_RETRY_MS = 500;
 const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
 const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
+const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
+const INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
+const NAME_POLL_MS_ENV = "PI_INTERCOM_NAME_POLL_MS";
+const SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV = "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
 const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
 const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
+const STALE_ASKS_MAX_ENTRIES = 256;
 
 interface ChildOrchestratorMetadata {
   orchestratorTarget: string;
+  orchestratorSessionId?: string;
   runId: string;
   agent: string;
   index: string;
@@ -40,41 +43,6 @@ interface InboundMessageEntry {
   message: Message;
   replyCommand?: string;
   bodyText: string;
-}
-
-interface ParsedSubagentIntercomPayload {
-  to: string;
-  message: string;
-  requestId?: string;
-  runId?: string;
-  agent?: string;
-  index?: number;
-}
-
-type IntercomDetachRefusalReason = "not_allowed" | "not_started" | "already_detached" | "already_closed" | "target_mismatch";
-
-interface IntercomDetachRequest {
-  requestId: string;
-  runId?: string;
-  agent?: string;
-  index?: number;
-  intercomSession?: string;
-}
-
-type IntercomDetachResponse =
-  | { requestId: string; accepted: true }
-  | { requestId: string; accepted: false; reason: IntercomDetachRefusalReason };
-
-interface SubagentForegroundLifecycle {
-  runId: string;
-  agent: string;
-  index?: number;
-  intercomSession: string;
-  allowIntercomDetach: boolean;
-}
-
-interface LiveSubagentChild extends SubagentForegroundLifecycle {
-  toolCallId: string;
 }
 
 type ContactSupervisorReason = "need_decision" | "progress_update" | "interview_request";
@@ -115,8 +83,30 @@ function formatAttachments(attachments: Attachment[]): string {
   }
   return text;
 }
+function hasTrimmedEnv(name: string): boolean {
+  return Boolean(process.env[name]?.trim());
+}
+
+function hasNumericChildIndex(): boolean {
+  const raw = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
+  if (!raw) {
+    return false;
+  }
+  return /^\d+$/.test(raw);
+}
+
+function hasNativeSubagentsSupervisorEnvironment(): boolean {
+  return hasTrimmedEnv(SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV)
+    && hasTrimmedEnv(SUBAGENT_RUN_ID_ENV)
+    && hasTrimmedEnv(SUBAGENT_CHILD_AGENT_ENV)
+    && hasNumericChildIndex()
+    && hasTrimmedEnv(SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV);
+}
+
 function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
   const orchestratorTarget = process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV]?.trim();
+  const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim()
+    || process.env[INTERCOM_SESSION_ID_ENV]?.trim();
   const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
   const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
   const index = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
@@ -126,6 +116,7 @@ function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
   const sessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
   return {
     orchestratorTarget,
+    ...(orchestratorSessionId ? { orchestratorSessionId } : {}),
     runId,
     agent,
     index,
@@ -396,7 +387,7 @@ function duplicateSessionNames(sessions: SessionInfo[]): Set<string> {
 function shortSessionId(sessionId: string): string {
   return sessionId.slice(0, 8);
 }
-function parseSubagentIntercomPayload(payload: unknown): ParsedSubagentIntercomPayload | null {
+function parseSubagentIntercomPayload(payload: unknown): { to: string; message: string; requestId?: string } | null {
   if (typeof payload !== "object" || payload === null) {
     return null;
   }
@@ -405,17 +396,7 @@ function parseSubagentIntercomPayload(payload: unknown): ParsedSubagentIntercomP
     return null;
   }
   const requestId = typeof record.requestId === "string" ? record.requestId : undefined;
-  const runId = typeof record.runId === "string" ? record.runId : undefined;
-  const agent = typeof record.agent === "string" ? record.agent : undefined;
-  const index = typeof record.index === "number" && Number.isFinite(record.index) ? record.index : undefined;
-  return {
-    to: record.to,
-    message: record.message,
-    ...(requestId ? { requestId } : {}),
-    ...(runId ? { runId } : {}),
-    ...(agent ? { agent } : {}),
-    ...(index !== undefined ? { index } : {}),
-  };
+  return { to: record.to, message: record.message, ...(requestId ? { requestId } : {}) };
 }
 function resolveIntercomPresenceName(sessionName: string | undefined, sessionId: string): string {
   const trimmedName = sessionName?.trim();
@@ -458,14 +439,28 @@ function previewText(value: unknown, maxLength = 72): string | undefined {
 function firstTextContent(result: { content?: Array<{ type: string; text?: string }> }): string {
   return result.content?.find((item) => item.type === "text" && typeof item.text === "string")?.text?.replace(/\*\*/g, "") ?? "";
 }
+function getNamePollMs(): number {
+  const configured = process.env[NAME_POLL_MS_ENV];
+  if (configured !== undefined) {
+    const value = Number(configured);
+    if (Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return 1000;
+}
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: IntercomClient | null = null;
   const config: IntercomConfig = loadConfig();
+  const askTimeoutMs = getAskTimeoutMs();
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
+  let namePollTimer: NodeJS.Timeout | null = null;
+  let lastPresenceName: string | null = null;
+  const previousIntercomSessionId = process.env[INTERCOM_SESSION_ID_ENV];
   let reconnectPromise: Promise<IntercomClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;
@@ -476,29 +471,23 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let runtimeGeneration = 0;
   let agentRunning = false;
   const activeTools = new Map<string, string>();
-  const activeSubagentCalls = new Set<string>();
-  const liveSubagentChildren = new Map<string, LiveSubagentChild>();
   const replyTracker = new ReplyTracker();
   const pendingIdleMessages: InboundMessageEntry[] = [];
-  let inboundFlushTimer: NodeJS.Timeout | null = null;
-  // Asks whose reply waiter timed out or was cancelled. A late inbound message with
-  // `replyTo` set to one of these is a stale answer to a question the agent has already
-  // moved past; surfacing it as a fresh inbound risks the agent acting on stale guidance
-  // (e.g. a worker whose contact_supervisor timed out and re-asked, then receives the
-  // supervisor's reply to the original ask after composing its fallback). Bounded by
-  // STALE_ASKS_MAX_ENTRIES with FIFO eviction so the set cannot grow unboundedly across
-  // a long session.
   const staleAsks = new Map<string, number>();
-  const STALE_ASKS_MAX_ENTRIES = 256;
+  let inboundFlushTimer: NodeJS.Timeout | null = null;
   function recordStaleAsk(replyTo: string): void {
-    if (!replyTo) return;
+    if (!replyTo) {
+      return;
+    }
     if (staleAsks.has(replyTo)) {
       staleAsks.delete(replyTo);
     }
     staleAsks.set(replyTo, Date.now());
     while (staleAsks.size > STALE_ASKS_MAX_ENTRIES) {
       const oldest = staleAsks.keys().next();
-      if (oldest.done) break;
+      if (oldest.done) {
+        break;
+      }
       staleAsks.delete(oldest.value);
     }
   }
@@ -508,7 +497,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
   } | null = null;
-  function waitForReply(from: string, replyTo: string, signal?: AbortSignal): Promise<Message> {
+  function waitForReply(from: string, replyTo: string, signal?: AbortSignal, onCancel?: () => void): Promise<Message> {
     if (replyWaiter) {
       return Promise.reject(new Error("Already waiting for a reply"));
     }
@@ -517,11 +506,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        // Mark the ask stale so a late reply gets dropped instead of injected as a fresh
-        // inbound after the agent has already moved on.
         recordStaleAsk(replyTo);
-        rejectReplyWaiter(new Error(`No reply from "${from}" within 10 minutes`));
-      }, 10 * 60 * 1000);
+        onCancel?.();
+        const timeoutDescription = askTimeoutMs % 60000 === 0 ? `${askTimeoutMs / 60000} minutes` : `${askTimeoutMs}ms`;
+        rejectReplyWaiter(new Error(`No reply from "${from}" within ${timeoutDescription}`));
+      }, askTimeoutMs);
       const cleanup = () => {
         clearTimeout(timeout);
         signal?.removeEventListener("abort", onAbort);
@@ -530,9 +519,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
       };
       const onAbort = () => {
-        // A cancelled ask is just as stale as a timed-out one for the purpose of late-reply
-        // delivery: the agent has decided it is no longer waiting on this answer.
         recordStaleAsk(replyTo);
+        onCancel?.();
         cleanup();
         reject(new Error("Cancelled"));
       };
@@ -567,6 +555,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     clearTimeout(startupConnectTimer);
     startupConnectTimer = null;
+  }
+  function clearNamePollTimer(): void {
+    if (!namePollTimer) {
+      return;
+    }
+    clearInterval(namePollTimer);
+    namePollTimer = null;
   }
   function clearInboundFlushTimer(): void {
     if (!inboundFlushTimer) {
@@ -619,7 +614,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const identity = buildPresenceIdentity(pi, currentSessionId);
     return {
       name: identity.name,
-      cwd: liveContext.cwd ?? process.cwd(),
+      cwd: liveContext.cwd,
       model: currentModel,
       pid: process.pid,
       startedAt: sessionStartedAt,
@@ -631,90 +626,39 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!client || !getLiveContext()) {
       return;
     }
-    client.updatePresence({ ...buildPresenceIdentity(pi, sessionId), status: currentStatus() });
+    const identity = buildPresenceIdentity(pi, sessionId);
+    lastPresenceName = identity.name;
+    client.updatePresence({ ...identity, status: currentStatus() });
+  }
+  function startNamePoll(): void {
+    clearNamePollTimer();
+    lastPresenceName = currentSessionId ? buildPresenceIdentity(pi, currentSessionId).name : null;
+    namePollTimer = setInterval(() => {
+      if (!currentSessionId || !getLiveContext()) {
+        return;
+      }
+      const identity = buildPresenceIdentity(pi, currentSessionId);
+      if (identity.name !== lastPresenceName) {
+        syncPresenceIdentity(currentSessionId);
+      }
+    }, getNamePollMs());
+    namePollTimer.unref?.();
+  }
+  function publishIntercomSessionId(sessionId: string): void {
+    process.env[INTERCOM_SESSION_ID_ENV] = sessionId;
+  }
+  function restoreIntercomSessionId(): void {
+    if (previousIntercomSessionId === undefined) {
+      delete process.env[INTERCOM_SESSION_ID_ENV];
+      return;
+    }
+    process.env[INTERCOM_SESSION_ID_ENV] = previousIntercomSessionId;
   }
   function syncPresenceStatus(): void {
     if (!client || !currentSessionId || !getLiveContext()) {
       return;
     }
     client.updatePresence({ status: currentStatus() });
-  }
-  function resetSubagentDetachState(): void {
-    activeSubagentCalls.clear();
-    liveSubagentChildren.clear();
-  }
-  function childSessionName(from: SessionInfo): string | null {
-    const trimmed = from.name?.trim();
-    return trimmed || null;
-  }
-  function lookupLiveSubagentChild(fromOrSession: SessionInfo | string): LiveSubagentChild | null {
-    const intercomSession = typeof fromOrSession === "string" ? fromOrSession.trim() : childSessionName(fromOrSession);
-    if (!intercomSession) {
-      return null;
-    }
-    return liveSubagentChildren.get(intercomSession) ?? null;
-  }
-  function lookupRelaySubagentChild(parsed: ParsedSubagentIntercomPayload): LiveSubagentChild | null {
-    if (!parsed.runId) {
-      return null;
-    }
-    for (const child of liveSubagentChildren.values()) {
-      if (
-        child.runId === parsed.runId
-        && (parsed.agent === undefined || child.agent === parsed.agent)
-        && (parsed.index === undefined || child.index === parsed.index)
-      ) {
-        return child;
-      }
-    }
-    return null;
-  }
-  function resolveSubagentToolCallId(runId: string): string | null {
-    // Parallel children of one `subagent({ tasks: [...] })` call share a runId and a
-    // single tool call, but each emits its own foreground-started event. Siblings must
-    // map to the same tool call so every parallel child becomes detach-eligible.
-    for (const child of liveSubagentChildren.values()) {
-      if (child.runId === runId) {
-        return child.toolCallId;
-      }
-    }
-    // A genuinely new run claims the newest active subagent tool call not already owned
-    // by another run, so overlapping single-child calls stay disambiguated.
-    const claimedByOtherRun = new Set(Array.from(liveSubagentChildren.values(), child => child.toolCallId));
-    const newestFirst = Array.from(activeSubagentCalls).reverse();
-    for (const toolCallId of newestFirst) {
-      if (!claimedByOtherRun.has(toolCallId) && activeTools.get(toolCallId) === "subagent") {
-        return toolCallId;
-      }
-    }
-    return null;
-  }
-  function canRequestSubagentDetach(child: LiveSubagentChild | null): child is LiveSubagentChild {
-    return Boolean(
-      child
-      && activeSubagentCalls.size > 0
-      && child.allowIntercomDetach
-      && activeSubagentCalls.has(child.toolCallId)
-      && activeTools.get(child.toolCallId) === "subagent"
-    );
-  }
-  function evictLiveSubagentChildByToolCall(toolCallId: string): void {
-    for (const [intercomSession, child] of liveSubagentChildren) {
-      if (child.toolCallId === toolCallId) {
-        liveSubagentChildren.delete(intercomSession);
-      }
-    }
-  }
-  function isSubagentForegroundLifecycle(payload: unknown): payload is SubagentForegroundLifecycle {
-    if (typeof payload !== "object" || payload === null) {
-      return false;
-    }
-    const record = payload as Record<string, unknown>;
-    return typeof record.runId === "string"
-      && typeof record.agent === "string"
-      && (record.index === undefined || (typeof record.index === "number" && Number.isFinite(record.index)))
-      && typeof record.intercomSession === "string"
-      && typeof record.allowIntercomDetach === "boolean";
   }
   function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: IntercomClient): boolean {
     const targets = new Set<string>();
@@ -729,7 +673,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return Boolean(resolvedTo && activeClient?.sessionId && resolvedTo === activeClient.sessionId)
       || targets.has(to.trim().toLowerCase());
   }
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "followUp", generation = runtimeGeneration): void {
+  function shouldTriggerInboundMessage(entry: InboundMessageEntry, forceTrigger = false): boolean {
+    if (forceTrigger) {
+      return true;
+    }
+    if (config.inboundTrigger === "always") {
+      return true;
+    }
+    if (config.inboundTrigger === "replies") {
+      return Boolean(entry.message.replyTo);
+    }
+    return false;
+  }
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "followUp", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
     }
@@ -745,7 +701,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         display: true,
         details: entry,
       },
-      delivery === "trigger"
+      delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
         ? { triggerTurn: true }
         : { deliverAs: "followUp" }
     );
@@ -783,79 +739,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
 
     const entries = pendingIdleMessages.splice(0, pendingIdleMessages.length);
+    const triggerIndex = entries.findIndex((entry) => shouldTriggerInboundMessage(entry));
     entries.forEach((entry, index) => {
-      sendIncomingMessage(entry, index === 0 ? "trigger" : "followUp");
+      sendIncomingMessage(entry, index === triggerIndex ? "trigger" : "followUp");
     });
   }
   function queueIdleMessage(entry: InboundMessageEntry): void {
     pendingIdleMessages.push(entry);
     scheduleInboundFlush();
-  }
-  async function requestSubagentDetach(
-    target: { runId: string; agent?: string; index?: number; intercomSession: string },
-    timeoutMs = 250,
-  ): Promise<{ accepted: boolean; reason?: IntercomDetachRefusalReason; requestId: string }> {
-    const requestId = randomUUID();
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (result: { accepted: boolean; reason?: IntercomDetachRefusalReason; requestId: string }) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        off();
-        resolve(result);
-      };
-      const off = pi.events.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload: unknown) => {
-        if (typeof payload !== "object" || payload === null) return;
-        const response = payload as Partial<IntercomDetachResponse>;
-        if (response.requestId !== requestId) return;
-        if (response.accepted === true) {
-          finish({ accepted: true, requestId });
-          return;
-        }
-        if (response.accepted === false && typeof response.reason === "string") {
-          if (response.reason === "target_mismatch") {
-            return;
-          }
-          finish({ accepted: false, reason: response.reason as IntercomDetachRefusalReason, requestId });
-        }
-      });
-      const timer = setTimeout(() => {
-        finish({ accepted: false, requestId });
-      }, timeoutMs);
-      const request: IntercomDetachRequest = { requestId, ...target };
-      pi.events.emit(INTERCOM_DETACH_REQUEST_EVENT, request);
-    });
-  }
-  function recordSubagentDetachFallback(
-    entryType: "intercom_detach_refused" | "intercom_detach_timeout",
-    result: { reason?: IntercomDetachRefusalReason; requestId: string },
-    target: { runId: string; agent?: string; index?: number; intercomSession: string },
-  ): void {
-    pi.appendEntry(entryType, {
-      ...(result.reason ? { reason: result.reason } : {}),
-      requestId: result.requestId,
-      target,
-      timestamp: Date.now(),
-    });
-  }
-  async function requestDetachForLiveChild(child: LiveSubagentChild): Promise<{ accepted: true } | { accepted: false }> {
-    const target = {
-      runId: child.runId,
-      ...(child.agent ? { agent: child.agent } : {}),
-      ...(child.index !== undefined ? { index: child.index } : {}),
-      intercomSession: child.intercomSession,
-    };
-    const result = await requestSubagentDetach(target);
-    if (!result.accepted) {
-      recordSubagentDetachFallback(
-        result.reason ? "intercom_detach_refused" : "intercom_detach_timeout",
-        result,
-        target,
-      );
-      return { accepted: false };
-    }
-    return { accepted: true };
   }
   function handleIncomingMessage(ctx: ExtensionContext, from: SessionInfo, message: Message): void {
     const messageGeneration = runtimeGeneration;
@@ -873,9 +764,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
     }
-    // Drop late replies that target an ask whose waiter already timed out or was cancelled.
-    // The agent has moved on; injecting a stale answer as a fresh inbound risks acting on
-    // outdated guidance.
     if (message.replyTo && staleAsks.has(message.replyTo)) {
       staleAsks.delete(message.replyTo);
       return;
@@ -895,30 +783,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (!activeContext.isIdle()) {
-        const liveChild = lookupLiveSubagentChild(from);
-        if (canRequestSubagentDetach(liveChild)) {
-          const detach = await requestDetachForLiveChild(liveChild);
-          if (!getLiveContext(liveContext, messageGeneration)) {
-            return;
-          }
-          if (detach.accepted) {
-            sendIncomingMessage(entry, "trigger", messageGeneration);
-            return;
-          }
-        }
         if (!activeContext.hasUI) {
           const activeClient = client;
           if (!message.replyTo && activeClient?.isConnected()) {
             try {
               const result = await activeClient.send(from.id, {
                 text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
-                replyTo: message.id,
+                ...(message.expectsReply ? { replyTo: message.id } : {}),
               });
-              if (result.delivered && getLiveContext(liveContext, messageGeneration)) {
+              if (message.expectsReply && result.delivered && getLiveContext(liveContext, messageGeneration)) {
                 replyTracker.markReplied(message.id);
               }
             } catch {
-              // Best-effort reply; keep the busy non-interactive session running either way.
+              // Best-effort notice; keep the busy non-interactive session running either way.
             }
           }
           return;
@@ -995,7 +872,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       attachClientHandlers(nextClient);
       try {
         await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
-        await nextClient.connect(buildRegistration());
+        await nextClient.connect(buildRegistration(), currentSessionId);
         if (!getLiveContext(contextAtStart, generationAtStart)) {
           await nextClient.disconnect();
           throw new Error("Intercom runtime no longer active");
@@ -1033,15 +910,37 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (byName.length > 1) {
       throw new Error(`Multiple sessions named "${nameOrId}" are connected. Use the session ID instead.`);
     }
-    return byName[0]?.id ?? null;
+    if (byName.length === 1) {
+      return byName[0]!.id;
+    }
+
+    const byIdPrefix = sessions.filter(s => s.id.startsWith(nameOrId));
+    if (byIdPrefix.length === 1) {
+      return byIdPrefix[0]!.id;
+    }
+    if (byIdPrefix.length > 1) {
+      throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
+    }
+    return null;
   }
-  function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
+  async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string> {
+    if (metadata.orchestratorSessionId) {
+      const bySessionId = await resolveSessionTarget(activeClient, metadata.orchestratorSessionId);
+      if (bySessionId) {
+        return bySessionId;
+      }
+    }
+    return await resolveSessionTarget(activeClient, metadata.orchestratorTarget) ?? metadata.orchestratorTarget;
+  }
+  function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string, generation = runtimeGeneration): void {
+    const liveContext = getLiveContext(runtimeContext, generation);
+    if (!liveContext) return;
     const now = Date.now();
     sendIncomingMessage({
       from: {
         id: sender,
         name: sender,
-        cwd: runtimeContext?.cwd ?? process.cwd(),
+        cwd: liveContext?.cwd ?? "",
         model: sender,
         pid: process.pid,
         startedAt: now,
@@ -1054,7 +953,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         content: { text: messageText },
       },
       bodyText: messageText,
-    }, "trigger");
+    }, "trigger", generation, true);
   }
   function recordSubagentDeliveryError(entryType: string, to: string, message: string, error: unknown): void {
     pi.appendEntry(entryType, {
@@ -1063,6 +962,49 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       error: getErrorMessage(error),
       timestamp: Date.now(),
     });
+  }
+  function startSessionRuntime(ctx: ExtensionContext): void {
+    const previousClient = client;
+    if (previousClient) {
+      client = null;
+      void previousClient.disconnect().catch(() => undefined);
+    }
+    shuttingDown = false;
+    disposed = false;
+    runtimeStarted = true;
+    runtimeGeneration += 1;
+    reconnectAttempt = 0;
+    clearReconnectTimer();
+    clearStartupConnectTimer();
+    clearNamePollTimer();
+    clearInboundFlushTimer();
+    rejectReplyWaiter(new Error("Session replaced"));
+    replyTracker.reset();
+    staleAsks.clear();
+    pendingIdleMessages.length = 0;
+    runtimeContext = ctx;
+    currentSessionId = ctx.sessionManager.getSessionId();
+    publishIntercomSessionId(currentSessionId);
+    currentModel = ctx.model?.id ?? "unknown";
+    sessionStartedAt = Date.now();
+    lastPresenceName = buildPresenceIdentity(pi, currentSessionId).name;
+    agentRunning = false;
+    activeTools.clear();
+    startNamePoll();
+    const startupGeneration = runtimeGeneration;
+    startupConnectTimer = setTimeout(() => {
+      startupConnectTimer = null;
+      if (!getLiveContext(ctx, startupGeneration)) {
+        return;
+      }
+      void ensureConnected("startup").catch(() => {
+        if (!getLiveContext(ctx, startupGeneration)) {
+          return;
+        }
+        client = null;
+        scheduleReconnect();
+      });
+    }, 0);
   }
   function emitResultDelivery(requestId: string | undefined, delivered: boolean, error?: unknown): void {
     if (!requestId) return;
@@ -1082,20 +1024,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!parsed) return;
 
     const relayGeneration = runtimeGeneration;
+    const relayStillLive = () => config.enabled && Boolean(getLiveContext(runtimeContext, relayGeneration));
+    if (!relayStillLive()) {
+      if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+      return;
+    }
+
     void (async () => {
-      const relayStillLive = () => !runtimeStarted || Boolean(getLiveContext(runtimeContext, relayGeneration));
       if (!relayStillLive()) {
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
         return;
       }
       if (currentSessionTargetMatches(parsed.to)) {
-        const liveChild = lookupRelaySubagentChild(parsed);
-        if (canRequestSubagentDetach(liveChild)) {
-          await requestDetachForLiveChild(liveChild);
-          if (!relayStillLive()) {
-            return;
-          }
-        }
-        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message, relayGeneration);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
         return;
       }
@@ -1116,14 +1057,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (currentSessionTargetMatches(parsed.to, target, activeClient)) {
-        const liveChild = lookupRelaySubagentChild(parsed);
-        if (canRequestSubagentDetach(liveChild)) {
-          await requestDetachForLiveChild(liveChild);
-          if (!relayStillLive()) {
-            return;
-          }
-        }
-        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message, relayGeneration);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
         return;
       }
@@ -1160,54 +1094,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       acknowledge: true,
     });
   });
-  pi.events.on(SUBAGENT_FOREGROUND_STARTED_EVENT, (payload) => {
-    if (!isSubagentForegroundLifecycle(payload)) {
-      return;
-    }
-    const toolCallId = resolveSubagentToolCallId(payload.runId);
-    if (!toolCallId) {
-      return;
-    }
-    liveSubagentChildren.set(payload.intercomSession, { ...payload, toolCallId });
-  });
-  pi.events.on(SUBAGENT_FOREGROUND_ENDED_EVENT, (payload) => {
-    if (!isSubagentForegroundLifecycle(payload)) {
-      return;
-    }
-    liveSubagentChildren.delete(payload.intercomSession);
-  });
   pi.on("session_start", (_event, ctx) => {
     if (!config.enabled) {
       return;
     }
-    shuttingDown = false;
-    disposed = false;
-    runtimeStarted = true;
-    runtimeGeneration += 1;
-    reconnectAttempt = 0;
-    clearReconnectTimer();
-    clearStartupConnectTimer();
-    runtimeContext = ctx;
-    currentSessionId = ctx.sessionManager.getSessionId();
-    currentModel = ctx.model?.id ?? "unknown";
-    sessionStartedAt = Date.now();
-    agentRunning = false;
-    activeTools.clear();
-    resetSubagentDetachState();
-    const startupGeneration = runtimeGeneration;
-    startupConnectTimer = setTimeout(() => {
-      startupConnectTimer = null;
-      if (!getLiveContext(ctx, startupGeneration)) {
-        return;
-      }
-      void ensureConnected("startup").catch(() => {
-        if (!getLiveContext(ctx, startupGeneration)) {
-          return;
-        }
-        client = null;
-        scheduleReconnect();
-      });
-    }, 0);
+    startSessionRuntime(ctx);
   });
   
   pi.on("session_shutdown", async () => {
@@ -1216,13 +1107,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     runtimeGeneration += 1;
     clearStartupConnectTimer();
     clearReconnectTimer();
+    clearNamePollTimer();
+    restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
+    staleAsks.clear();
     pendingIdleMessages.length = 0;
     clearInboundFlushTimer();
     agentRunning = false;
     activeTools.clear();
-    resetSubagentDetachState();
     if (client) {
       await client.disconnect();
       client = null;
@@ -1244,7 +1137,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     agentRunning = true;
     activeTools.clear();
-    resetSubagentDetachState();
     syncPresenceStatus();
   });
   pi.on("tool_execution_start", (event) => {
@@ -1252,9 +1144,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     activeTools.set(event.toolCallId, event.toolName);
-    if (event.toolName === "subagent") {
-      activeSubagentCalls.add(event.toolCallId);
-    }
     syncPresenceStatus();
   });
   pi.on("tool_execution_end", (event) => {
@@ -1262,8 +1151,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     activeTools.delete(event.toolCallId);
-    activeSubagentCalls.delete(event.toolCallId);
-    evictLiveSubagentChildByToolCall(event.toolCallId);
     syncPresenceStatus();
   });
   pi.on("agent_end", () => {
@@ -1272,16 +1159,23 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     agentRunning = false;
     activeTools.clear();
-    resetSubagentDetachState();
     syncPresenceStatus();
     scheduleInboundFlush(0);
   });
   pi.on("turn_start", (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!currentSessionId || sessionId !== currentSessionId) {
+      if (!config.enabled) {
+        return;
+      }
+      startSessionRuntime(ctx);
+      replyTracker.beginTurn();
+      return;
+    }
     if (!getLiveContext(ctx)) {
       return;
     }
-    currentSessionId = ctx.sessionManager.getSessionId();
-    syncPresenceIdentity(ctx.sessionManager.getSessionId());
+    syncPresenceIdentity(sessionId);
     replyTracker.beginTurn();
   });
   pi.on("model_select", (event, ctx) => {
@@ -1298,13 +1192,29 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.registerMessageRenderer("intercom_message", (message, _options, theme) => {
+  pi.registerMessageRenderer("intercom_message", (message, options, theme) => {
     const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
     if (!details) return undefined;
-    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText);
+    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
   });
 
-  const childOrchestratorMetadata = readChildOrchestratorMetadata();
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== "intercom" && event.toolName !== "contact_supervisor") {
+      return;
+    }
+    if (!event.details || typeof event.details !== "object") {
+      return;
+    }
+
+    const details = event.details as { error?: unknown; delivered?: unknown };
+    if (details.error === true || details.delivered === false) {
+      return { isError: true };
+    }
+  });
+
+  const childOrchestratorMetadata = hasNativeSubagentsSupervisorEnvironment()
+    ? null
+    : readChildOrchestratorMetadata();
   if (childOrchestratorMetadata) {
     pi.registerTool({
       name: "contact_supervisor",
@@ -1318,8 +1228,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         "Do not use contact_supervisor for routine completion handoffs; return the final subagent result normally.",
       ],
       parameters: Type.Object({
-        reason: Type.String({
-          enum: ["need_decision", "progress_update", "interview_request"],
+        reason: StringEnum(["need_decision", "progress_update", "interview_request"] as const, {
           description: "Contact reason: 'need_decision' waits for a reply; 'interview_request' sends structured questions and waits for a reply; 'progress_update' sends a non-blocking update",
         }),
         message: Type.Optional(Type.String({
@@ -1330,7 +1239,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           description: Type.Optional(Type.String()),
           questions: Type.Array(Type.Object({
             id: Type.String(),
-            type: Type.String({ description: "Question type: single, multi, text, image, or info" }),
+            type: StringEnum(["single", "multi", "text", "image", "info"] as const, {
+              description: "Question type: single, multi, text, image, or info",
+            }),
             question: Type.String(),
             options: Type.Optional(Type.Array(Type.Any())),
             context: Type.Optional(Type.String()),
@@ -1342,14 +1253,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (reason !== "need_decision" && reason !== "progress_update" && reason !== "interview_request") {
           return {
             content: [{ type: "text", text: "Invalid reason. Use 'need_decision', 'interview_request', or 'progress_update'." }],
-            isError: true,
             details: { error: true },
           };
         }
         if ((reason === "need_decision" || reason === "progress_update") && typeof params.message !== "string") {
           return {
             content: [{ type: "text", text: `Missing 'message' parameter for reason '${reason}'.` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1359,7 +1268,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (interviewValidation?.ok === false) {
           return {
             content: [{ type: "text", text: `Invalid interview request: ${interviewValidation.error}` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1371,7 +1279,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         } catch (error) {
           return {
             content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1381,7 +1288,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1389,25 +1295,22 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         const metadata = childOrchestratorMetadata;
         let sendTo: string;
         try {
-          sendTo = await resolveSessionTarget(connectedClient, metadata.orchestratorTarget) ?? metadata.orchestratorTarget;
+          sendTo = await resolveSupervisorTarget(connectedClient, metadata);
         } catch (error) {
           return {
             content: [{ type: "text", text: `Failed to resolve supervisor target: ${getErrorMessage(error)}` }],
-            isError: true,
             details: { error: true },
           };
         }
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
-            isError: true,
             details: { error: true },
           };
         }
         if (sendTo === connectedClient.sessionId) {
           return {
             content: [{ type: "text", text: "Cannot message the current session" }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1422,7 +1325,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
                 content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
@@ -1435,13 +1337,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             });
             return {
               content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}` }],
-              isError: false,
               details: { messageId: result.id, delivered: true },
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to send progress update: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1450,7 +1350,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (replyWaiter) {
           return {
             content: [{ type: "text", text: "Already waiting for a reply" }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1458,7 +1357,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         let replyPromise: Promise<Message> | null = null;
         try {
           const questionId = randomUUID();
-          replyPromise = waitForReply(sendTo, questionId, signal);
+          replyPromise = waitForReply(sendTo, questionId, signal, () => connectedClient.cancelAsk(questionId));
           replyPromise.catch(() => undefined);
           if (signal?.aborted) {
             rejectReplyWaiter(new Error("Cancelled"));
@@ -1469,7 +1368,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             }
             return {
               content: [{ type: "text", text: "Cancelled" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1493,7 +1391,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             }
             return {
               content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1523,10 +1420,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           });
           return {
             content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}${replyAttachments}` }],
-            isError: false,
-            ...(structuredReply
-              ? { details: structuredReply.value !== undefined ? { structuredReply: structuredReply.value } : { structuredReplyParseError: structuredReply.error } }
-              : {}),
+            details: structuredReply
+              ? structuredReply.value !== undefined
+                ? { structuredReply: structuredReply.value }
+                : { structuredReplyParseError: structuredReply.error }
+              : {},
           };
         } catch (error) {
           rejectReplyWaiter(toError(error));
@@ -1539,7 +1437,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           }
           return {
             content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1577,7 +1474,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         return new Text(text, 0, 0);
       },
-    });
+    } as any);
   }
 
   pi.registerTool({
@@ -1597,7 +1494,7 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: Type.String({
+      action: StringEnum(["list", "send", "ask", "reply", "pending", "status"] as const, {
         description: "Action: 'list', 'send', 'ask', 'reply', 'pending', or 'status'",
       }),
       to: Type.Optional(Type.String({
@@ -1607,7 +1504,7 @@ Usage:
         description: "Message to send (for 'send', 'ask', or 'reply' action)",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
-        type: Type.Union([Type.Literal("file"), Type.Literal("snippet"), Type.Literal("context")]),
+        type: StringEnum(["file", "snippet", "context"] as const),
         name: Type.String(),
         content: Type.String(),
         language: Type.Optional(Type.String()),
@@ -1624,7 +1521,6 @@ Usage:
       } catch (error) {
         return {
           content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
-          isError: true,
           details: { error: true },
         };
       }
@@ -1644,7 +1540,6 @@ Usage:
             if (!currentSession) {
               return {
                 content: [{ type: "text", text: "Current session is missing from intercom session list." }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1656,12 +1551,11 @@ Usage:
 
             return {
               content: [{ type: "text", text: `${currentSection}\n\n${otherSection}` }],
-              isError: false,
+              details: {},
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to list sessions: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1671,7 +1565,6 @@ Usage:
           if (!to || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'message' parameter" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1680,7 +1573,6 @@ Usage:
             if (sendTo === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1693,7 +1585,7 @@ Usage:
               if (!confirmed) {
                 return {
                   content: [{ type: "text", text: "Message cancelled by user" }],
-                  isError: false,
+                  details: {},
                 };
               }
             }
@@ -1706,7 +1598,6 @@ Usage:
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
                 content: [{ type: "text", text: `Message to "${to}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
@@ -1721,13 +1612,11 @@ Usage:
             }
             return {
               content: [{ type: "text", text: `Message sent to ${to}` }],
-              isError: false,
               details: { messageId: result.id, delivered: true },
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to send: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1737,7 +1626,6 @@ Usage:
           if (!to || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'message' parameter" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1745,7 +1633,6 @@ Usage:
           if (replyWaiter) {
             return {
               content: [{ type: "text", text: "Already waiting for a reply" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1753,7 +1640,6 @@ Usage:
           if (_signal?.aborted) {
             return {
               content: [{ type: "text", text: "Cancelled" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1764,19 +1650,24 @@ Usage:
             if (_signal?.aborted) {
               return {
                 content: [{ type: "text", text: "Cancelled" }],
-                isError: true,
                 details: { error: true },
               };
             }
             if (sendTo === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
-                isError: true,
+                details: { error: true },
+              };
+            }
+            if (replyWaiter) {
+              return {
+                content: [{ type: "text", text: "Already waiting for a reply" }],
                 details: { error: true },
               };
             }
             const questionId = randomUUID();
-            replyPromise = waitForReply(sendTo, questionId, _signal);
+            replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId));
+            replyPromise.catch(() => undefined);
             const sendResult = await connectedClient.send(sendTo, {
               messageId: questionId,
               text: message,
@@ -1797,7 +1688,6 @@ Usage:
               }
               return {
                 content: [{ type: "text", text: `Message to "${to}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1820,7 +1710,7 @@ Usage:
             });
             return {
               content: [{ type: "text", text: `**Reply from ${to}:**\n${replyText}${replyAttachments}` }],
-              isError: false,
+              details: {},
             };
           } catch (error) {
             rejectReplyWaiter(toError(error));
@@ -1833,7 +1723,6 @@ Usage:
             }
             return {
               content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1843,17 +1732,15 @@ Usage:
           if (!message) {
             return {
               content: [{ type: "text", text: "Missing 'message' parameter" }],
-              isError: true,
               details: { error: true },
             };
           }
 
           try {
-            const target = replyTracker.resolveReplyTarget({ to });
+            const target = replyTracker.resolveReplyTarget({ to, replyTo });
             if (target.from.id === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1863,9 +1750,11 @@ Usage:
             });
             if (!result.delivered) {
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
+              if (result.reason === "Session not found") {
+                replyTracker.dismissPendingAsk(target.message.id);
+              }
               return {
                 content: [{ type: "text", text: `Reply to "${target.from.name || target.from.id}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
@@ -1878,13 +1767,11 @@ Usage:
             });
             return {
               content: [{ type: "text", text: `Reply sent to ${target.from.name || target.from.id}` }],
-              isError: false,
               details: { messageId: result.id, delivered: true, replyTo: target.message.id },
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to reply: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1895,7 +1782,7 @@ Usage:
           if (pendingAsks.length === 0) {
             return {
               content: [{ type: "text", text: "No unresolved inbound asks." }],
-              isError: false,
+              details: {},
             };
           }
 
@@ -1907,7 +1794,7 @@ Usage:
           });
           return {
             content: [{ type: "text", text: `**Pending asks:**\n${lines.join("\n")}` }],
-            isError: false,
+            details: {},
           };
         }
 
@@ -1920,12 +1807,11 @@ Usage:
                 type: "text",
                 text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nActive sessions: ${sessions.length}`,
               }],
-              isError: false,
+              details: {},
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to get status: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1934,7 +1820,6 @@ Usage:
         default:
           return {
             content: [{ type: "text", text: `Unknown action: ${action}` }],
-            isError: true,
             details: { error: true },
           };
       }
@@ -1973,12 +1858,12 @@ Usage:
       }
       return new Text(text, 0, 0);
     },
-  });
+  } as any);
 
   async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
-    if (!liveContext?.hasUI) return;
+    if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
 
     let overlayClient: IntercomClient;
     try {
@@ -2013,7 +1898,7 @@ Usage:
 
     const selectedSession = await ctx.ui.custom<SessionInfo | undefined>(
       (_tui, theme, keybindings, done) => new SessionListOverlay(theme, keybindings, currentSession, sessions, done),
-      { overlay: true }
+      { overlay: true, overlayOptions: { width: 88 } }
     ).catch(() => undefined);
 
     if (!selectedSession || !getLiveContext(ctx, overlayGeneration)) return;
@@ -2030,7 +1915,7 @@ Usage:
 
     const result = await ctx.ui.custom<ComposeResult>(
       (tui, theme, keybindings, done) => new ComposeOverlay(tui, theme, keybindings, selectedSession, targetLabel, overlayClient, done),
-      { overlay: true }
+      { overlay: true, overlayOptions: { width: 72 } }
     ).catch(() => undefined);
 
     if (result?.sent && result.messageId && result.text && getLiveContext(ctx, overlayGeneration)) {

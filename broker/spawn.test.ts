@@ -10,11 +10,17 @@ import {
   getWindowsHiddenLauncherScript,
   getWindowsBrokerCommandLine,
   getWindowsHiddenLauncherPath,
-} from "./spawn.js";
+  isBrokerHealthOkMessage,
+} from "./spawn.ts";
 
-test("getTsxCliPath points at local tsx cli", () => {
+test("getTsxCliPath resolves tsx cli via module resolution", () => {
   const cliPath = getTsxCliPath("C:/repo");
-  assert.equal(cliPath, path.join("C:/repo", "node_modules", "tsx", "dist", "cli.mjs"));
+  // getTsxCliPath resolves the tsx package main entry and locates cli.mjs next
+  // to it, so the path reflects the real install location (bundled under
+  // extensionDir or hoisted by npm) rather than a hardcoded relative path.
+  assert.equal(path.basename(cliPath), "cli.mjs");
+  assert.equal(path.basename(path.dirname(cliPath)), "dist");
+  assert.equal(path.basename(path.dirname(path.dirname(cliPath))), "tsx");
 });
 
 test("getWindowsHiddenLauncherPath points at the broker launcher script", () => {
@@ -22,15 +28,16 @@ test("getWindowsHiddenLauncherPath points at the broker launcher script", () => 
   assert.equal(launcherPath, path.join("C:/tmp/intercom", "broker-launch.vbs"));
 });
 
-test("getWindowsBrokerCommandLine wraps node, tsx cli, and broker path", () => {
+test("getWindowsBrokerCommandLine wraps node, resolved tsx cli, and broker path", () => {
   const commandLine = getWindowsBrokerCommandLine(
     "C:/repo/broker.ts",
     "C:/repo",
     "C:/Program Files/nodejs/node.exe",
   );
+  const expectedTsxPath = getTsxCliPath("C:/repo");
   assert.equal(
     commandLine,
-    `"C:/Program Files/nodejs/node.exe" "${path.join("C:/repo", "node_modules", "tsx", "dist", "cli.mjs")}" "C:/repo/broker.ts"`,
+    `"C:/Program Files/nodejs/node.exe" "${expectedTsxPath}" "C:/repo/broker.ts"`,
   );
 });
 
@@ -56,7 +63,8 @@ test("getBrokerLaunchSpec uses wscript launcher on Windows without writing files
     assert.equal(spec.command, "wscript.exe");
     assert.deepEqual(spec.args, [path.join(intercomDir, "broker-launch.vbs")]);
     assert.equal(spec.kind, "windows-launcher");
-    assert.equal(spec.launcherCommandLine, `"C:/Program Files/nodejs/node.exe" "${path.join("C:/repo", "node_modules", "tsx", "dist", "cli.mjs")}" "C:/repo/broker.ts"`);
+    const expectedTsxPath = getTsxCliPath("C:/repo");
+    assert.equal(spec.launcherCommandLine, `"C:/Program Files/nodejs/node.exe" "${expectedTsxPath}" "C:/repo/broker.ts"`);
     assert.equal(existsSync(path.join(intercomDir, "broker-launch.vbs")), false);
   } finally {
     rmSync(intercomDir, { recursive: true, force: true });
@@ -76,12 +84,11 @@ test("getBrokerLaunchSpec uses custom broker command on Windows", () => {
   }
 });
 
-test("getBrokerLaunchSpec launches default broker via node --import tsx on non-Windows", () => {
+test("getBrokerLaunchSpec uses node + resolved tsx for the default non-Windows launch", () => {
   const spec = getBrokerLaunchSpec("C:/repo/broker.ts", "npx", ["--no-install", "tsx"], "C:/repo", "linux", "/tmp/intercom", "/usr/bin/node");
   assert.equal(spec.command, "/usr/bin/node");
   assert.deepEqual(spec.args, [
-    "--import",
-    "tsx",
+    getTsxCliPath("C:/repo"),
     "C:/repo/broker.ts",
   ]);
   assert.equal(spec.kind, "direct");
@@ -108,4 +115,16 @@ test("getBrokerSpawnOptions keeps portable defaults on non-Windows platforms", (
   assert.equal(options.detached, true);
   assert.equal(options.stdio, "ignore");
   assert.equal(options.cwd, "/repo");
+});
+
+test("getBrokerSpawnOptions passes an absolute PI_CODING_AGENT_DIR to the broker", () => {
+  const options = getBrokerSpawnOptions("/repo", { PI_CODING_AGENT_DIR: "relative-agent" });
+  assert.equal(options.env.PI_CODING_AGENT_DIR, path.resolve("relative-agent"));
+});
+
+test("isBrokerHealthOkMessage requires the intercom protocol marker", () => {
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1", protocol: "pi-intercom", version: 1 }, "req-1"), true);
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1" }, "req-1"), false);
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-2", protocol: "pi-intercom", version: 1 }, "req-1"), false);
+  assert.equal(isBrokerHealthOkMessage("ok", "req-1"), false);
 });
