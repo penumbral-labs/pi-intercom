@@ -3,6 +3,7 @@ import { join } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 
 export const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+export const MAX_ASK_TIMEOUT_MS = 2_147_483_647;
 
 export function getAskTimeoutMs(): number {
   const raw = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
@@ -11,8 +12,8 @@ export function getAskTimeoutMs(): number {
   }
 
   const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error("PI_INTERCOM_ASK_TIMEOUT_MS must be a positive integer number of milliseconds");
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_ASK_TIMEOUT_MS) {
+    throw new Error(`PI_INTERCOM_ASK_TIMEOUT_MS must be a positive integer number of milliseconds no greater than ${MAX_ASK_TIMEOUT_MS}`);
   }
   return value;
 }

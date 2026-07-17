@@ -9,6 +9,9 @@ export const MAX_FRAME_BYTES = 1024 * 1024;
 export function writeMessage(socket: Socket, msg: unknown): void {
   const json = JSON.stringify(msg);
   const payload = Buffer.from(json, "utf-8");
+  if (payload.length > MAX_FRAME_BYTES) {
+    throw new Error(`Intercom frame length ${payload.length} exceeds maximum ${MAX_FRAME_BYTES} bytes`);
+  }
   const header = Buffer.alloc(4);
   header.writeUInt32BE(payload.length, 0);
   socket.write(Buffer.concat([header, payload]));
@@ -24,12 +27,21 @@ export function createMessageReader(
   onError: (error: Error) => void,
   maxFrameBytes = MAX_FRAME_BYTES,
 ) {
-  let buffer = Buffer.alloc(0);
+  const header = Buffer.alloc(4);
+  let headerOffset = 0;
+  let payload: Buffer | null = null;
+  let payloadOffset = 0;
 
-  function reportMessage(payload: Buffer): boolean {
+  function resetFrame(): void {
+    headerOffset = 0;
+    payload = null;
+    payloadOffset = 0;
+  }
+
+  function reportMessage(payloadBuffer: Buffer): boolean {
     let msg: unknown;
     try {
-      msg = JSON.parse(payload.toString("utf-8"));
+      msg = JSON.parse(payloadBuffer.toString("utf-8"));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       onError(new Error(`Failed to parse intercom message: ${message}`, { cause: error }));
@@ -47,39 +59,46 @@ export function createMessageReader(
   }
 
   return (data: Buffer) => {
-    let remaining = data;
+    let offset = 0;
 
-    while (remaining.length > 0) {
-      if (buffer.length < 4) {
-        const headerBytes = Math.min(4 - buffer.length, remaining.length);
-        buffer = Buffer.concat([buffer, remaining.subarray(0, headerBytes)]);
-        remaining = remaining.subarray(headerBytes);
-        if (buffer.length < 4) {
+    while (offset < data.length) {
+      if (headerOffset < 4) {
+        const headerBytes = Math.min(4 - headerOffset, data.length - offset);
+        data.copy(header, headerOffset, offset, offset + headerBytes);
+        headerOffset += headerBytes;
+        offset += headerBytes;
+        if (headerOffset < 4) {
           return;
         }
+
+        const length = header.readUInt32BE(0);
+        if (length > maxFrameBytes) {
+          resetFrame();
+          onError(new Error(`Intercom frame length ${length} exceeds maximum ${maxFrameBytes} bytes`));
+          return;
+        }
+        payload = Buffer.alloc(length);
+        payloadOffset = 0;
       }
 
-      const length = buffer.readUInt32BE(0);
-      if (length > maxFrameBytes) {
-        buffer = Buffer.alloc(0);
-        onError(new Error(`Intercom frame length ${length} exceeds maximum ${maxFrameBytes} bytes`));
-        return;
+      const activePayload = payload;
+      if (!activePayload) {
+        throw new Error("Intercom frame reader reached payload copy without an active payload");
       }
 
-      const missingPayloadBytes = length - Math.max(0, buffer.length - 4);
-      const payloadBytes = Math.min(missingPayloadBytes, remaining.length);
+      const payloadBytes = Math.min(activePayload.length - payloadOffset, data.length - offset);
       if (payloadBytes > 0) {
-        buffer = Buffer.concat([buffer, remaining.subarray(0, payloadBytes)]);
-        remaining = remaining.subarray(payloadBytes);
+        data.copy(activePayload, payloadOffset, offset, offset + payloadBytes);
+        payloadOffset += payloadBytes;
+        offset += payloadBytes;
       }
 
-      if (buffer.length < 4 + length) {
+      if (payloadOffset < activePayload.length) {
         return;
       }
 
-      const payload = buffer.subarray(4, 4 + length);
-      buffer = Buffer.alloc(0);
-      if (!reportMessage(payload)) {
+      resetFrame();
+      if (!reportMessage(activePayload)) {
         return;
       }
     }

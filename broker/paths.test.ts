@@ -37,10 +37,22 @@ test("getIntercomDirPath points at the intercom runtime directory under the agen
   assert.equal(getIntercomDirPath("/tmp/pi-agent"), join("/tmp/pi-agent", "intercom"));
 });
 
-test("getBrokerSocketPath uses named pipe on Windows", () => {
+test("getBrokerSocketPath uses a collision-resistant named pipe on Windows", () => {
   const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh/.pi/agent");
   assert.match(pipePath, /^\\\\\.\\pipe\\pi-intercom-/);
+  assert.match(pipePath, /-[0-9a-f]{16}$/);
   assert.doesNotMatch(pipePath, /broker\.sock$/);
+});
+
+// Both inputs sanitize to c-a-b, so the hash is the collision-resistant part.
+test("getBrokerSocketPath distinguishes Windows paths with the same sanitized prefix", () => {
+  const first = getBrokerSocketPath("win32", "C:/a/b");
+  const second = getBrokerSocketPath("win32", "C:/a-b");
+
+  assert.match(first, /^\\\\\.\\pipe\\pi-intercom-c-a-b-[0-9a-f]{16}$/);
+  assert.match(second, /^\\\\\.\\pipe\\pi-intercom-c-a-b-[0-9a-f]{16}$/);
+  assert.notEqual(first, second);
+  assert.equal(getBrokerSocketPath("win32", "C:/a/b"), first);
 });
 
 test("getBrokerSocketPath uses broker.sock under PI_CODING_AGENT_DIR on non-Windows", () => {

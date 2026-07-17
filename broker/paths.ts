@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, readFileSync } from "fs";
 import { isAbsolute, join, resolve } from "path";
 import { homedir } from "os";
+import { createHash } from "crypto";
 
 export const INTERCOM_DIR_MODE = 0o700;
 export const INTERCOM_RUNTIME_FILE_MODE = 0o600;
@@ -22,6 +23,14 @@ function sanitizePipeSegment(value: string): string {
     .replace(/[^a-zA-Z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase() || "default";
+}
+
+function normalizedPipeAgentDir(agentDir: string): string {
+  return resolve(agentDir).toLowerCase();
+}
+
+function pipeAgentDirHash(agentDir: string): string {
+  return createHash("sha256").update(normalizedPipeAgentDir(agentDir)).digest("hex").slice(0, 16);
 }
 
 export function getAgentDirPath(
@@ -67,7 +76,7 @@ export function getBrokerSocketPath(
   agentDir: string = getAgentDirPath(),
 ): string {
   if (platform === "win32") {
-    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(agentDir)}`;
+    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(agentDir)}-${pipeAgentDirHash(agentDir)}`;
   }
 
   return join(getIntercomDirPath(agentDir), "broker.sock");

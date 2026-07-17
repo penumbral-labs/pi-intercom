@@ -28,6 +28,8 @@ const REGISTRATION_TIMEOUT_MS = 1000;
 const RATE_LIMIT_CAPACITY = 240;
 const RATE_LIMIT_REFILL_PER_SECOND = 120;
 const PRESENCE_HEARTBEAT_MS = 1000;
+const MAX_PENDING_ASK_EDGES_PER_SESSION = 16;
+const MAX_PENDING_ASK_EDGES = MAX_SESSIONS * 4;
 
 interface ConnectedSession {
   socket: net.Socket;
@@ -132,6 +134,8 @@ function isSessionRegistration(value: unknown): value is SessionRegistration {
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
   private askEdges = new Map<string, AskEdge>();
+  private askEdgesByAsker = new Map<string, number>();
+  private askEdgesByPair = new Map<string, number>();
   private connections = new Set<net.Socket>();
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
@@ -281,6 +285,64 @@ class IntercomBroker {
     }
     connection.tokens -= 1;
     return true;
+  }
+
+  private askPairKey(from: string, to: string): string {
+    return `${from}\0${to}`;
+  }
+
+  private incrementCounter(map: Map<string, number>, key: string): void {
+    map.set(key, (map.get(key) ?? 0) + 1);
+  }
+
+  private decrementCounter(map: Map<string, number>, key: string): void {
+    const count = map.get(key);
+    if (count === undefined || count <= 1) {
+      map.delete(key);
+      return;
+    }
+    map.set(key, count - 1);
+  }
+
+  private addAskEdge(messageId: string, from: string, to: string, now = Date.now()): void {
+    this.deleteAskEdge(messageId);
+    const pairKey = this.askPairKey(from, to);
+    this.askEdges.set(messageId, { from, to, pairKey, createdAt: now });
+    this.incrementCounter(this.askEdgesByAsker, from);
+    this.incrementCounter(this.askEdgesByPair, pairKey);
+  }
+
+  private deleteAskEdge(messageId: string): boolean {
+    const edge = this.askEdges.get(messageId);
+    if (!edge) {
+      return false;
+    }
+    this.askEdges.delete(messageId);
+    this.decrementCounter(this.askEdgesByAsker, edge.from);
+    this.decrementCounter(this.askEdgesByPair, edge.pairKey);
+    return true;
+  }
+
+  private hasReverseAskEdge(from: string, to: string, excludingMessageId?: string): boolean {
+    const reversePairKey = this.askPairKey(to, from);
+    let count = this.askEdgesByPair.get(reversePairKey) ?? 0;
+    if (excludingMessageId) {
+      const excluded = this.askEdges.get(excludingMessageId);
+      if (excluded?.pairKey === reversePairKey) {
+        count -= 1;
+      }
+    }
+    return count > 0;
+  }
+
+  private canAddAskEdge(from: string): { ok: true } | { ok: false; reason: string } {
+    if (this.askEdges.size >= MAX_PENDING_ASK_EDGES) {
+      return { ok: false, reason: "Too many pending intercom asks" };
+    }
+    if ((this.askEdgesByAsker.get(from) ?? 0) >= MAX_PENDING_ASK_EDGES_PER_SESSION) {
+      return { ok: false, reason: "Too many pending intercom asks from this session" };
+    }
+    return { ok: true };
   }
 
   private scheduleShutdownCheck(): void {
@@ -458,8 +520,7 @@ class IntercomBroker {
             break;
           }
           if (message.expectsReply) {
-            const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.info.id && edge.to === currentId);
-            if (reverseEdge) {
+            if (this.hasReverseAskEdge(currentId, target.info.id, message.replyTo)) {
               writeMessage(socket, {
                 type: "delivery_failed",
                 messageId: message.id,
@@ -467,7 +528,16 @@ class IntercomBroker {
               });
               break;
             }
-            this.askEdges.set(message.id, { from: currentId, to: target.info.id, createdAt: Date.now() });
+            const askCapacity = this.canAddAskEdge(currentId);
+            if (!askCapacity.ok) {
+              writeMessage(socket, {
+                type: "delivery_failed",
+                messageId: message.id,
+                reason: askCapacity.reason,
+              });
+              break;
+            }
+            this.addAskEdge(message.id, currentId, target.info.id);
           }
           writeMessage(target.socket, {
             type: "message",
@@ -475,7 +545,7 @@ class IntercomBroker {
             message,
           });
           if (message.replyTo) {
-            this.askEdges.delete(message.replyTo);
+            this.deleteAskEdge(message.replyTo);
           }
           writeMessage(socket, { type: "delivered", messageId: message.id });
           break;
@@ -508,7 +578,7 @@ class IntercomBroker {
         const session = this.sessions.get(currentId);
         const edge = this.askEdges.get(clientMessage.messageId);
         if (session?.socket === socket && edge?.from === currentId) {
-          this.askEdges.delete(clientMessage.messageId);
+          this.deleteAskEdge(clientMessage.messageId);
         }
         break;
       }
@@ -565,7 +635,7 @@ class IntercomBroker {
   private pruneAskEdges(now = Date.now()): void {
     for (const [messageId, edge] of this.askEdges) {
       if (now - edge.createdAt > this.askTimeoutMs) {
-        this.askEdges.delete(messageId);
+        this.deleteAskEdge(messageId);
       }
     }
   }
@@ -573,7 +643,7 @@ class IntercomBroker {
   private clearAskEdgesForSession(sessionId: string): void {
     for (const [messageId, edge] of this.askEdges) {
       if (edge.from === sessionId || edge.to === sessionId) {
-        this.askEdges.delete(messageId);
+        this.deleteAskEdge(messageId);
       }
     }
   }
@@ -611,6 +681,8 @@ class IntercomBroker {
     }
     this.sessions.clear();
     this.askEdges.clear();
+    this.askEdgesByAsker.clear();
+    this.askEdgesByPair.clear();
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);

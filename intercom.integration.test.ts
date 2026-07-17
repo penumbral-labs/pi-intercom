@@ -1614,6 +1614,123 @@ test("regular intercom asks fail safely when started concurrently", { concurrenc
   }
 });
 
+test("broker bounds pending asks per session and frees capacity after cancellation", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const targets: IntercomClient[] = [];
+
+  try {
+    for (let i = 0; i < 17; i += 1) {
+      const target = new IntercomClient();
+      await target.connect({
+        name: `ask-limit-target-${i}`,
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      });
+      targets.push(target);
+    }
+
+    for (let i = 0; i < 16; i += 1) {
+      const result = await planner.send(targets[i].sessionId!, {
+        messageId: `per-session-ask-${i}`,
+        text: `Question ${i}?`,
+        expectsReply: true,
+      });
+      assert.equal(result.delivered, true);
+    }
+
+    const limited = await planner.send(targets[16].sessionId!, {
+      messageId: "per-session-ask-over-limit",
+      text: "One too many?",
+      expectsReply: true,
+    });
+    assert.equal(limited.delivered, false);
+    assert.match(limited.reason ?? "", /Too many pending intercom asks from this session/);
+
+    planner.cancelAsk("per-session-ask-0");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const afterCancel = await planner.send(targets[16].sessionId!, {
+      messageId: "per-session-ask-after-cancel",
+      text: "Capacity restored?",
+      expectsReply: true,
+    });
+    assert.equal(afterCancel.delivered, true);
+  } finally {
+    for (const target of targets) {
+      await target.disconnect().catch(() => undefined);
+    }
+    await cleanup();
+  }
+});
+
+test("broker bounds pending asks globally", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const askers: IntercomClient[] = [];
+  const targets: IntercomClient[] = [];
+  let extraAsker: IntercomClient | undefined;
+
+  try {
+    for (let i = 0; i < 32; i += 1) {
+      const asker = new IntercomClient();
+      const target = new IntercomClient();
+      await asker.connect({
+        name: `global-asker-${i}`,
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      });
+      askers.push(asker);
+      await target.connect({
+        name: `global-target-${i}`,
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      });
+      targets.push(target);
+    }
+    extraAsker = new IntercomClient();
+    await extraAsker.connect({
+      name: "global-extra-asker",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+
+    for (let round = 0; round < 16; round += 1) {
+      for (let i = 0; i < 32; i += 1) {
+        const result = await askers[i].send(targets[i].sessionId!, {
+          messageId: `global-ask-${round}-${i}`,
+          text: `Global question ${round}/${i}?`,
+          expectsReply: true,
+        });
+        assert.equal(result.delivered, true);
+      }
+    }
+
+    const limited = await extraAsker.send(targets[0].sessionId!, {
+      messageId: "global-ask-over-limit",
+      text: "One too many globally?",
+      expectsReply: true,
+    });
+    assert.equal(limited.delivered, false);
+    assert.match(limited.reason ?? "", /Too many pending intercom asks$/);
+  } finally {
+    for (const client of [...askers, ...targets, extraAsker].filter((client): client is IntercomClient => Boolean(client))) {
+      await client.disconnect().catch(() => undefined);
+    }
+    await cleanup();
+  }
+});
+
 test("broker refuses reverse mutual asks until the original ask is answered", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
 
