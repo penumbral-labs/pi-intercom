@@ -2,7 +2,7 @@ import net from "net";
 import { writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.ts";
+import { writeMessage, createMessageReader, IntercomFrameTooLargeError } from "./framing.ts";
 import {
   ensureIntercomRuntimeDir,
   getBrokerListenTarget,
@@ -46,6 +46,7 @@ interface ConnectionState {
 interface AskEdge {
   from: string;
   to: string;
+  pairKey: string;
   createdAt: number;
 }
 
@@ -233,6 +234,11 @@ class IntercomBroker {
         }
       });
     }, (error) => {
+      if (error.cause instanceof IntercomFrameTooLargeError) {
+        console.error(error.message);
+        socket.destroy(error);
+        return;
+      }
       socket.destroy(error);
     });
 
@@ -468,7 +474,15 @@ class IntercomBroker {
         }
 
         const sessions = Array.from(this.sessions.values()).map(s => s.info);
-        writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
+        try {
+          writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
+        } catch (error) {
+          if (error instanceof IntercomFrameTooLargeError) {
+            writeMessage(socket, { type: "error", error: "Intercom session list is too large" });
+            break;
+          }
+          throw error;
+        }
         break;
       }
 
@@ -537,15 +551,35 @@ class IntercomBroker {
               });
               break;
             }
-            this.addAskEdge(message.id, currentId, target.info.id);
           }
-          writeMessage(target.socket, {
-            type: "message",
-            from: fromSession.info,
-            message,
-          });
+          try {
+            writeMessage(target.socket, {
+              type: "message",
+              from: fromSession.info,
+              message,
+            });
+          } catch (error) {
+            if (error instanceof IntercomFrameTooLargeError) {
+              writeMessage(socket, {
+                type: "delivery_failed",
+                messageId: message.id,
+                reason: "Message is too large after broker metadata was added",
+              });
+              break;
+            }
+            target.socket.destroy(error instanceof Error ? error : new Error(String(error)));
+            writeMessage(socket, {
+              type: "delivery_failed",
+              messageId: message.id,
+              reason: "Target session socket write failed",
+            });
+            break;
+          }
           if (message.replyTo) {
             this.deleteAskEdge(message.replyTo);
+          }
+          if (message.expectsReply) {
+            this.addAskEdge(message.id, currentId, target.info.id);
           }
           writeMessage(socket, { type: "delivered", messageId: message.id });
           break;
@@ -668,7 +702,15 @@ class IntercomBroker {
   private broadcast(msg: BrokerMessage, exclude?: string): void {
     for (const [id, session] of this.sessions) {
       if (id !== exclude) {
-        writeMessage(session.socket, msg);
+        try {
+          writeMessage(session.socket, msg);
+        } catch (error) {
+          if (error instanceof IntercomFrameTooLargeError) {
+            console.error(`Skipping oversized ${msg.type} broadcast to ${id}: ${error.message}`);
+            continue;
+          }
+          session.socket.destroy(error instanceof Error ? error : new Error(String(error)));
+        }
       }
     }
   }

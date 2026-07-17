@@ -2,6 +2,12 @@ import type { Socket } from "net";
 
 export const MAX_FRAME_BYTES = 1024 * 1024;
 
+export class IntercomFrameTooLargeError extends Error {
+  constructor(readonly length: number, readonly maxFrameBytes: number) {
+    super(`Intercom frame length ${length} exceeds maximum ${maxFrameBytes} bytes`);
+  }
+}
+
 /**
  * Write a length-prefixed message to a socket.
  * Format: 4-byte big-endian length + JSON payload
@@ -10,7 +16,7 @@ export function writeMessage(socket: Socket, msg: unknown): void {
   const json = JSON.stringify(msg);
   const payload = Buffer.from(json, "utf-8");
   if (payload.length > MAX_FRAME_BYTES) {
-    throw new Error(`Intercom frame length ${payload.length} exceeds maximum ${MAX_FRAME_BYTES} bytes`);
+    throw new IntercomFrameTooLargeError(payload.length, MAX_FRAME_BYTES);
   }
   const header = Buffer.alloc(4);
   header.writeUInt32BE(payload.length, 0);

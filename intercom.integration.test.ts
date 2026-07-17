@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
+import { MAX_FRAME_BYTES } from "./broker/framing.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
 const repoDir = process.cwd();
@@ -226,16 +227,59 @@ async function connectRawRegistered(sessionId: string, name: string, sessionOver
   const { createMessageReader, writeMessage } = await import("./broker/framing.ts");
   const socket = net.connect(getBrokerSocketPath());
   await once(socket, "connect");
-  const registered = new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Raw register timed out")), 2000);
-    const reader = createMessageReader((msg) => {
-      if (typeof msg === "object" && msg !== null && "type" in msg && msg.type === "registered") {
-        clearTimeout(timeout);
-        socket.off("data", reader);
-        resolve();
-      }
-    }, reject);
-    socket.on("data", reader);
+  const messages: unknown[] = [];
+  const waiters: Array<{
+    predicate: (message: unknown) => boolean;
+    resolve: (message: unknown) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }> = [];
+  const waiterFor = (predicate: (message: unknown) => boolean, timeoutMessage: string, timeoutMs = 2000): Promise<unknown> => {
+    const existingIndex = messages.findIndex(predicate);
+    if (existingIndex !== -1) {
+      const [message] = messages.splice(existingIndex, 1);
+      return Promise.resolve(message);
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        predicate,
+        resolve,
+        reject,
+        timeout: setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index !== -1) {
+            waiters.splice(index, 1);
+          }
+          reject(new Error(timeoutMessage));
+        }, timeoutMs),
+      };
+      waiters.push(waiter);
+    });
+  };
+  const reader = createMessageReader((msg) => {
+    const waiterIndex = waiters.findIndex((waiter) => waiter.predicate(msg));
+    if (waiterIndex !== -1) {
+      const [waiter] = waiters.splice(waiterIndex, 1);
+      clearTimeout(waiter.timeout);
+      waiter.resolve(msg);
+      return;
+    }
+    messages.push(msg);
+  }, (error) => {
+    while (waiters.length > 0) {
+      const waiter = waiters.shift()!;
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
+  });
+  socket.on("data", reader);
+  socket.on("close", () => {
+    const error = new Error("Raw socket closed");
+    while (waiters.length > 0) {
+      const waiter = waiters.shift()!;
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
   });
   writeMessage(socket, {
     type: "register",
@@ -250,8 +294,12 @@ async function connectRawRegistered(sessionId: string, name: string, sessionOver
       ...sessionOverrides,
     },
   });
-  await registered;
-  return { socket, writeMessage };
+  await waiterFor((msg) => typeof msg === "object" && msg !== null && "type" in msg && msg.type === "registered", "Raw register timed out");
+  return {
+    socket,
+    writeMessage,
+    waitForMessage: waiterFor,
+  };
 }
 
 test("opt-in TCP broker requires endpoint state for health and registration", { concurrency: false }, async () => {
@@ -524,6 +572,24 @@ async function waitForNoSessionId(client: InstanceType<typeof IntercomClient>, s
   throw new Error(`Timed out waiting for ${sessionId} to leave`);
 }
 
+function makeOversizedByBrokerWrappingText(sender: SessionInfo, messageId: string): string {
+  const timestamp = Date.now();
+  const envelopeWithoutText = Buffer.byteLength(JSON.stringify({
+    type: "message",
+    from: sender,
+    message: { id: messageId, timestamp, expectsReply: true, content: { text: "" } },
+  }), "utf-8");
+  const inboundWithoutText = Buffer.byteLength(JSON.stringify({
+    type: "send",
+    to: "broker-wrap-target",
+    message: { id: messageId, timestamp, expectsReply: true, content: { text: "" } },
+  }), "utf-8");
+  const maxInboundTextBytes = MAX_FRAME_BYTES - inboundWithoutText;
+  const maxWrappedTextBytes = MAX_FRAME_BYTES - envelopeWithoutText;
+  assert.ok(maxInboundTextBytes > maxWrappedTextBytes, "broker envelope must be larger than client send envelope");
+  return "x".repeat(maxWrappedTextBytes + 1);
+}
+
 test("broker accepts caller supplied stable IDs across reconnect", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const worker = new IntercomClient();
@@ -743,6 +809,87 @@ test("old stable-ID socket cannot mutate the replacement session", { concurrency
   }
 });
 
+test("near-limit sends that become oversized after broker wrapping fail without disconnecting the sender", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const target = await connectRawRegistered("broker-wrap-target", "broker-wrap-target");
+
+  try {
+    const sender = await waitForSessionId(orchestrator, planner.sessionId!);
+    const oversizedMessageId = "oversized-after-broker-wrap";
+    const oversizedText = makeOversizedByBrokerWrappingText(sender, oversizedMessageId);
+
+    const targetSession = await waitForSessionId(planner, "broker-wrap-target");
+    const presenceWithoutStatus = Buffer.byteLength(JSON.stringify({
+      type: "presence",
+      status: "",
+    }), "utf-8");
+    const oversizedPresenceStatus = "x".repeat(MAX_FRAME_BYTES - presenceWithoutStatus);
+    const oversizedPresenceBroadcast = {
+      type: "presence_update",
+      session: { ...targetSession, lastActivity: Date.now(), status: oversizedPresenceStatus },
+    };
+    assert.equal(Buffer.byteLength(JSON.stringify({
+      type: "presence",
+      status: oversizedPresenceStatus,
+    }), "utf-8"), MAX_FRAME_BYTES);
+    assert.ok(Buffer.byteLength(JSON.stringify(oversizedPresenceBroadcast), "utf-8") > MAX_FRAME_BYTES);
+    assert.doesNotThrow(() => {
+      target.writeMessage(target.socket, { type: "presence", status: oversizedPresenceStatus });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(planner.isConnected(), true);
+    assert.equal(orchestrator.isConnected(), true);
+    target.writeMessage(target.socket, { type: "presence", status: "normal" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const oversized = await planner.send("broker-wrap-target", {
+      messageId: oversizedMessageId,
+      text: oversizedText,
+      expectsReply: true,
+    });
+    assert.equal(oversized.delivered, false);
+    assert.match(oversized.reason ?? "", /too large/i);
+    assert.equal(planner.isConnected(), true);
+
+    target.writeMessage(target.socket, {
+      type: "send",
+      to: planner.sessionId,
+      message: {
+        id: "reverse-after-oversized-wrap",
+        timestamp: Date.now(),
+        expectsReply: true,
+        content: { text: "No stale ask edge should remain." },
+      },
+    });
+    const reverseAfterOversized = await target.waitForMessage((msg) => {
+      return typeof msg === "object" && msg !== null
+        && "messageId" in msg
+        && msg.messageId === "reverse-after-oversized-wrap";
+    }, "Reverse ask after oversized send did not resolve");
+    assert.deepEqual(reverseAfterOversized, { type: "delivered", messageId: "reverse-after-oversized-wrap" });
+
+    const normalReceived = target.waitForMessage((msg) => {
+      return typeof msg === "object" && msg !== null
+        && "type" in msg
+        && msg.type === "message"
+        && "message" in msg
+        && typeof msg.message === "object"
+        && msg.message !== null
+        && "id" in msg.message
+        && msg.message.id === "normal-after-oversized-wrap";
+    }, "Normal message after oversized send was not delivered");
+    const normal = await planner.send("broker-wrap-target", {
+      messageId: "normal-after-oversized-wrap",
+      text: "sender still works",
+    });
+    assert.equal(normal.delivered, true);
+    await normalReceived;
+  } finally {
+    target.socket.destroy();
+    await cleanup();
+  }
+});
+
 test("stable-ID replacement clears old ask edges and ignores stale cancels", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const first = await connectRawRegistered("replaceable-asker-id", "replaceable-asker-old");
@@ -754,7 +901,7 @@ test("stable-ID replacement clears old ask edges and ignores stale cancels", { c
       to: orchestrator.sessionId,
       message: { id: "old-ask-edge", timestamp: Date.now(), expectsReply: true, content: { text: "Old ask" } },
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await first.waitForMessage((msg) => typeof msg === "object" && msg !== null && "type" in msg && msg.type === "delivered", "Old ask was not delivered");
 
     await replacement.connect({
       name: "replaceable-asker-new",
@@ -1726,6 +1873,76 @@ test("broker bounds pending asks globally", { concurrency: false }, async () => 
   } finally {
     for (const client of [...askers, ...targets, extraAsker].filter((client): client is IntercomClient => Boolean(client))) {
       await client.disconnect().catch(() => undefined);
+    }
+    await cleanup();
+  }
+});
+
+test("broker frees ask capacity when a stable-ID replacement clears old edges", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const asker = new IntercomClient();
+  const replacement = new IntercomClient();
+  const targets: IntercomClient[] = [];
+
+  try {
+    await asker.connect({
+      name: "replace-capacity-asker-old",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "replace-capacity-asker-id");
+    for (let i = 0; i < 17; i += 1) {
+      const target = new IntercomClient();
+      await target.connect({
+        name: `replace-capacity-target-${i}`,
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      });
+      targets.push(target);
+    }
+
+    for (let i = 0; i < 16; i += 1) {
+      const result = await asker.send(targets[i].sessionId!, {
+        messageId: `replace-capacity-ask-${i}`,
+        text: `Question ${i}?`,
+        expectsReply: true,
+      });
+      assert.equal(result.delivered, true);
+    }
+
+    const limited = await asker.send(targets[16].sessionId!, {
+      messageId: "replace-capacity-over-limit",
+      text: "One too many?",
+      expectsReply: true,
+    });
+    assert.equal(limited.delivered, false);
+    assert.match(limited.reason ?? "", /Too many pending intercom asks from this session/);
+
+    await replacement.connect({
+      name: "replace-capacity-asker-new",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "replace-capacity-asker-id");
+
+    const afterReplacement = await replacement.send(targets[16].sessionId!, {
+      messageId: "replace-capacity-after-replacement",
+      text: "Capacity restored?",
+      expectsReply: true,
+    });
+    assert.equal(afterReplacement.delivered, true);
+  } finally {
+    await asker.disconnect().catch(() => undefined);
+    await replacement.disconnect().catch(() => undefined);
+    for (const target of targets) {
+      await target.disconnect().catch(() => undefined);
     }
     await cleanup();
   }
