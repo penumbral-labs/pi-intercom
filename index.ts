@@ -739,8 +739,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
 
     const entries = pendingIdleMessages.splice(0, pendingIdleMessages.length);
+    const triggerIndex = entries.findIndex((entry) => shouldTriggerInboundMessage(entry));
     entries.forEach((entry, index) => {
-      sendIncomingMessage(entry, index === 0 ? "trigger" : "followUp");
+      sendIncomingMessage(entry, index === triggerIndex ? "trigger" : "followUp");
     });
   }
   function queueIdleMessage(entry: InboundMessageEntry): void {

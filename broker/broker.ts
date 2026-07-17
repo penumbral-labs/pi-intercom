@@ -341,8 +341,9 @@ class IntercomBroker {
     return count > 0;
   }
 
-  private canAddAskEdge(from: string): { ok: true } | { ok: false; reason: string } {
-    if (this.askEdges.size >= MAX_PENDING_ASK_EDGES) {
+  private canAddAskEdge(from: string, replacingMessageId?: string): { ok: true } | { ok: false; reason: string } {
+    const replacingExistingEdge = replacingMessageId !== undefined && this.askEdges.has(replacingMessageId);
+    if (this.askEdges.size >= MAX_PENDING_ASK_EDGES && !replacingExistingEdge) {
       return { ok: false, reason: "Too many pending intercom asks" };
     }
     if ((this.askEdgesByAsker.get(from) ?? 0) >= MAX_PENDING_ASK_EDGES_PER_SESSION) {
@@ -534,6 +535,14 @@ class IntercomBroker {
             break;
           }
           if (message.expectsReply) {
+            if (this.askEdges.has(message.id)) {
+              writeMessage(socket, {
+                type: "delivery_failed",
+                messageId: message.id,
+                reason: "Duplicate pending ask message ID",
+              });
+              break;
+            }
             if (this.hasReverseAskEdge(currentId, target.info.id, message.replyTo)) {
               writeMessage(socket, {
                 type: "delivery_failed",
@@ -542,7 +551,7 @@ class IntercomBroker {
               });
               break;
             }
-            const askCapacity = this.canAddAskEdge(currentId);
+            const askCapacity = this.canAddAskEdge(currentId, message.replyTo);
             if (!askCapacity.ok) {
               writeMessage(socket, {
                 type: "delivery_failed",

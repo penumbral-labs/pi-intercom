@@ -482,6 +482,49 @@ function waitForReply(client: InstanceType<typeof IntercomClient>, replyTo: stri
   });
 }
 
+async function waitForNoMessage(client: InstanceType<typeof IntercomClient>, predicate: (from: SessionInfo, message: Message) => boolean, timeoutMs = 100): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      client.off("message", handler);
+      resolve();
+    }, timeoutMs);
+    const handler = (from: SessionInfo, message: Message) => {
+      if (!predicate(from, message)) {
+        return;
+      }
+      clearTimeout(timeout);
+      client.off("message", handler);
+      reject(new Error(`Received unexpected message ${message.id}`));
+    };
+    client.on("message", handler);
+  });
+}
+
+async function sendAskUntilDelivered(
+  client: InstanceType<typeof IntercomClient>,
+  to: string,
+  options: { messageId: string; text: string },
+  timeoutMs = 1000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastReason = "";
+  while (Date.now() < deadline) {
+    const result = await client.send(to, {
+      ...options,
+      expectsReply: true,
+    });
+    if (result.delivered) {
+      return;
+    }
+    lastReason = result.reason ?? "unknown failure";
+    if (!/Too many pending intercom asks from this session/.test(lastReason)) {
+      throw new Error(`Retry ask ${options.messageId} failed: ${lastReason}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ask capacity after cancellation: ${lastReason}`);
+}
+
 async function assertLateReplyIsDropped(options: {
   harness: ReturnType<typeof createExtensionHarness>;
   intercomTool: CapturedTool;
@@ -654,6 +697,69 @@ test("broker rejects unknown replyTo values instead of delivering forged replies
     assert.equal(result.delivered, false);
     assert.match(result.reason ?? "", /pending ask/i);
   } finally {
+    await cleanup();
+  }
+});
+
+test("broker rejects duplicate pending ask IDs without replacing the original edge", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const duplicate = new IntercomClient();
+
+  try {
+    await duplicate.connect({
+      name: "duplicate-ask-sender",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+
+    const originalAskReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const original = await planner.send(orchestrator.sessionId!, {
+      messageId: "duplicate-pending-ask-id",
+      text: "Original ask?",
+      expectsReply: true,
+    });
+    assert.equal(original.delivered, true);
+    const [, originalMessage] = await originalAskReceived;
+    assert.equal(originalMessage.id, "duplicate-pending-ask-id");
+
+    const duplicateDelivered = waitForNoMessage(
+      orchestrator,
+      (_from, message) => message.id === "duplicate-pending-ask-id" && message.content.text === "Replacement ask?",
+    );
+    const duplicateResult = await duplicate.send(orchestrator.sessionId!, {
+      messageId: "duplicate-pending-ask-id",
+      text: "Replacement ask?",
+      expectsReply: true,
+    });
+    assert.equal(duplicateResult.delivered, false);
+    assert.match(duplicateResult.reason ?? "", /Duplicate pending ask message ID/);
+    await duplicateDelivered;
+
+    duplicate.cancelAsk("duplicate-pending-ask-id");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const reverseWhileOriginalPending = await orchestrator.send(planner.sessionId!, {
+      messageId: "reverse-after-duplicate-cancel",
+      text: "Can I replace the original?",
+      expectsReply: true,
+    });
+    assert.equal(reverseWhileOriginalPending.delivered, false);
+    assert.match(reverseWhileOriginalPending.reason ?? "", /Mutual ask refused/);
+
+    const replyPromise = waitForReply(planner, "duplicate-pending-ask-id", 1000);
+    const reply = await orchestrator.send(planner.sessionId!, {
+      messageId: "reply-to-original-duplicate-id",
+      text: "Answering the original.",
+      replyTo: "duplicate-pending-ask-id",
+    });
+    assert.equal(reply.delivered, true);
+    const receivedReply = await replyPromise;
+    assert.equal(receivedReply.message.content.text, "Answering the original.");
+  } finally {
+    await duplicate.disconnect().catch(() => undefined);
     await cleanup();
   }
 });
@@ -1221,6 +1327,65 @@ test("busy interactive sessions idle-gate top-level asks without aborting", { co
     assert.match(harness.sentMessages[0]?.message.content ?? "", /Can you respond after your current turn/);
   } finally {
     await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("idle-gated replies trigger one turn without reordering earlier queued messages", { concurrency: false }, async () => {
+  const { getConfigPath } = await import("./config.ts");
+  const configPath = getConfigPath();
+  mkdirSync(path.dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify({ inboundTrigger: "replies" }));
+  const { default: piIntercomExtension } = await import(`./index.ts?idle-reply-order-${Date.now()}`);
+  const { planner, cleanup } = await setupClients();
+  let idle = false;
+  const harness = createExtensionHarness("idle-reply-order-worker", {
+    hasUI: true,
+    isIdle: () => idle,
+  });
+
+  try {
+    await withCapturedIntercomClients(async (clients) => {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const target = await waitForSessionByName(planner, "idle-reply-order-worker");
+      const workerClient = clients.find((candidate) => candidate.sessionId === target.id);
+      assert.ok(workerClient);
+
+      const normal = await planner.send(target.id, {
+        messageId: "queued-normal-before-reply",
+        text: "Queued normal message first.",
+      });
+      assert.equal(normal.delivered, true);
+
+      const workerAsk = await workerClient.send(planner.sessionId!, {
+        messageId: "worker-ask-for-queued-reply",
+        text: "Please reply while I am busy.",
+        expectsReply: true,
+      });
+      assert.equal(workerAsk.delivered, true);
+      const reply = await planner.send(target.id, {
+        messageId: "queued-reply-after-normal",
+        text: "Queued reply second.",
+        replyTo: "worker-ask-for-queued-reply",
+      });
+      assert.equal(reply.delivered, true);
+      assert.equal(harness.sentMessages.length, 0);
+
+      idle = true;
+      await harness.emitLifecycle("agent_end");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      assert.equal(harness.sentMessages.length, 2);
+      assert.match(harness.sentMessages[0]?.message.content ?? "", /Queued normal message first/);
+      assert.deepEqual(harness.sentMessages[0]?.options, { deliverAs: "followUp" });
+      assert.match(harness.sentMessages[1]?.message.content ?? "", /Queued reply second/);
+      assert.equal(harness.sentMessages[1]?.options?.triggerTurn, true);
+      assert.equal(harness.sentMessages.filter((sent) => sent.options?.triggerTurn === true).length, 1);
+    });
+  } finally {
+    rmSync(configPath, { force: true });
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
     await cleanup();
   }
 });
@@ -1797,14 +1962,11 @@ test("broker bounds pending asks per session and frees capacity after cancellati
     assert.match(limited.reason ?? "", /Too many pending intercom asks from this session/);
 
     planner.cancelAsk("per-session-ask-0");
-    await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const afterCancel = await planner.send(targets[16].sessionId!, {
+    await sendAskUntilDelivered(planner, targets[16].sessionId!, {
       messageId: "per-session-ask-after-cancel",
       text: "Capacity restored?",
-      expectsReply: true,
     });
-    assert.equal(afterCancel.delivered, true);
   } finally {
     for (const target of targets) {
       await target.disconnect().catch(() => undefined);
@@ -1872,6 +2034,115 @@ test("broker bounds pending asks globally", { concurrency: false }, async () => 
     assert.match(limited.reason ?? "", /Too many pending intercom asks$/);
   } finally {
     for (const client of [...askers, ...targets, extraAsker].filter((client): client is IntercomClient => Boolean(client))) {
+      await client.disconnect().catch(() => undefined);
+    }
+    await cleanup();
+  }
+});
+
+test("broker allows reply-and-ask handoff at full global ask capacity", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const requester = new IntercomClient();
+  const responder = new IntercomClient();
+  const fillerAskers: IntercomClient[] = [];
+  const fillerTargets: IntercomClient[] = [];
+  let extraAsker: IntercomClient | undefined;
+
+  try {
+    await requester.connect({
+      name: "global-handoff-requester",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+    await responder.connect({
+      name: "global-handoff-responder",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+    for (let i = 0; i < 32; i += 1) {
+      const asker = new IntercomClient();
+      const target = new IntercomClient();
+      await asker.connect({
+        name: `global-handoff-filler-asker-${i}`,
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      });
+      fillerAskers.push(asker);
+      await target.connect({
+        name: `global-handoff-filler-target-${i}`,
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      });
+      fillerTargets.push(target);
+    }
+    extraAsker = new IntercomClient();
+    await extraAsker.connect({
+      name: "global-handoff-extra-asker",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+
+    const firstAsk = await requester.send(responder.sessionId!, {
+      messageId: "global-handoff-original",
+      text: "Can you take this?",
+      expectsReply: true,
+    });
+    assert.equal(firstAsk.delivered, true);
+
+    for (let i = 0; i < fillerAskers.length; i += 1) {
+      const askCount = i === 0 ? 15 : 16;
+      for (let round = 0; round < askCount; round += 1) {
+        const result = await fillerAskers[i].send(fillerTargets[i].sessionId!, {
+          messageId: `global-handoff-filler-${i}-${round}`,
+          text: `Filler question ${i}/${round}?`,
+          expectsReply: true,
+        });
+        assert.equal(result.delivered, true);
+      }
+    }
+
+    const limited = await extraAsker.send(fillerTargets[0].sessionId!, {
+      messageId: "global-handoff-over-limit",
+      text: "One too many before handoff?",
+      expectsReply: true,
+    });
+    assert.equal(limited.delivered, false);
+    assert.match(limited.reason ?? "", /Too many pending intercom asks$/);
+
+    const handoff = await responder.send(requester.sessionId!, {
+      messageId: "global-handoff-reply-and-ask",
+      text: "Answered; can you take the follow-up?",
+      replyTo: "global-handoff-original",
+      expectsReply: true,
+    });
+    assert.equal(handoff.delivered, true);
+
+    const stillFull = await extraAsker.send(fillerTargets[0].sessionId!, {
+      messageId: "global-handoff-still-full",
+      text: "Still one too many after handoff?",
+      expectsReply: true,
+    });
+    assert.equal(stillFull.delivered, false);
+    assert.match(stillFull.reason ?? "", /Too many pending intercom asks$/);
+  } finally {
+    await requester.disconnect().catch(() => undefined);
+    await responder.disconnect().catch(() => undefined);
+    for (const client of [...fillerAskers, ...fillerTargets, extraAsker].filter((client): client is IntercomClient => Boolean(client))) {
       await client.disconnect().catch(() => undefined);
     }
     await cleanup();
