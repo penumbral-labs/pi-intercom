@@ -5,6 +5,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ## [Unreleased]
 
 ### Changed
+
 - Updated Pi runtime peer metadata and tool schemas for the `@earendil-works` package scope and Pi-bundled `typebox`/`pi-ai` packages.
 - Centralized pi-intercom runtime and config paths under `PI_CODING_AGENT_DIR` when set, defaulting to `~/.pi/agent`.
 - Hardened default broker auto-spawn to launch the resolved bundled `tsx` CLI through the current Node executable instead of resolving `npx` through `PATH`; custom `brokerCommand`/`brokerArgs` remain available as advanced trusted config.
@@ -12,6 +13,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Made inline intercom messages collapse and expand with Pi's `Ctrl+O` custom-message toggle while keeping sender, preview, reply, and attachment cues visible. Thanks to RyanKim17920 for PR #32.
 
 ### Fixed
+
 - Let native `pi-subagents` supervisor metadata own child `contact_supervisor` while keeping broker-backed `intercom` available, and drop late replies to timed-out or cancelled asks.
 - Added broker-owned local trust metadata, clearer stable-ID trust boundaries for duplicate names, per-connection rate limiting, and no-op presence coalescing for local IPC abuse hardening.
 - Added an inbound broker frame size cap to reject oversized local IPC messages before buffering their payloads.
@@ -21,7 +23,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Stabilized intercom session addressing across reconnects, idle `/name` changes, replaced Pi sessions, supervisor routing, pending replies, and short-ID targeting.
 - Aligned intercom overlay widths with their rendered modal boxes. Thanks to Cat for PR #43.
 - Marked failed `intercom` and `contact_supervisor` tool results through Pi's `tool_result` error flag path while preserving structured renderer details.
-- Limited the intercom overlay to TUI mode and unsubscribed subagent relay event handlers during session shutdown.
+- Limited the intercom overlay to TUI mode and gated subagent relay event delivery to active sessions.
 - Added an opt-in Windows localhost TCP transport using a dynamic port, broker protocol health checks, and a local endpoint secret instead of a fixed-port default.
 
 ## [0.6.0] - 2026-05-03

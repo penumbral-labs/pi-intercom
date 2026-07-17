@@ -788,13 +788,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             try {
               const result = await activeClient.send(from.id, {
                 text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
-                replyTo: message.id,
+                ...(message.expectsReply ? { replyTo: message.id } : {}),
               });
-              if (result.delivered && getLiveContext(liveContext, messageGeneration)) {
+              if (message.expectsReply && result.delivered && getLiveContext(liveContext, messageGeneration)) {
                 replyTracker.markReplied(message.id);
               }
             } catch {
-              // Best-effort reply; keep the busy non-interactive session running either way.
+              // Best-effort notice; keep the busy non-interactive session running either way.
             }
           }
           return;
@@ -931,8 +931,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return await resolveSessionTarget(activeClient, metadata.orchestratorTarget) ?? metadata.orchestratorTarget;
   }
-  function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
-    const liveContext = getLiveContext();
+  function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string, generation = runtimeGeneration): void {
+    const liveContext = getLiveContext(runtimeContext, generation);
+    if (!liveContext) return;
     const now = Date.now();
     sendIncomingMessage({
       from: {
@@ -951,7 +952,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         content: { text: messageText },
       },
       bodyText: messageText,
-    }, "trigger", runtimeGeneration, true);
+    }, "trigger", generation, true);
   }
   function recordSubagentDeliveryError(entryType: string, to: string, message: string, error: unknown): void {
     pi.appendEntry(entryType, {
@@ -1022,13 +1023,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!parsed) return;
 
     const relayGeneration = runtimeGeneration;
+    const relayStillLive = () => config.enabled && Boolean(getLiveContext(runtimeContext, relayGeneration));
+    if (!relayStillLive()) {
+      if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+      return;
+    }
+
     void (async () => {
-      const relayStillLive = () => !runtimeStarted || Boolean(getLiveContext(runtimeContext, relayGeneration));
       if (!relayStillLive()) {
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
         return;
       }
       if (currentSessionTargetMatches(parsed.to)) {
-        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message, relayGeneration);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
         return;
       }
@@ -1049,7 +1056,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (currentSessionTargetMatches(parsed.to, target, activeClient)) {
-        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message, relayGeneration);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
         return;
       }
@@ -1071,14 +1078,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
     })();
   }
-  const unsubscribeSubagentControlIntercom = pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
+  pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
     relaySubagentIntercomPayload(payload, {
       sender: "subagent-control",
       status: "needs_attention",
       errorEntryType: "intercom_control_error",
     });
   });
-  const unsubscribeSubagentResultIntercom = pi.events.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
+  pi.events.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
     relaySubagentIntercomPayload(payload, {
       sender: "subagent-result",
       status: "result",
@@ -1094,8 +1101,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
   
   pi.on("session_shutdown", async () => {
-    unsubscribeSubagentControlIntercom();
-    unsubscribeSubagentResultIntercom();
     shuttingDown = true;
     disposed = true;
     runtimeGeneration += 1;

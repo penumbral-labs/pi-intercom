@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -1210,6 +1210,43 @@ test("busy non-interactive sessions auto-reply to top-level asks without abortin
   }
 });
 
+test("busy non-interactive sessions send notices for plain top-level sends", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let abortCount = 0;
+  const harness = createExtensionHarness("plain-send-worker", {
+    abort: () => { abortCount += 1; },
+    hasUI: false,
+    isIdle: () => false,
+  });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const target = await waitForSessionByName(planner, "plain-send-worker");
+    const noticePromise = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const delivered = await planner.send(target.id, {
+      messageId: "pipe-mode-send",
+      text: "Plain FYI while busy.",
+    });
+    assert.equal(delivered.delivered, true);
+
+    const [_from, notice] = await Promise.race([
+      noticePromise,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for busy notice")), 1000)),
+    ]);
+    assert.equal(notice.replyTo, undefined);
+    assert.equal(notice.expectsReply, undefined);
+    assert.match(notice.content.text, /non-interactive|cannot respond/i);
+    assert.equal(abortCount, 0);
+
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("supervisor tool registers only when child metadata is present", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
 
@@ -2032,82 +2069,121 @@ test("intercom reply dismisses stale pending ask only when sender session is gon
 
 test("subagent control intercom events wake the current orchestrator session", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
-  const events = new EventEmitter();
-  const sentMessages: Array<{ message: { customType?: string; content?: string }; options?: { triggerTurn?: boolean } }> = [];
-  const pi = {
-    getSessionName: () => "orchestrator",
-    events: {
-      on: (channel: string, handler: (payload: unknown) => void) => {
-        events.on(channel, handler);
-        return () => events.off(channel, handler);
-      },
-      emit: (channel: string, payload: unknown) => events.emit(channel, payload),
-    },
-    on: () => undefined,
-    registerMessageRenderer: () => undefined,
-    registerTool: () => undefined,
-    registerCommand: () => undefined,
-    registerShortcut: () => undefined,
-    sendMessage: (message: { customType?: string; content?: string }, options?: { triggerTurn?: boolean }) => {
-      sentMessages.push({ message, options });
-    },
-    appendEntry: () => undefined,
-  };
+  const harness = createExtensionHarness("orchestrator");
 
-  piIntercomExtension(pi as never);
-  pi.events.emit("subagent:control-intercom", {
+  piIntercomExtension(harness.pi as never);
+  await harness.emitLifecycle("session_start");
+  harness.pi.events.emit("subagent:control-intercom", {
     to: "orchestrator",
     message: "subagent needs attention\n\nworker needs attention in run 78f659a3.",
   });
-  await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(sentMessages.length, 1);
-  assert.equal(sentMessages[0]?.message.customType, "intercom_message");
-  assert.match(sentMessages[0]?.message.content ?? "", /From subagent-control/);
-  assert.match(sentMessages[0]?.message.content ?? "", /worker needs attention in run 78f659a3/);
-  assert.equal(sentMessages[0]?.options?.triggerTurn, true);
+  assert.equal(harness.sentMessages.length, 1);
+  assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
+  assert.match(harness.sentMessages[0]?.message.content ?? "", /From subagent-control/);
+  assert.match(harness.sentMessages[0]?.message.content ?? "", /worker needs attention in run 78f659a3/);
+  assert.equal(harness.sentMessages[0]?.options?.triggerTurn, true);
+  await harness.emitLifecycle("session_shutdown");
 });
 
 test("subagent result intercom events wake the current orchestrator session", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
-  const events = new EventEmitter();
-  const sentMessages: Array<{ message: { customType?: string; content?: string }; options?: { triggerTurn?: boolean } }> = [];
+  const harness = createExtensionHarness("orchestrator");
   const deliveryAcks: unknown[] = [];
-  events.on("subagent:result-intercom-delivery", (payload) => deliveryAcks.push(payload));
-  const pi = {
-    getSessionName: () => "orchestrator",
-    events: {
-      on: (channel: string, handler: (payload: unknown) => void) => {
-        events.on(channel, handler);
-        return () => events.off(channel, handler);
-      },
-      emit: (channel: string, payload: unknown) => events.emit(channel, payload),
-    },
-    on: () => undefined,
-    registerMessageRenderer: () => undefined,
-    registerTool: () => undefined,
-    registerCommand: () => undefined,
-    registerShortcut: () => undefined,
-    sendMessage: (message: { customType?: string; content?: string }, options?: { triggerTurn?: boolean }) => {
-      sentMessages.push({ message, options });
-    },
-    appendEntry: () => undefined,
-  };
+  harness.pi.events.on("subagent:result-intercom-delivery", (payload) => deliveryAcks.push(payload));
 
-  piIntercomExtension(pi as never);
-  pi.events.emit("subagent:result-intercom", {
+  piIntercomExtension(harness.pi as never);
+  await harness.emitLifecycle("session_start");
+  harness.pi.events.emit("subagent:result-intercom", {
     to: "orchestrator",
     requestId: "result-1",
     message: "subagent result\n\nRun: 78f659a3\nAgent: worker\nStatus: completed",
   });
-  await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(sentMessages.length, 1);
-  assert.equal(sentMessages[0]?.message.customType, "intercom_message");
-  assert.match(sentMessages[0]?.message.content ?? "", /From subagent-result/);
-  assert.match(sentMessages[0]?.message.content ?? "", /Status: completed/);
-  assert.equal(sentMessages[0]?.options?.triggerTurn, true);
+  assert.equal(harness.sentMessages.length, 1);
+  assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
+  assert.match(harness.sentMessages[0]?.message.content ?? "", /From subagent-result/);
+  assert.match(harness.sentMessages[0]?.message.content ?? "", /Status: completed/);
+  assert.equal(harness.sentMessages[0]?.options?.triggerTurn, true);
   assert.deepEqual(deliveryAcks, [{ requestId: "result-1", delivered: true }]);
+  await harness.emitLifecycle("session_shutdown");
+});
+
+test("subagent relay events honor disabled and inactive runtimes", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-intercom-disabled-relay-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    const intercomDir = path.join(root, "intercom");
+    mkdirSync(intercomDir, { recursive: true });
+    writeFileSync(path.join(intercomDir, "config.json"), JSON.stringify({ enabled: false }));
+    process.env.PI_CODING_AGENT_DIR = root;
+
+    const { default: piIntercomExtension } = await import(`./index.ts?disabled-relay-${Date.now()}`);
+    const harness = createExtensionHarness("orchestrator");
+    const deliveryAcks: unknown[] = [];
+    harness.pi.events.on("subagent:result-intercom-delivery", (payload) => deliveryAcks.push(payload));
+
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    harness.pi.events.emit("subagent:control-intercom", {
+      to: "orchestrator",
+      message: "control should not deliver",
+    });
+    harness.pi.events.emit("subagent:result-intercom", {
+      to: "orchestrator",
+      requestId: "disabled-result",
+      message: "result should not deliver",
+    });
+
+    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(deliveryAcks.length, 1);
+    assert.deepEqual(deliveryAcks[0], {
+      requestId: "disabled-result",
+      delivered: false,
+      error: "Intercom runtime is not active",
+    });
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("subagent relay listeners survive session restart without duplicate delivery", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("orchestrator");
+  const deliveryAcks: unknown[] = [];
+  harness.pi.events.on("subagent:result-intercom-delivery", (payload) => deliveryAcks.push(payload));
+
+  piIntercomExtension(harness.pi as never);
+  await harness.emitLifecycle("session_start");
+  harness.pi.events.emit("subagent:control-intercom", {
+    to: "orchestrator",
+    message: "first delivery",
+  });
+  assert.equal(harness.sentMessages.length, 1);
+
+  await harness.emitLifecycle("session_shutdown");
+  harness.pi.events.emit("subagent:result-intercom", {
+    to: "orchestrator",
+    requestId: "shutdown-result",
+    message: "should not deliver while shut down",
+  });
+  assert.equal(harness.sentMessages.length, 1);
+  assert.deepEqual(deliveryAcks, [{
+    requestId: "shutdown-result",
+    delivered: false,
+    error: "Intercom runtime is not active",
+  }]);
+
+  await harness.emitLifecycle("session_start");
+  harness.pi.events.emit("subagent:control-intercom", {
+    to: "orchestrator",
+    message: "second delivery",
+  });
+  assert.equal(harness.sentMessages.length, 2);
+  assert.match(harness.sentMessages[1]?.message.content ?? "", /second delivery/);
+  await harness.emitLifecycle("session_shutdown");
 });
 
 test("async ask can be replied to later from the single pending ask fallback", { concurrency: false }, async () => {
