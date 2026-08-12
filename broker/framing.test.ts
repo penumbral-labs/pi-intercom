@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createMessageReader, writeMessage, MAX_FRAME_BYTES, IntercomFrameTooLargeError } from "./framing.ts";
+import {
+  createMessageReader,
+  writeMessage,
+  writeEncodedFrames,
+  encodeFrame,
+  validateFrameBytes,
+  EncodedFrame,
+  MAX_FRAME_BYTES,
+  IntercomFrameTooLargeError,
+} from "./framing.ts";
 
 function framePayload(payload: Buffer): Buffer {
   const header = Buffer.alloc(4);
@@ -137,4 +146,95 @@ test("writeMessage still writes a frame exactly at the cap", () => {
   assert.equal(chunks.length, 1);
   assert.equal(chunks[0]!.readUInt32BE(0), MAX_FRAME_BYTES);
   assert.equal(chunks[0]!.length, 4 + MAX_FRAME_BYTES);
+});
+
+// A socket stand-in that records every write, so "zero bytes written" is directly observable.
+function recordingSocket() {
+  const writes: Buffer[] = [];
+  return {
+    writes,
+    socket: {
+      write(chunk: Buffer) {
+        writes.push(Buffer.from(chunk));
+        return true;
+      },
+    } as unknown as import("net").Socket,
+  };
+}
+
+function frameBytes(payloadLength: number, declaredLength = payloadLength): Buffer {
+  const buf = Buffer.alloc(4 + payloadLength, 0x61);
+  buf.writeUInt32BE(declaredLength, 0);
+  return buf;
+}
+
+test("validateFrameBytes rejects a declared length above the cap", () => {
+  assert.throws(
+    () => validateFrameBytes(frameBytes(16, MAX_FRAME_BYTES + 1)),
+    (error: unknown) => error instanceof IntercomFrameTooLargeError && error.length === MAX_FRAME_BYTES + 1,
+  );
+});
+
+test("validateFrameBytes rejects a forged small header over a large body", () => {
+  // Header claims 8 bytes; the buffer actually carries 4096. A writer trusting the header would
+  // emit the whole body, and the peer would read the surplus as the start of the next frame.
+  assert.throws(() => validateFrameBytes(frameBytes(4096, 8)), /declares 8 bytes but buffer carries 4096/);
+});
+
+test("validateFrameBytes rejects a truncated body", () => {
+  assert.throws(() => validateFrameBytes(frameBytes(16, 64)), /declares 64 bytes but buffer carries 16/);
+});
+
+test("validateFrameBytes rejects a buffer too short to hold a header", () => {
+  assert.throws(() => validateFrameBytes(Buffer.alloc(3)), /truncated/);
+});
+
+test("validateFrameBytes accepts a frame exactly at the cap", () => {
+  assert.doesNotThrow(() => validateFrameBytes(frameBytes(MAX_FRAME_BYTES)));
+});
+
+test("an oversize message writes zero bytes", () => {
+  const { writes, socket } = recordingSocket();
+  assert.throws(
+    () => writeMessage(socket, { padding: "x".repeat(MAX_FRAME_BYTES) }),
+    IntercomFrameTooLargeError,
+  );
+  assert.equal(writes.length, 0, "no write may occur when encoding fails");
+});
+
+test("writeEncodedFrames emits pre-encoded frames in order as one unit", () => {
+  const { writes, socket } = recordingSocket();
+  writeEncodedFrames(socket, encodeFrame({ seq: 1 }), encodeFrame({ seq: 2 }));
+  assert.equal(writes.length, 2);
+  const decode = (buf: Buffer) => JSON.parse(buf.subarray(4).toString("utf-8"));
+  assert.deepEqual(decode(writes[0]!), { seq: 1 });
+  assert.deepEqual(decode(writes[1]!), { seq: 2 });
+});
+
+test("no raw buffer writer is exported", async () => {
+  // Regression: an exported writer taking an arbitrary Buffer would let any caller put bytes on a
+  // socket without passing the frame cap, which is the bypass this module exists to prevent.
+  const framing = await import("./framing.ts");
+  assert.equal("writeFrame" in framing, false, "writeFrame must not be exported");
+  const exported = Object.keys(framing).filter((key) => /^write/.test(key)).sort();
+  assert.deepEqual(exported, ["writeEncodedFrames", "writeMessage"]);
+});
+
+test("a frame corrupted after minting is rejected at write time", () => {
+  // from() retains the caller's buffer by reference, so a frame that was legal when minted can be
+  // made illegal afterwards. Validation at mint alone would let those bytes reach a socket.
+  const buf = frameBytes(16);
+  const frame = EncodedFrame.from(buf);
+  buf.writeUInt32BE(MAX_FRAME_BYTES + 1, 0);
+  assert.throws(() => frame.toValidatedBytes(), IntercomFrameTooLargeError);
+});
+
+test("one bad frame in a sequence writes zero bytes, not a partial sequence", () => {
+  const { writes, socket } = recordingSocket();
+  const good = encodeFrame({ seq: 1 });
+  const corruptable = frameBytes(16);
+  const bad = EncodedFrame.from(corruptable);
+  corruptable.writeUInt32BE(MAX_FRAME_BYTES + 1, 0);
+  assert.throws(() => writeEncodedFrames(socket, good, bad), IntercomFrameTooLargeError);
+  assert.equal(writes.length, 0, "a valid leading frame must not be written when a later frame is bad");
 });
