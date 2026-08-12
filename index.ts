@@ -1104,7 +1104,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (reconnectPromise && reconnectPromiseGeneration === generationAtStart) {
       return reconnectPromise;
     }
-    const nextReconnectPromise = (async () => {
+    // Declared before the IIFE so the `finally` below can compare identity without TS treating
+    // the binding as read-before-assignment. The `finally` cannot run before assignment completes,
+    // because the first statement inside the IIFE that can suspend is the `await` further down.
+    let nextReconnectPromise: Promise<IntercomClient> | null = null;
+    nextReconnectPromise = (async () => {
       const nextClient = new IntercomClient();
       client = nextClient;
       attachClientHandlers(nextClient);
@@ -1997,9 +2001,19 @@ Usage:
                 };
               }
             }
-            const target: DeliveryTarget = cwd
-              ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal })
-              : { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
+            let target: DeliveryTarget;
+            if (cwd) {
+              target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
+            } else if (to) {
+              target = { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
+            } else {
+              // Unreachable given the guard above, which returns when both `to` and `cwd` are absent.
+              // Kept as a typed exit so `to` narrows to string in the branch that needs it.
+              return {
+                content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
+                details: { error: true },
+              };
+            }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
             if (sendTo === connectedClient.sessionId) {
@@ -2102,7 +2116,7 @@ Usage:
             let target: DeliveryTarget;
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
-            } else {
+            } else if (to) {
               const resolved = await resolveSessionTarget(connectedClient, to);
               if (!resolved) {
                 return {
@@ -2111,6 +2125,12 @@ Usage:
                 };
               }
               target = { id: resolved, label: to };
+            } else {
+              // Unreachable given the guard above; kept as a typed exit so `to` narrows to string.
+              return {
+                content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
+                details: { error: true },
+              };
             }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
