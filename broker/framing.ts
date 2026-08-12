@@ -17,13 +17,15 @@ export class IntercomFrameTooLargeError extends Error {
 }
 
 /**
- * Write a length-prefixed message to a socket.
+ * Encode a message into a length-prefixed frame without touching a socket.
  * Format: 4-byte big-endian length + JSON payload
  *
- * Throws IntercomFrameTooLargeError before writing any bytes when the payload exceeds
- * MAX_FRAME_BYTES, so a partial frame is never emitted.
+ * Throws IntercomFrameTooLargeError when the payload exceeds MAX_FRAME_BYTES. Separated from
+ * the write so a caller emitting several frames as one logical unit can validate all of them
+ * first and then write only if every one is legal — otherwise a mid-sequence throw leaves the
+ * peer holding a partial sequence it cannot undo.
  */
-export function writeMessage(socket: Socket, msg: unknown): void {
+export function encodeFrame(msg: unknown): Buffer {
   const json = JSON.stringify(msg);
   const payloadLength = Buffer.byteLength(json, "utf-8");
   if (payloadLength > MAX_FRAME_BYTES) {
@@ -32,7 +34,22 @@ export function writeMessage(socket: Socket, msg: unknown): void {
   const frame = Buffer.allocUnsafe(4 + payloadLength);
   frame.writeUInt32BE(payloadLength, 0);
   frame.write(json, 4, payloadLength, "utf-8");
+  return frame;
+}
+
+/** Write an already-encoded frame. Cannot fail the size check, which encodeFrame already made. */
+export function writeFrame(socket: Socket, frame: Buffer): void {
   socket.write(frame);
+}
+
+/**
+ * Write a length-prefixed message to a socket.
+ *
+ * Throws IntercomFrameTooLargeError before writing any bytes when the payload exceeds
+ * MAX_FRAME_BYTES, so a partial frame is never emitted.
+ */
+export function writeMessage(socket: Socket, msg: unknown): void {
+  writeFrame(socket, encodeFrame(msg));
 }
 
 /**

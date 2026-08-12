@@ -2,7 +2,7 @@ import net from "net";
 import { writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader, IntercomFrameTooLargeError } from "./framing.ts";
+import { writeMessage, createMessageReader, encodeFrame, writeFrame, IntercomFrameTooLargeError } from "./framing.ts";
 import { AskEdges } from "./ask-edges.ts";
 import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
 import {
@@ -579,25 +579,28 @@ class IntercomBroker {
             brokerReceivedAt,
             brokerDeliveredAt: Date.now(),
           };
-          if (message.supersedes) {
-            const control: MessageControl = {
-              action: "supersede",
-              messageId: message.supersedes,
-              supersededBy: message.id,
-              timestamp: Date.now(),
-            };
-            writeMessage(target.socket, {
-              type: "message_control",
-              from: fromSession.info,
-              control,
-            });
-          }
-          // Deliver before recording the ask edge. Broker metadata (brokerReceivedAt /
-          // brokerDeliveredAt) can push a borderline message past the frame cap, and an edge
-          // recorded for a message that never left would strand the asker on a reply that can
-          // never arrive.
+          // A supersede is two frames that mean nothing apart: the control retires the old ID and
+          // the message supplies its replacement. Encoding both before writing either keeps them
+          // atomic with respect to the frame cap. Writing the control first and then failing the
+          // replacement would leave the receiver having retired an ID whose replacement never
+          // arrives, with no way to undo it.
+          let supersedeFrame: Buffer | undefined;
+          let messageFrame: Buffer;
           try {
-            writeMessage(target.socket, {
+            if (message.supersedes) {
+              const control: MessageControl = {
+                action: "supersede",
+                messageId: message.supersedes,
+                supersededBy: message.id,
+                timestamp: Date.now(),
+              };
+              supersedeFrame = encodeFrame({
+                type: "message_control",
+                from: fromSession.info,
+                control,
+              });
+            }
+            messageFrame = encodeFrame({
               type: "message",
               from: fromSession.info,
               message: deliveredMessage,
@@ -613,6 +616,16 @@ class IntercomBroker {
             }
             throw error;
           }
+          // Both frames are known legal, so the wire order (control before message) can be
+          // preserved without risking a half-applied supersede.
+          if (supersedeFrame) {
+            writeFrame(target.socket, supersedeFrame);
+          }
+          // Deliver before recording the ask edge. Broker metadata (brokerReceivedAt /
+          // brokerDeliveredAt) can push a borderline message past the frame cap, and an edge
+          // recorded for a message that never left would strand the asker on a reply that can
+          // never arrive.
+          writeFrame(target.socket, messageFrame);
           if (message.expectsReply) {
             this.askEdges.add(message.id, currentId, target.info.id);
           }

@@ -3547,3 +3547,105 @@ test("oversize delivery is contained: sender is told, and neither connection die
     await cleanup();
   }
 });
+
+test("a supersede whose replacement exceeds the frame cap applies neither frame", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const sender = await connectRawRegistered("supersede-atomic-sender-id", "supersede-atomic-sender");
+  const receiver = await connectRawRegistered("supersede-atomic-receiver-id", "supersede-atomic-receiver");
+  try {
+    const { createMessageReader, MAX_FRAME_BYTES } = await import("./broker/framing.ts");
+
+    // Record every frame the receiver sees, in arrival order.
+    const received: Array<{ type?: string; message?: { id?: string }; control?: { action?: string; messageId?: string } }> = [];
+    const receiverReader = createMessageReader((msg) => {
+      received.push(msg as (typeof received)[number]);
+    }, () => undefined);
+    receiver.socket.on("data", receiverReader);
+
+    const senderFrames: Array<{ type?: string; messageId?: string; reason?: string }> = [];
+    const senderReader = createMessageReader((msg) => {
+      senderFrames.push(msg as (typeof senderFrames)[number]);
+    }, () => undefined);
+    sender.socket.on("data", senderReader);
+
+    const awaitSender = async (messageId: string, timeoutMs = 5000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const hit = senderFrames.find((f) => f.messageId === messageId && (f.type === "delivered" || f.type === "delivery_failed"));
+        if (hit) return hit;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      throw new Error(`no outcome for ${messageId}: ${JSON.stringify(senderFrames)}`);
+    };
+
+    // 1. An ordinary message establishes the ID that will later be superseded.
+    sender.writeMessage(sender.socket, {
+      type: "send",
+      to: "supersede-atomic-receiver-id",
+      message: { id: "original-msg", timestamp: 1, content: { text: "original" } },
+    });
+    assert.equal((await awaitSender("original-msg")).type, "delivered");
+
+    // 2. Supersede it with a replacement that only exceeds the cap once broker metadata is
+    //    added. Hand-built so the inbound frame sits exactly at the cap and is legal on the way
+    //    in; client.send would have refused it locally and never reached the broker.
+    const build = (padding: string) => JSON.stringify({
+      type: "send",
+      to: "supersede-atomic-receiver-id",
+      message: { id: "oversize-replacement", timestamp: 2, supersedes: "original-msg", content: { text: padding } },
+    });
+    const payload = build("x".repeat(MAX_FRAME_BYTES - Buffer.byteLength(build(""), "utf-8")));
+    assert.equal(Buffer.byteLength(payload, "utf-8"), MAX_FRAME_BYTES, "inbound frame must sit exactly at the cap");
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(Buffer.byteLength(payload, "utf-8"), 0);
+    const before = received.length;
+    sender.socket.write(Buffer.concat([header, Buffer.from(payload, "utf-8")]));
+
+    // 3. The sender is told, with the metadata-expansion reason.
+    const failure = await awaitSender("oversize-replacement");
+    assert.equal(failure.type, "delivery_failed");
+    assert.match(failure.reason ?? "", /too large after broker metadata/);
+
+    // 4. The receiver got NEITHER frame — no supersede control, no replacement. This is the
+    //    regression: emitting the control first would have retired original-msg with no
+    //    replacement ever arriving.
+    await new Promise((r) => setTimeout(r, 250));
+    const after = received.slice(before);
+    assert.deepEqual(
+      after.filter((f) => f.type === "message_control"),
+      [],
+      "no supersede control may reach the receiver when the replacement cannot be delivered",
+    );
+    assert.deepEqual(
+      after.filter((f) => f.message?.id === "oversize-replacement"),
+      [],
+      "the oversized replacement must not be delivered",
+    );
+
+    // 5. The old ID is still actionable: a second, legal supersede of it still succeeds, which
+    //    it could not if the failed attempt had consumed or retired it.
+    const legalStart = received.length;
+    sender.writeMessage(sender.socket, {
+      type: "send",
+      to: "supersede-atomic-receiver-id",
+      message: { id: "legal-replacement", timestamp: 3, supersedes: "original-msg", content: { text: "replacement" } },
+    });
+    assert.equal((await awaitSender("legal-replacement")).type, "delivered");
+
+    await new Promise((r) => setTimeout(r, 250));
+    const legal = received.slice(legalStart);
+    const controlIndex = legal.findIndex((f) => f.type === "message_control" && f.control?.messageId === "original-msg");
+    const messageIndex = legal.findIndex((f) => f.message?.id === "legal-replacement");
+    assert.ok(controlIndex >= 0, "a successful supersede still delivers the control");
+    assert.ok(messageIndex >= 0, "a successful supersede still delivers the replacement");
+    assert.ok(controlIndex < messageIndex, "wire ordering is preserved: control before message");
+
+    // 6. Neither connection was collateral damage.
+    assert.equal(sender.socket.destroyed, false, "sender socket must stay live");
+    assert.equal(receiver.socket.destroyed, false, "receiver socket must stay live");
+  } finally {
+    sender.socket.destroy();
+    receiver.socket.destroy();
+    await cleanup();
+  }
+});
