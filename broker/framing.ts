@@ -1,14 +1,34 @@
 import type { Socket } from "net";
 
-const MAX_FRAME_BYTES = 1024 * 1024;
+export const MAX_FRAME_BYTES = 1024 * 1024;
+
+/**
+ * Thrown by writeMessage when an encoded frame would exceed the wire cap.
+ *
+ * Distinguishable so callers can contain an oversize frame at the specific write site
+ * instead of letting it reach the peer, whose reader would reject the length prefix and
+ * tear down an otherwise healthy connection.
+ */
+export class IntercomFrameTooLargeError extends Error {
+  constructor(readonly length: number, readonly maxFrameBytes: number = MAX_FRAME_BYTES) {
+    super(`Intercom frame length ${length} exceeds maximum ${maxFrameBytes} bytes`);
+    this.name = "IntercomFrameTooLargeError";
+  }
+}
 
 /**
  * Write a length-prefixed message to a socket.
  * Format: 4-byte big-endian length + JSON payload
+ *
+ * Throws IntercomFrameTooLargeError before writing any bytes when the payload exceeds
+ * MAX_FRAME_BYTES, so a partial frame is never emitted.
  */
 export function writeMessage(socket: Socket, msg: unknown): void {
   const json = JSON.stringify(msg);
   const payloadLength = Buffer.byteLength(json, "utf-8");
+  if (payloadLength > MAX_FRAME_BYTES) {
+    throw new IntercomFrameTooLargeError(payloadLength);
+  }
   const frame = Buffer.allocUnsafe(4 + payloadLength);
   frame.writeUInt32BE(payloadLength, 0);
   frame.write(json, 4, payloadLength, "utf-8");

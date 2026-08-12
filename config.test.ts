@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getConfigPath, loadConfig } from "./config.ts";
+import { getAskTimeoutMs, getConfigPath, loadConfig, MAX_ASK_TIMEOUT_MS } from "./config.ts";
 
 async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -87,5 +87,28 @@ test("loadConfig rejects invalid inboundTrigger values", async () => {
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("getAskTimeoutMs accepts the largest delay setTimeout can represent", () => {
+  const previous = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = String(MAX_ASK_TIMEOUT_MS);
+  try {
+    assert.equal(getAskTimeoutMs(), MAX_ASK_TIMEOUT_MS);
+    assert.equal(MAX_ASK_TIMEOUT_MS, 2 ** 31 - 1);
+  } finally {
+    if (previous === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previous;
+  }
+});
+
+test("getAskTimeoutMs rejects a delay setTimeout would fire immediately", () => {
+  const previous = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = String(MAX_ASK_TIMEOUT_MS + 1);
+  try {
+    assert.throws(() => getAskTimeoutMs(), new RegExp(String(MAX_ASK_TIMEOUT_MS)));
+  } finally {
+    if (previous === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previous;
   }
 });

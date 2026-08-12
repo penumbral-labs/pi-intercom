@@ -3432,3 +3432,118 @@ test("failed delivery from an inferred reply preserves the pending ask", { concu
     await cleanup();
   }
 });
+
+test("broker refuses a duplicate pending ask ID without displacing the original edge", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  try {
+    const target = await waitForSessionByName(planner, "orchestrator");
+    const askId = "duplicate-pending-ask-id";
+
+    const first = await planner.send(target.id, { messageId: askId, text: "first ask", expectsReply: true });
+    assert.equal(first.delivered, true);
+
+    const second = await planner.send(target.id, { messageId: askId, text: "second ask", expectsReply: true });
+    assert.equal(second.delivered, false);
+    assert.match(second.reason ?? "", /Duplicate pending ask message ID/);
+
+    // The original edge must survive: replying to it still resolves against a live ask.
+    const reply = await orchestrator.send(
+      (await waitForSessionByName(orchestrator, "planner")).id,
+      { text: "answer", replyTo: askId },
+    );
+    assert.equal(reply.delivered, true, "original ask edge must still be pending after the refusal");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("broker caps concurrent pending asks per session and keeps other sessions unaffected", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const other = await connectRawRegistered("ask-cap-other-id", "ask-cap-other");
+  try {
+    const target = await waitForSessionByName(planner, "orchestrator");
+    for (let i = 0; i < 16; i += 1) {
+      const result = await planner.send(target.id, { messageId: `cap-ask-${i}`, text: `ask ${i}`, expectsReply: true });
+      assert.equal(result.delivered, true, `ask ${i + 1} of 16 should be accepted`);
+    }
+
+    const refused = await planner.send(target.id, { messageId: "cap-ask-overflow", text: "one too many", expectsReply: true });
+    assert.equal(refused.delivered, false);
+    assert.match(refused.reason ?? "", /from this session/);
+
+    // The cap is per asker: an unrelated session is still allowed to ask.
+    const { createMessageReader } = await import("./broker/framing.ts");
+    const otherAsk = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("no delivered/delivery_failed for other session")), 3000);
+      const reader = createMessageReader((msg) => {
+        const m = msg as { type?: string; messageId?: string };
+        if (m.messageId !== "other-session-ask") return;
+        clearTimeout(timeout);
+        other.socket.off("data", reader);
+        if (m.type === "delivered") resolve();
+        else reject(new Error(`other session was refused: ${JSON.stringify(msg)}`));
+      }, reject);
+      other.socket.on("data", reader);
+    });
+    other.writeMessage(other.socket, {
+      type: "send",
+      to: target.id,
+      message: { id: "other-session-ask", timestamp: Date.now(), expectsReply: true, content: { text: "from other" } },
+    });
+    await otherAsk;
+  } finally {
+    other.socket.destroy();
+    await cleanup();
+  }
+});
+
+test("oversize delivery is contained: sender is told, and neither connection dies", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("oversize-sender-id", "oversize-sender");
+  try {
+    const { createMessageReader, MAX_FRAME_BYTES } = await import("./broker/framing.ts");
+    const target = await waitForSessionByName(planner, "orchestrator");
+
+    // Hand-build the frame so it is exactly at the wire cap: legal inbound, but the broker's
+    // added `from` plus brokerReceivedAt/brokerDeliveredAt push the outbound frame over it.
+    // Going through client.send would be capped on the way out instead.
+    const build = (padding: string) => JSON.stringify({
+      type: "send",
+      to: target.id,
+      message: { id: "oversize-after-metadata", timestamp: 1, content: { text: padding } },
+    });
+    const overhead = Buffer.byteLength(build(""), "utf-8");
+    const payload = build("x".repeat(MAX_FRAME_BYTES - overhead));
+    assert.equal(Buffer.byteLength(payload, "utf-8"), MAX_FRAME_BYTES, "inbound frame must sit exactly at the cap");
+
+    const outcome = new Promise<{ type?: string; reason?: string }>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("no delivery outcome for the oversize send")), 5000);
+      const reader = createMessageReader((msg) => {
+        const m = msg as { type?: string; messageId?: string; reason?: string };
+        if (m.messageId !== "oversize-after-metadata") return;
+        clearTimeout(timeout);
+        raw.socket.off("data", reader);
+        resolve(m);
+      }, reject);
+      raw.socket.on("data", reader);
+    });
+
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(Buffer.byteLength(payload, "utf-8"), 0);
+    raw.socket.write(Buffer.concat([header, Buffer.from(payload, "utf-8")]));
+
+    const result = await outcome;
+    assert.equal(result.type, "delivery_failed");
+    assert.match(result.reason ?? "", /too large after broker metadata/);
+
+    // The point of containment: neither peer's connection was collateral damage.
+    assert.equal(raw.socket.destroyed, false, "sender connection must survive an oversize refusal");
+    const followUp = await planner.send(target.id, { text: "still connected" });
+    assert.equal(followUp.delivered, true);
+    const sessions = await orchestrator.listSessions();
+    assert.ok(sessions.length >= 2, "target connection must survive an oversize refusal");
+  } finally {
+    raw.socket.destroy();
+    await cleanup();
+  }
+});

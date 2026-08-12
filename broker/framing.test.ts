@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createMessageReader, writeMessage } from "./framing.ts";
+import { createMessageReader, writeMessage, MAX_FRAME_BYTES, IntercomFrameTooLargeError } from "./framing.ts";
 
 function framePayload(payload: Buffer): Buffer {
   const header = Buffer.alloc(4);
@@ -111,4 +111,30 @@ test("writeMessage emits frames accepted by createMessageReader", () => {
   reader(Buffer.concat(chunks));
 
   assert.deepEqual(messages, [{ ok: true }]);
+});
+
+test("writeMessage refuses an oversized frame before writing any bytes", () => {
+  const chunks: Buffer[] = [];
+  const socket = { write: (chunk: Buffer) => { chunks.push(chunk); return true; } };
+  const envelope = Buffer.byteLength(JSON.stringify({ text: "" }), "utf-8");
+  const tooLarge = "x".repeat(MAX_FRAME_BYTES - envelope + 1);
+
+  assert.throws(
+    () => writeMessage(socket as never, { text: tooLarge }),
+    (error: unknown) => error instanceof IntercomFrameTooLargeError && error.length === MAX_FRAME_BYTES + 1,
+  );
+  assert.deepEqual(chunks, [], "no partial frame may reach the socket");
+});
+
+test("writeMessage still writes a frame exactly at the cap", () => {
+  const chunks: Buffer[] = [];
+  const socket = { write: (chunk: Buffer) => { chunks.push(chunk); return true; } };
+  const envelope = Buffer.byteLength(JSON.stringify({ text: "" }), "utf-8");
+  const exact = "x".repeat(MAX_FRAME_BYTES - envelope);
+
+  writeMessage(socket as never, { text: exact });
+
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0]!.readUInt32BE(0), MAX_FRAME_BYTES);
+  assert.equal(chunks[0]!.length, 4 + MAX_FRAME_BYTES);
 });

@@ -2,7 +2,8 @@ import net from "net";
 import { writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.ts";
+import { writeMessage, createMessageReader, IntercomFrameTooLargeError } from "./framing.ts";
+import { AskEdges } from "./ask-edges.ts";
 import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
 import {
   ensureIntercomRuntimeDir,
@@ -70,11 +71,6 @@ interface ConnectionState {
   lastRefillAt: number;
 }
 
-interface AskEdge {
-  from: string;
-  to: string;
-  createdAt: number;
-}
 
 interface MessageReceiptRoute {
   from: string;
@@ -96,7 +92,7 @@ interface MailboxMessage {
 
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
-  private askEdges = new Map<string, AskEdge>();
+  private askEdges = new AskEdges(MAX_SESSIONS * 4);
   private messageReceiptRoutes = new Map<string, MessageReceiptRoute>();
   private disconnectedSessions = new Map<string, DisconnectedSession>();
   private mailboxMessages: MailboxMessage[] = [];
@@ -477,7 +473,15 @@ class IntercomBroker {
         }
 
         const sessions = Array.from(this.sessions.values()).map(s => s.info);
-        writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
+        try {
+          writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
+        } catch (error) {
+          if (error instanceof IntercomFrameTooLargeError) {
+            writeMessage(socket, { type: "error", error: "Intercom session list is too large" });
+            break;
+          }
+          throw error;
+        }
         break;
       }
 
@@ -542,8 +546,7 @@ class IntercomBroker {
             break;
           }
           if (message.expectsReply) {
-            const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.info.id && edge.to === currentId);
-            if (reverseEdge) {
+            if (this.askEdges.hasReverse(currentId, target.info.id, message.replyTo)) {
               writeMessage(socket, {
                 type: "delivery_failed",
                 messageId: message.id,
@@ -551,7 +554,25 @@ class IntercomBroker {
               });
               break;
             }
-            this.askEdges.set(message.id, { from: currentId, to: target.info.id, createdAt: Date.now() });
+            // A message id that already names a pending ask must not silently displace it: the
+            // original asker would wait forever on an edge that no longer exists.
+            if (this.askEdges.has(message.id)) {
+              writeMessage(socket, {
+                type: "delivery_failed",
+                messageId: message.id,
+                reason: "Duplicate pending ask message ID",
+              });
+              break;
+            }
+            const capacity = this.askEdges.canAdd(currentId, message.replyTo);
+            if (!capacity.ok) {
+              writeMessage(socket, {
+                type: "delivery_failed",
+                messageId: message.id,
+                reason: capacity.reason,
+              });
+              break;
+            }
           }
           const deliveredMessage: Message = {
             ...message,
@@ -571,11 +592,30 @@ class IntercomBroker {
               control,
             });
           }
-          writeMessage(target.socket, {
-            type: "message",
-            from: fromSession.info,
-            message: deliveredMessage,
-          });
+          // Deliver before recording the ask edge. Broker metadata (brokerReceivedAt /
+          // brokerDeliveredAt) can push a borderline message past the frame cap, and an edge
+          // recorded for a message that never left would strand the asker on a reply that can
+          // never arrive.
+          try {
+            writeMessage(target.socket, {
+              type: "message",
+              from: fromSession.info,
+              message: deliveredMessage,
+            });
+          } catch (error) {
+            if (error instanceof IntercomFrameTooLargeError) {
+              writeMessage(socket, {
+                type: "delivery_failed",
+                messageId: message.id,
+                reason: "Message is too large after broker metadata was added",
+              });
+              break;
+            }
+            throw error;
+          }
+          if (message.expectsReply) {
+            this.askEdges.add(message.id, currentId, target.info.id);
+          }
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
           }
@@ -644,11 +684,23 @@ class IntercomBroker {
               brokerReceivedAt,
               brokerDeliveredAt: Date.now(),
             };
-            writeMessage(liveMailboxTarget.socket, {
-              type: "message",
-              from: fromSession.info,
-              message: deliveredMessage,
-            });
+            try {
+              writeMessage(liveMailboxTarget.socket, {
+                type: "message",
+                from: fromSession.info,
+                message: deliveredMessage,
+              });
+            } catch (error) {
+              if (error instanceof IntercomFrameTooLargeError) {
+                writeMessage(socket, {
+                  type: "delivery_failed",
+                  messageId: message.id,
+                  reason: "Message is too large after broker metadata was added",
+                });
+                break;
+              }
+              throw error;
+            }
             this.messageReceiptRoutes.set(message.id, { from: currentId, to: liveMailboxTarget.info.id, createdAt: brokerReceivedAt });
           } else {
             this.queueMailboxMessage(fromSession.info, target, message, brokerReceivedAt);
@@ -930,20 +982,32 @@ class IntercomBroker {
         continue;
       }
 
-      this.mailboxMessages.splice(index, 1);
-      const edge = this.askEdges.get(entry.message.id);
-      if (edge?.to === entry.target.id) {
-        edge.to = session.info.id;
-      }
       const deliveredMessage: Message = {
         ...entry.message,
         brokerDeliveredAt: Date.now(),
       };
-      writeMessage(session.socket, {
-        type: "message",
-        from: entry.from,
-        message: deliveredMessage,
-      });
+      // Write before removing the entry. Splicing first would lose the message permanently if the
+      // write throws, and would also abort the flush for every remaining entry.
+      try {
+        writeMessage(session.socket, {
+          type: "message",
+          from: entry.from,
+          message: deliveredMessage,
+        });
+      } catch (error) {
+        if (error instanceof IntercomFrameTooLargeError) {
+          console.error(`Skipping oversized mailbox redelivery ${entry.message.id}: ${error.message}`);
+          index += 1;
+          continue;
+        }
+        throw error;
+      }
+      this.mailboxMessages.splice(index, 1);
+      const edge = this.askEdges.get(entry.message.id);
+      if (edge?.to === entry.target.id) {
+        // Must go through the owner so the pair index follows the retarget.
+        this.askEdges.rekeyTarget(entry.message.id, session.info.id);
+      }
       this.messageReceiptRoutes.set(entry.message.id, {
         from: entry.from.id,
         to: session.info.id,
@@ -953,19 +1017,11 @@ class IntercomBroker {
   }
 
   private pruneAskEdges(now = Date.now()): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (now - edge.createdAt > this.askTimeoutMs) {
-        this.askEdges.delete(messageId);
-      }
-    }
+    this.askEdges.pruneOlderThan(this.askTimeoutMs, now);
   }
 
   private clearAskEdgesForSession(sessionId: string): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (edge.from === sessionId || edge.to === sessionId) {
-        this.askEdges.delete(messageId);
-      }
-    }
+    this.askEdges.deleteForSession(sessionId);
   }
 
   private pruneMessageReceiptRoutes(now = Date.now()): void {
@@ -1051,7 +1107,16 @@ class IntercomBroker {
   private broadcast(msg: BrokerMessage, exclude?: string): void {
     for (const [id, session] of this.sessions) {
       if (id !== exclude) {
-        writeMessage(session.socket, msg);
+        try {
+          writeMessage(session.socket, msg);
+        } catch (error) {
+          if (error instanceof IntercomFrameTooLargeError) {
+            // One recipient's oversize broadcast must not stop the rest from receiving it.
+            console.error(`Skipping oversized ${msg.type} broadcast to ${id}: ${error.message}`);
+            continue;
+          }
+          throw error;
+        }
       }
     }
   }
