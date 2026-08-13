@@ -39,6 +39,7 @@ interface PendingOperation {
 }
 
 const MAX_PENDING_OPERATIONS = 256;
+export const MAX_POISONED_LEGACY_MESSAGE_IDS = 256;
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -552,6 +553,16 @@ export class IntercomClient extends EventEmitter {
     pending?.resolve(result);
   }
 
+  private poisonLegacyMessageId(messageId: string): void {
+    this.poisonedLegacyMessageIds.delete(messageId);
+    this.poisonedLegacyMessageIds.add(messageId);
+    while (this.poisonedLegacyMessageIds.size > MAX_POISONED_LEGACY_MESSAGE_IDS) {
+      const oldest = this.poisonedLegacyMessageIds.values().next().value;
+      if (typeof oldest !== "string") break;
+      this.poisonedLegacyMessageIds.delete(oldest);
+    }
+  }
+
   private runMessageOperation(
     messageId: string,
     timeoutLabel: "Send" | "Cancel",
@@ -583,7 +594,7 @@ export class IntercomClient extends EventEmitter {
         }
         if (!correlated) {
           this.legacyOperations.delete(messageId);
-          this.poisonedLegacyMessageIds.add(messageId);
+          this.poisonLegacyMessageId(messageId);
         }
         wrappedReject(new Error(`${timeoutLabel} timeout`));
       }, 10000);

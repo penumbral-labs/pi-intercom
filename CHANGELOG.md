@@ -7,9 +7,10 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ### Changed
 - Added a pinned strict TypeScript verification gate for the reconciled v0.10 baseline.
 - Kept the broker protocol at version 1 while negotiating correlated ordinary send/cancel operations additively.
+- Hardened broker framing with capped outbound writes, single-allocation encoding, contained oversized deliveries, and atomic supersede/replacement validation; pending ask indexes now enforce global and per-session bounds during reply retargeting.
 
 ### Fixed
-- Correlate concurrent ordinary send and cancel results without allowing a late legacy result to settle the wrong caller.
+- Correlate concurrent ordinary send and cancel results without allowing a late legacy result to settle the wrong caller, while bounding the legacy late-result quarantine.
 - Emit ordinary mailbox `queued`, `expired`, and `cancelled` receipts under a reserved broker identity.
 - Report dead subagent relay dispatches accurately and send busy non-interactive notices only for asks.
 - Classify abandoned asks so explicit cancel/supersede replies are dropped while plain-timeout replies remain visible with an annotation.

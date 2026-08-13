@@ -19,6 +19,7 @@
     "format-context.ts",
     "project-agent.ts",
     "reply-tracker.ts",
+    "stale-asks.ts",
     "broker/**/*.ts",
     "ui/**/*.ts",
     "test/**/*.ts",

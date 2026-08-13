@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { IntercomClient } from "./client.ts";
+import { IntercomClient, MAX_POISONED_LEGACY_MESSAGE_IDS } from "./client.ts";
 
 test("validated session lifecycle messages reach broker-message subscribers", () => {
   const client = new IntercomClient();
@@ -109,6 +109,18 @@ test("late legacy results consume poison instead of settling a later operation",
   assert.deepEqual(resolved, []);
   assert.equal((client as any).poisonedLegacyMessageIds.has("shared-message"), false);
   assert.equal((client as any).pendingOperations.has("shared-message"), true);
+});
+
+test("legacy timeout poison is bounded to the newest message IDs", () => {
+  const client = new IntercomClient();
+
+  for (let index = 0; index <= MAX_POISONED_LEGACY_MESSAGE_IDS; index += 1) {
+    (client as any).poisonLegacyMessageId(`message-${index}`);
+  }
+
+  assert.equal((client as any).poisonedLegacyMessageIds.size, MAX_POISONED_LEGACY_MESSAGE_IDS);
+  assert.equal((client as any).poisonedLegacyMessageIds.has("message-0"), false);
+  assert.equal((client as any).poisonedLegacyMessageIds.has(`message-${MAX_POISONED_LEGACY_MESSAGE_IDS}`), true);
 });
 
 test("cancelAsk ignores synchronous socket write failures", () => {

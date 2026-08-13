@@ -2256,6 +2256,101 @@ test("regular intercom ask timeout reports message id and delivery state", { con
   }
 });
 
+test("extension applies cancelled, superseded, and timed-out stale-reply tiers", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("stale-tier-worker", { sessionId: "session-stale-tier-worker", hasUI: true });
+  const originalOn = EventEmitter.prototype.on;
+  let inboundMessageHandler: ((from: SessionInfo, message: Message) => void) | undefined;
+  EventEmitter.prototype.on = function (eventName: string | symbol, listener: (...args: any[]) => void) {
+    if (eventName === "message") inboundMessageHandler = listener;
+    return originalOn.call(this, eventName, listener);
+  };
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "stale-tier-worker");
+    EventEmitter.prototype.on = originalOn;
+    const plannerSession = await waitForSessionByName(planner, "planner");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    assert.ok(inboundMessageHandler);
+    const emitLateReply = (id: string, replyTo: string, text: string) => {
+      inboundMessageHandler!(plannerSession, {
+        id,
+        timestamp: Date.now(),
+        replyTo,
+        content: { text },
+      });
+    };
+
+    const cancelledController = new AbortController();
+    const cancelledMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const cancelledAsk = intercomTool.execute("stale-cancelled", {
+      action: "ask",
+      to: "planner",
+      message: "This ask will be cancelled.",
+    }, cancelledController.signal, undefined, harness.ctx);
+    const [, cancelledQuestion] = await cancelledMessage;
+    cancelledController.abort();
+    assert.equal((await cancelledAsk).details?.error, true);
+    emitLateReply("late-cancelled-reply", cancelledQuestion.id, "Too late after cancellation.");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 0, "cancelled late reply must be dropped");
+
+    const timedOutMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const timedOutAsk = intercomTool.execute("stale-timed-out", {
+      action: "ask",
+      to: "planner",
+      message: "This ask will time out.",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, timedOutQuestion] = await timedOutMessage;
+    assert.equal((await timedOutAsk).details?.error, true);
+    emitLateReply("late-timeout-reply", timedOutQuestion.id, "Visible after timeout.");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 1);
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Late reply to abandoned ask/);
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Visible after timeout/);
+
+    const supersededMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const supersededAsk = intercomTool.execute("stale-before-supersede", {
+      action: "ask",
+      to: "planner",
+      message: "This ask will be replaced.",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, supersededQuestion] = await supersededMessage;
+    assert.equal((await supersededAsk).details?.error, true);
+
+    const replacementMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const replacementAsk = intercomTool.execute("stale-superseding", {
+      action: "ask",
+      to: "planner",
+      message: "This replaces the prior ask.",
+      supersedes: supersededQuestion.id,
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, replacementQuestion] = await replacementMessage;
+    emitLateReply("late-superseded-reply", supersededQuestion.id, "Too late after supersession.");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 1, "superseded late reply must be dropped");
+
+    emitLateReply("replacement-reply", replacementQuestion.id, "Current answer.");
+    const replacementResult = await replacementAsk;
+    assert.notEqual(replacementResult.details?.error, true);
+    assert.match(replacementResult.content[0]?.text ?? "", /Current answer/);
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    if (previousTimeout === undefined) {
+      delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    } else {
+      process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
+    }
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("regular intercom ask cancellation clears broker mutual-ask edge", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
@@ -2520,6 +2615,37 @@ test("broker queues replies to recently disconnected named senders", { concurren
     assert.equal(typeof message.brokerDeliveredAt, "number");
   } finally {
     await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broker reports queued and cancelled mailbox receipts without closing the sender socket", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+
+  try {
+    const disconnectedId = planner.sessionId!;
+    await planner.disconnect();
+    const receipts: Array<{ from: string; status: string }> = [];
+    const unsubscribeReceipts = orchestrator.onMessageReceipt((from, receipt) => {
+      if (receipt.messageId === "queued-then-cancelled") {
+        receipts.push({ from: from.name ?? from.id, status: receipt.status });
+      }
+    });
+
+    assert.equal((await orchestrator.send(disconnectedId, {
+      messageId: "queued-then-cancelled",
+      text: "Cancel this while it is still queued.",
+    })).delivered, true);
+    assert.equal((await orchestrator.cancelMessage("queued-then-cancelled")).delivered, true);
+    assert.deepEqual(receipts, [
+      { from: "pi-intercom-broker", status: "queued" },
+      { from: "pi-intercom-broker", status: "cancelled" },
+    ]);
+
+    const sessions = await orchestrator.listSessions();
+    assert.ok(sessions.some((session) => session.id === orchestrator.sessionId));
+    unsubscribeReceipts();
+  } finally {
     await cleanup();
   }
 });
