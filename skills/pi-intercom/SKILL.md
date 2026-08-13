@@ -17,6 +17,12 @@ When you are supervising `pi-subagents`, delegated child agents can escalate to
 you via `contact_supervisor` if `pi-subagents` supplied child bridge metadata.
 This skill covers how to handle those orchestrator-side escalations.
 
+## Opaque extension transport
+
+Opaque consumers require registry-ready v2 and `opaque-dispatch-v1` version 1. Reserve synchronously, persist and fsync
+epoch plus message/reservation IDs and payload, then claim. Inject only after accepted claim; never convert opaque work to
+an ordinary message or automatically resend an indeterminate broker outcome. There is no confirmation or detach path.
+
 ## When to Use
 
 - **Task delegation**: Split work between a planner session and worker sessions

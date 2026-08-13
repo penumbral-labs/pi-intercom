@@ -4,6 +4,10 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Added registry-ready v2, correlated state refresh, and `opaque-dispatch-v1` with exact ID/namespace routing, broker epochs, sequenced receipts, bounded lifecycle, durable-then-claim custody, and restart reconciliation.
+- Added a scratch dogfood consumer that fsyncs its record before claim without replacing the loaded runtime.
+
 ### Changed
 - Added a pinned strict TypeScript verification gate for the reconciled v0.10 baseline.
 - Kept the broker protocol at version 1 while negotiating correlated ordinary send/cancel operations additively.

@@ -476,6 +476,19 @@ The broker:
 
 `channel.publish()` accepts payloads up to 16 KiB. A `capable` broadcast includes the sender, so consumers must not blindly republish messages they receive. `channel.commitState()` uses compare-and-swap against the last observed revision. Capabilities registered after the broker connection is established are synchronized without reconnecting. Clients connected to an older broker see the channel as unsupported and do not send extension operations.
 
+### Opaque dispatch v1
+
+Registry-ready v2 advertises `opaque-dispatch-v1` and `extension-state-refresh-v1`. Registrations advertise `send`,
+`receive`, or both; `receive` requires synchronous reservation. Addressing is exact full session ID plus namespace, with
+no ordinary name/prefix/cwd/mailbox fallback and no confirmation dialog.
+
+Consumers must persist and fsync the broker epoch, message ID, reservation ID, and payload before calling `claim()`. Only
+an accepted claim result authorizes consumer-owned model injection. Active records live 24 hours; terminal replay lives one
+hour. Attempts are capped at 8, receipts at 20, active records at 256 globally and 32 per sender/target namespace, and
+tombstones at 512. Same-epoch restart can reconcile retained claim history; epoch/history loss is indeterminate and never
+automatically injects or resends. Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
+extension events, or model context. This local same-user transport is not remote authorization and provides no detach.
+
 ## How It Works
 
 ```mermaid
