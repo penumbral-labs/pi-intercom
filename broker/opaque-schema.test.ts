@@ -50,6 +50,10 @@ test("every opaque client frame validates exact fields and bounds", () => {
   for (const frame of frames) assert.equal(isOpaqueDispatchClientFrame(frame), true, frame.type);
   assert.equal(isOpaqueDispatchClientFrame({ ...frames[0], unexpected: true }), false);
   assert.equal(isOpaqueDispatchClientFrame({ ...frames[0], operationId: "x".repeat(129) }), false);
+  assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "refused", reason: "consumer_refused" }), true);
+  assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "failed_closed", reason: "consumer_unloaded" }), true);
+  assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "reserved", reason: "consumer_failed" }), false);
+  assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "refused", reason: "broker_epoch_changed" }), false);
 });
 
 test("every opaque broker frame validates exact fields and bounds", () => {
@@ -58,7 +62,11 @@ test("every opaque broker frame validates exact fields and bounds", () => {
     { type: "opaque_dispatch_v1_rejected", operationId: "op", code: "unsupported_target" },
     { type: "opaque_dispatch_v1_offer", reservationId, requestId: "request", messageId, attempt: 1, brokerEpoch, toSessionId: "target", recipientNamespace: "receiver/v1", sender: { sessionId: "origin", namespace: "sender/v1", trustedLocal: true }, payload: null, reserveBy: 1 },
     { type: "opaque_dispatch_v1_reservation_ended", messageId, reservationId, outcome: "cancelled" },
-    { type: "opaque_dispatch_v1_receipt", senderNamespace: "sender/v1", receipt: { requestId: "request", messageId, status: "queued", at: 1, attempt: 1, sequence: 1 } },
+    ...(["queued", "reserved", "claimed", "refused", "expired", "cancelled", "superseded", "failed_closed"] as const).map((status, index) => ({
+      type: "opaque_dispatch_v1_receipt",
+      senderNamespace: "sender/v1",
+      receipt: { requestId: "request", messageId, status, at: 1, attempt: 1, sequence: index + 1 },
+    })),
     { type: "opaque_dispatch_v1_claim_result", operationId: "op", reservationId, messageId, claimed: true },
     { type: "opaque_dispatch_v1_fail_result", operationId: "op", reservationId, messageId, failedClosed: true },
     { type: "opaque_dispatch_v1_claim_status_result", operationId: "op", brokerEpoch, reservationId, messageId, result: { state: "indeterminate", code: "broker_epoch_changed" } },
@@ -67,5 +75,6 @@ test("every opaque broker frame validates exact fields and bounds", () => {
   ];
   for (const frame of frames) assert.equal(isOpaqueDispatchBrokerFrame(frame), true, frame.type);
   assert.equal(isOpaqueDispatchBrokerFrame({ ...frames[2], attempt: 9 }), false);
-  assert.equal(isOpaqueDispatchBrokerFrame({ ...frames[4], receipt: { ...(frames[4] as { receipt: object }).receipt, sequence: 21 } }), false);
+  const receipt = frames.find((frame) => frame.type === "opaque_dispatch_v1_receipt") as { receipt: object };
+  assert.equal(isOpaqueDispatchBrokerFrame({ ...receipt, receipt: { ...receipt.receipt, sequence: 21 } }), false);
 });

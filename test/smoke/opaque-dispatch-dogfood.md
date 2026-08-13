@@ -18,6 +18,7 @@ offer, records the broker epoch, message ID, reservation ID, and payload to a sc
 claims. It verifies the claim result, same-epoch reconciliation, durable sentinel, absence of the sentinel from
 ordinary-message and generic broker callbacks, and ordinary socket usability after the opaque flow.
 
-This is an equivalent two-client production-broker dogfood, not a replacement of the currently loaded Pi extension.
-Runtime replacement, publication, push, and loaded-runtime mutation are not part of this run; cutover remains a separate
-human action.
+This is a two-client production-broker dogfood, not two real Pi runtimes or a replacement of the currently loaded Pi
+extension. `opaque-dispatch-residual.md` records the true-Pi-only matrix that this hermetic harness cannot honestly
+cover. Runtime replacement, publication, push, and loaded-runtime mutation are not part of this run; cutover remains a
+separate human action.

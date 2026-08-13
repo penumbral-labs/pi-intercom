@@ -95,6 +95,13 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+function opaqueErrorReason(error: unknown, fallback: OpaqueDispatchReason): OpaqueDispatchReason {
+  const message = getErrorMessage(error);
+  return message === "unsupported_broker" || message === "limit_exceeded" || message === "connection_lost"
+    ? message
+    : fallback;
+}
+
 function formatAttachments(attachments: Attachment[]): string {
   let text = "";
   for (const att of attachments) {
@@ -792,8 +799,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             });
           }
           return result;
-        } catch {
-          return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+        } catch (error) {
+          return { accepted: false as const, requestId: input.requestId, code: opaqueErrorReason(error, "connection_lost") };
         }
       },
       async cancelMessage(messageId) {
@@ -802,7 +809,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           return { cancelled: false as const, code: "unsupported_broker" as const };
         }
         try { return await activeClient.cancelOpaqueDispatch(namespace, messageId); }
-        catch { return { cancelled: false as const, code: "connection_lost" as const }; }
+        catch (error) { return { cancelled: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
       },
       async reconcileClaim(input) {
         const activeClient = client;
@@ -846,18 +853,25 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }));
   }
   function registerLocalExtension(registration: IntercomExtensionRegistration): void {
+    const unavailable = () => {
+      try { registration.onUnavailable?.("unsupported_host"); }
+      catch { /* A rejected consumer callback cannot break intercom registration. */ }
+    };
     if (!/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(registration.namespace)) {
-      throw new Error(`Invalid intercom extension namespace: ${registration.namespace}`);
+      unavailable();
+      return;
     }
     if (localExtensions.has(registration.namespace)) {
-      throw new Error(`Intercom extension namespace already registered: ${registration.namespace}`);
+      unavailable();
+      return;
     }
     const roles = registration.opaqueDispatch?.roles;
     if (registration.opaqueDispatch) {
       if (registration.opaqueDispatch.version !== 1 || !Array.isArray(roles) || roles.length === 0
         || roles.some((role) => role !== "send" && role !== "receive") || new Set(roles).size !== roles.length
         || (roles.includes("receive") && typeof registration.opaqueDispatch.onReserve !== "function")) {
-        throw new Error(`Invalid opaque dispatch registration: ${registration.namespace}`);
+        unavailable();
+        return;
       }
     }
     const generation = nextExtensionGeneration++;
@@ -1119,14 +1133,26 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               return { claimed: false, code: "stale_reservation" };
             }
             try { return await nextClient.claimOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
-            catch { return { claimed: false, code: "connection_lost" }; }
+            catch (error) { return { claimed: false, code: opaqueErrorReason(error, "connection_lost") }; }
+            finally {
+              const active = localExtensions.get(frame.recipientNamespace);
+              if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
+                active.reservations.delete(frame.messageId);
+              }
+            }
           },
           async fail() {
             if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
               return { failedClosed: false, code: "stale_reservation" };
             }
             try { return await nextClient.failOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
-            catch { return { failedClosed: false, code: "connection_lost" }; }
+            catch (error) { return { failedClosed: false, code: opaqueErrorReason(error, "connection_lost") }; }
+            finally {
+              const active = localExtensions.get(frame.recipientNamespace);
+              if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
+                active.reservations.delete(frame.messageId);
+              }
+            }
           },
         };
         let decision: unknown;
@@ -1633,6 +1659,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       || typeof registration.onEvent !== "function"
       || typeof registration.onReady !== "function"
     ) {
+      try { registration.onUnavailable?.("unsupported_host"); }
+      catch { /* A rejected consumer callback cannot break the host event bus. */ }
       return;
     }
     registerLocalExtension(registration as IntercomExtensionRegistration);

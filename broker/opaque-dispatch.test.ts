@@ -40,6 +40,7 @@ test("canonical payload grammar sorts keys and rejects non-JSON values", () => {
   if (result.ok) assert.equal(result.json, '{"a":[true,null,0],"z":1}');
   assert.deepEqual(canonicalizeOpaquePayload(Number.NaN), { ok: false, code: "invalid_request" });
   assert.deepEqual(canonicalizeOpaquePayload({ value: undefined }), { ok: false, code: "invalid_request" });
+  assert.deepEqual(canonicalizeOpaquePayload("x".repeat(64 * 1024)), { ok: false, code: "payload_too_large" });
   const sparse = Array(1);
   assert.deepEqual(canonicalizeOpaquePayload(sparse), { ok: false, code: "invalid_request" });
   const cyclic: { self?: unknown } = {};
@@ -145,6 +146,16 @@ test("claim-first supersede race rejects the replacement", () => {
   manager.shutdown();
 });
 
+test("offered-window disconnect accepts the send as mailbox queued", () => {
+  const { manager, senderFrames, send } = harness();
+  send();
+  manager.endpointDisconnected("receiver");
+  const ack = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_ack" }> => frame.type === "opaque_dispatch_v1_ack");
+  assert.equal(ack?.deliveryState, "mailbox_queued");
+  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_rejected"), false);
+  manager.shutdown();
+});
+
 test("receiver reconnect exhausts eight delivery attempts", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send();
@@ -170,6 +181,36 @@ test("cancel ends reservation before terminal receipt", () => {
   const terminal = senderFrames.find((frame) => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "cancelled");
   assert.ok(terminal);
   assert.equal(senderFrames.at(-1)?.type, "opaque_dispatch_v1_cancel_result");
+  manager.shutdown();
+});
+
+test("duplicate positive reservation result is idempotent", () => {
+  const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
+  send();
+  const offered = offer(receiverFrames);
+  const result = { type: "opaque_dispatch_v1_reservation_result" as const, reservationId: offered.reservationId, messageId: offered.messageId, decision: "reserved" as const };
+  manager.handle(endpoints.get("receiver")!, result);
+  manager.handle(endpoints.get("receiver")!, result);
+  assert.equal(senderFrames.filter((frame) => frame.type === "opaque_dispatch_v1_ack").length, 1);
+  assert.equal(senderFrames.filter((frame) => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "reserved").length, 1);
+  manager.shutdown();
+});
+
+test("receiver reservation reasons are restricted to consumer failures", () => {
+  const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
+  send();
+  const offered = offer(receiverFrames);
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_reservation_result",
+    reservationId: offered.reservationId,
+    messageId: offered.messageId,
+    decision: "refused",
+    reason: "broker_epoch_changed",
+  });
+  const rejection = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_rejected" }> => frame.type === "opaque_dispatch_v1_rejected");
+  assert.equal(rejection?.code, "consumer_refused");
+  const receipt = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt");
+  assert.equal(receipt?.receipt.reason, "consumer_refused");
   manager.shutdown();
 });
 
@@ -223,6 +264,51 @@ test("repeated accepted claim is idempotent and foreign reconcile reveals no his
   manager.shutdown();
 });
 
+test("reservation and claim deadlines fail closed with typed reasons", async () => {
+  const reservationHarness = harness(true, { reservationTimeoutMs: 10, claimTimeoutMs: 1_000 });
+  reservationHarness.send();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const reservationTimeout = reservationHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
+  assert.equal(reservationTimeout?.receipt.reason, "reservation_timeout");
+  reservationHarness.manager.shutdown();
+
+  const claimHarness = harness(true, { reservationTimeoutMs: 1_000, claimTimeoutMs: 10 });
+  claimHarness.send();
+  const offered = offer(claimHarness.receiverFrames);
+  claimHarness.manager.handle(claimHarness.endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_reservation_result", reservationId: offered.reservationId, messageId: offered.messageId, decision: "reserved",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const claimTimeout = claimHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
+  assert.equal(claimTimeout?.receipt.reason, "claim_timeout");
+  claimHarness.manager.shutdown();
+});
+
+test("capability invalidation and reservation rate limits fail closed", async () => {
+  const capabilityHarness = harness();
+  capabilityHarness.send();
+  const capabilityOffer = offer(capabilityHarness.receiverFrames);
+  capabilityHarness.manager.handle(capabilityHarness.endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_reservation_result", reservationId: capabilityOffer.reservationId, messageId: capabilityOffer.messageId, decision: "reserved",
+  });
+  capabilityHarness.endpoints.get("receiver")!.extensions = [];
+  capabilityHarness.manager.capabilityChanged("receiver");
+  await new Promise((resolve) => setImmediate(resolve));
+  const invalidated = capabilityHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
+  assert.equal(invalidated?.receipt.reason, "capability_invalidated");
+  capabilityHarness.manager.shutdown();
+
+  const rateHarness = harness();
+  rateHarness.send();
+  const rateOffer = offer(rateHarness.receiverFrames);
+  rateHarness.manager.rateLimited(rateHarness.endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_reservation_result", reservationId: rateOffer.reservationId, messageId: rateOffer.messageId, decision: "reserved",
+  });
+  const rateLimited = rateHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
+  assert.equal(rateLimited?.receipt.reason, "rate_limited");
+  rateHarness.manager.shutdown();
+});
+
 test("active expiry emits expired without a reservation-timeout reason", async () => {
   const { manager, senderFrames, receiverFrames, send } = harness(true, { activeTtlMs: 10, reservationTimeoutMs: 1_000 });
   send();
@@ -249,7 +335,7 @@ test("global capacity evicts an old queued record without a stale per-principal 
       write: (frame) => senderFrames.push(frame),
     });
   }
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 9; index += 1) {
     const id = `receiver-${index}`;
     endpoints.set(id, { sessionId: id, info: info(id), extensions: receiverExtensions, connected: false });
   }
@@ -261,10 +347,41 @@ test("global capacity evicts an old queued record without a stale per-principal 
     }
   }
   assert.equal(manager.activeCount, 256);
-  const origin = endpoints.get("sender-0")!;
-  manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: "boundary-op", requestId: "boundary-request", senderNamespace: "sender/v1", toSessionId: "receiver-0", recipientNamespace: "receiver/v1", payload: null });
+  const origin = endpoints.get("sender-8")!;
+  manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: "boundary-op", requestId: "boundary-request", senderNamespace: "sender/v1", toSessionId: "receiver-8", recipientNamespace: "receiver/v1", payload: null });
   assert.equal(manager.activeCount, 256);
   assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_ack" && frame.operationId === "boundary-op"), true);
+  manager.shutdown();
+});
+
+test("capped principal cannot evict another principal at global capacity", () => {
+  const senderFrames = new Map<string, OpaqueDispatchBrokerFrame[]>();
+  const endpoints = new Map<string, OpaqueEndpoint>();
+  for (let index = 0; index < 9; index += 1) {
+    const id = `sender-${index}`;
+    const frames: OpaqueDispatchBrokerFrame[] = [];
+    senderFrames.set(id, frames);
+    endpoints.set(id, { sessionId: id, info: info(id), extensions: senderExtensions, connected: true, write: (frame) => frames.push(frame) });
+    endpoints.set(`receiver-${index}`, { sessionId: `receiver-${index}`, info: info(`receiver-${index}`), extensions: receiverExtensions, connected: false });
+  }
+  const manager = new OpaqueDispatchManager({ brokerEpoch: "33333333-3333-4333-8333-333333333333", endpoint: (id) => endpoints.get(id), owner: () => undefined });
+  for (let senderIndex = 0; senderIndex < 8; senderIndex += 1) {
+    for (let recordIndex = 0; recordIndex < 32; recordIndex += 1) {
+      manager.handle(endpoints.get(`sender-${senderIndex}`)!, {
+        type: "opaque_dispatch_v1_send", operationId: `op-${senderIndex}-${recordIndex}`, requestId: `request-${senderIndex}-${recordIndex}`,
+        senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, recipientNamespace: "receiver/v1", payload: null,
+      });
+    }
+  }
+  const foreignBefore = senderFrames.get("sender-1")!.length;
+  manager.handle(endpoints.get("sender-0")!, {
+    type: "opaque_dispatch_v1_send", operationId: "capped-op", requestId: "capped-request", senderNamespace: "sender/v1",
+    toSessionId: "receiver-8", recipientNamespace: "receiver/v1", payload: null,
+  });
+  assert.equal(manager.activeCount, 256);
+  const rejection = senderFrames.get("sender-0")!.at(-1);
+  assert.equal(rejection?.type === "opaque_dispatch_v1_rejected" ? rejection.code : undefined, "limit_exceeded");
+  assert.equal(senderFrames.get("sender-1")!.length, foreignBefore);
   manager.shutdown();
 });
 

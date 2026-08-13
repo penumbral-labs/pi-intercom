@@ -1010,6 +1010,26 @@ test("intercom tool shows unique ID prefixes when names collide", { concurrency:
   }
 });
 
+test("invalid extension registrations invoke onUnavailable without onReady", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness();
+  const unavailable: string[] = [];
+  let ready = false;
+
+  piIntercomExtension(harness.pi as never);
+  harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+    namespace: "invalid opaque namespace",
+    ownerEligible: false,
+    opaqueDispatch: { version: 1, roles: ["receive"] },
+    onReady: () => { ready = true; },
+    onEvent: () => undefined,
+    onUnavailable: (reason: string) => unavailable.push(reason),
+  });
+
+  assert.deepEqual(unavailable, ["unsupported_host"]);
+  assert.equal(ready, false);
+});
+
 test("extension channels register locally without creating conversation messages", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness();
@@ -1032,6 +1052,100 @@ test("extension channels register locally without creating conversation messages
   assert.deepEqual(extensionEvents, []);
   assert.deepEqual(harness.sentMessages, []);
   assert.deepEqual(harness.entries, []);
+});
+
+test("opaque claim releases receiver reservation before dispose", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const sender = new IntercomClient();
+  const harness = createExtensionHarness("opaque-claim-receiver", { hasUI: true, sessionId: "opaque-claim-receiver" });
+  let receiverChannel: IntercomExtensionChannel | undefined;
+  let claim: (() => Promise<unknown>) | undefined;
+  try {
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "opaque/claim-receiver",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["receive"],
+        onReserve: (_event: unknown, reservation: { claim(): Promise<unknown> }) => {
+          claim = () => reservation.claim();
+          return "reserved";
+        },
+      },
+      onReady: (channel: IntercomExtensionChannel) => { receiverChannel = channel; },
+      onEvent: () => undefined,
+    });
+    await harness.emitLifecycle("session_start");
+    await sender.connect({
+      name: "opaque-claim-sender", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace: "opaque/claim-sender", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "opaque-claim-sender");
+    await waitForSessionId(sender, "opaque-claim-receiver");
+    const accepted = await sender.sendOpaqueDispatch("opaque/claim-sender", {
+      requestId: "claim-release-request", toSessionId: "opaque-claim-receiver", recipientNamespace: "opaque/claim-receiver", payload: null,
+    });
+    assert.equal(accepted.accepted, true);
+    assert.ok(claim);
+    assert.deepEqual(await claim(), { claimed: true });
+    assert.deepEqual(await claim(), { claimed: true });
+
+    const frames: BrokerMessage[] = [];
+    const stop = sender.onOpaqueDispatch((frame) => frames.push(frame));
+    receiverChannel?.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    stop();
+    assert.equal(frames.some((frame) => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed"), false);
+  } finally {
+    receiverChannel?.dispose();
+    await sender.disconnect().catch(() => undefined);
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("opaque consumer refusal and callback failures retain typed terminal reasons", { concurrency: false }, async () => {
+  const cases = [
+    { name: "refused", expected: "consumer_refused", onReserve: () => "refused" },
+    { name: "threw", expected: "consumer_threw", onReserve: () => { throw new Error("consumer failed privately"); } },
+    { name: "malformed", expected: "malformed_consumer_result", onReserve: () => "invalid" },
+  ] as const;
+  for (const entry of cases) {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const { cleanup } = await setupClients();
+    const sender = new IntercomClient();
+    const sessionId = `opaque-${entry.name}-receiver`;
+    const namespace = `opaque/${entry.name}-receiver`;
+    const harness = createExtensionHarness(sessionId, { hasUI: true, sessionId });
+    let channel: IntercomExtensionChannel | undefined;
+    try {
+      piIntercomExtension(harness.pi as never);
+      harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+        namespace,
+        ownerEligible: false,
+        opaqueDispatch: { version: 1, roles: ["receive"], onReserve: entry.onReserve },
+        onReady: (value: IntercomExtensionChannel) => { channel = value; },
+        onEvent: () => undefined,
+      });
+      await harness.emitLifecycle("session_start");
+      await sender.connect({
+        name: `opaque-${entry.name}-sender`, cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(),
+        extensions: [{ namespace: "opaque/failure-sender", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+      }, `opaque-${entry.name}-sender`);
+      await waitForSessionId(sender, sessionId);
+      const result = await sender.sendOpaqueDispatch("opaque/failure-sender", {
+        requestId: `${entry.name}-request`, toSessionId: sessionId, recipientNamespace: namespace, payload: null,
+      });
+      assert.equal(result.accepted, false);
+      if (!result.accepted) assert.equal(result.code, entry.expected);
+    } finally {
+      channel?.dispose();
+      await sender.disconnect().catch(() => undefined);
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  }
 });
 
 test("opaque extension sends consumer_unloaded before dispose removes capability", { concurrency: false }, async () => {

@@ -490,9 +490,11 @@ namespace. Same-epoch restart can reconcile retained claim history; epoch/histor
 automatically injects or resends. Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
 extension events, or model context. This local same-user transport is not remote authorization and provides no detach.
 
-`refreshState()` intentionally returns `ExtensionStateRefreshResult` rather than a bare snapshot: successful results carry
+`refreshState()` returns `ExtensionStateRefreshResult` rather than a bare snapshot: successful results carry
 `{ok:true,state}`, while old-broker and disconnected paths return typed `{ok:false,code}` outcomes before any unsupported
-write. This is the approved extension API contract for state refresh.
+write. The implementation and published API use this result contract; the approved reconciliation PRD's older bare-snapshot
+signature remains unchanged as planning history. Registration rejection invokes `onUnavailable("unsupported_host")`, and
+opaque operations preserve typed `unsupported_broker`, `limit_exceeded`, and `connection_lost` results at this boundary.
 
 ## How It Works
 

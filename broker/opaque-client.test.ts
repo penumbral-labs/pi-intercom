@@ -61,6 +61,49 @@ test("opaque pending operations enforce a 32-per-namespace cap", async () => {
   await Promise.all(pending);
 });
 
+test("opaque pending operations enforce the 256 global cap", async () => {
+  const client = new IntercomClient();
+  const raw = internals(client);
+  raw._sessionId = "sender";
+  raw._features = new Set([OPAQUE_DISPATCH_FEATURE]);
+  const operationIds: string[] = [];
+  raw.socket = {
+    destroyed: false,
+    writableEnded: false,
+    writable: true,
+    write: (data) => {
+      const buffer = Buffer.from(data);
+      const frame = JSON.parse(buffer.subarray(4, 4 + buffer.readUInt32BE(0)).toString("utf8")) as { operationId: string };
+      operationIds.push(frame.operationId);
+      return true;
+    },
+  };
+  const pending: Array<ReturnType<IntercomClient["sendOpaqueDispatch"]>> = [];
+  for (let namespaceIndex = 0; namespaceIndex < 8; namespaceIndex += 1) {
+    for (let operationIndex = 0; operationIndex < 32; operationIndex += 1) {
+      pending.push(client.sendOpaqueDispatch(`sender/${namespaceIndex}`, {
+        requestId: `request-${namespaceIndex}-${operationIndex}`,
+        toSessionId: "receiver",
+        recipientNamespace: "receiver/v1",
+        payload: null,
+      }));
+    }
+  }
+  await assert.rejects(client.sendOpaqueDispatch("sender/overflow", {
+    requestId: "request-over-global-limit",
+    toSessionId: "receiver",
+    recipientNamespace: "receiver/v1",
+    payload: null,
+  }), /limit_exceeded/);
+  operationIds.forEach((operationId, index) => raw.handleBrokerMessage({
+    type: "opaque_dispatch_v1_rejected",
+    operationId,
+    requestId: `settled-${index}`,
+    code: "unsupported_target",
+  }));
+  await Promise.all(pending);
+});
+
 test("opaque claim result settles only the correlated operation", async () => {
   const client = new IntercomClient();
   const raw = internals(client);

@@ -28,6 +28,17 @@ function registration(name: string, namespace: string, role: "send" | "receive")
   };
 }
 
+function legacyRegistration(name: string): SessionRegistration {
+  return {
+    name,
+    cwd: process.cwd(),
+    model: "wire-test-v0.10",
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+  };
+}
+
 async function waitForBrokerReady(broker: ChildProcess): Promise<void> {
   const stdout = broker.stdout;
   if (!stdout) throw new Error("Broker stdout unavailable");
@@ -146,7 +157,7 @@ test("new client refuses opaque writes to a featureless v0.10-style broker and k
 });
 
 test("v0.10-style client remains ordinary-wire compatible with the new broker", { concurrency: false }, async () => {
-  await withWireClients(async (_sender, receiver) => {
+  await withWireClients(async (sender, receiver) => {
     const socket = net.connect(getBrokerSocketPath());
     const received: unknown[] = [];
     socket.on("data", createMessageReader((frame) => received.push(frame), (error) => socket.destroy(error)));
@@ -161,7 +172,7 @@ test("v0.10-style client remains ordinary-wire compatible with the new broker", 
       throw new Error(`legacy wire response timeout: ${JSON.stringify(received)}`);
     };
     try {
-      writeMessage(socket, { type: "register", sessionId: "legacy-client", session: registration("legacy-client", "legacy/v1", "send") });
+      writeMessage(socket, { type: "register", sessionId: "legacy-client", session: legacyRegistration("legacy-client") });
       await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "registered");
       writeMessage(socket, { type: "list", requestId: "legacy-list" });
       const sessions = await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "sessions") as { sessions: Array<{ id: string }> };
@@ -173,6 +184,20 @@ test("v0.10-style client remains ordinary-wire compatible with the new broker", 
       });
       const delivered = await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "delivered") as { messageId: string };
       assert.equal(delivered.messageId, "legacy-message");
+
+      const unsupported = await sender.sendOpaqueDispatch(senderNamespace, {
+        requestId: "legacy-target-request",
+        toSessionId: "legacy-client",
+        recipientNamespace: "legacy/v1",
+        payload: { sentinel },
+      });
+      assert.deepEqual(unsupported, { accepted: false, requestId: "legacy-target-request", code: "unsupported_target" });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(received.some((frame) => typeof frame === "object" && frame !== null && "type" in frame
+        && String(frame.type).startsWith("opaque_dispatch_v1_")), false);
+      writeMessage(socket, { type: "list", requestId: "legacy-list-after-opaque" });
+      await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "sessions"
+        && "requestId" in frame && frame.requestId === "legacy-list-after-opaque");
       assert.equal(receiver.isConnected(), true);
     } finally {
       socket.destroy();

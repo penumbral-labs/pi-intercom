@@ -21,7 +21,8 @@ This skill covers how to handle those orchestrator-side escalations.
 
 Opaque consumers require registry-ready v2 and `opaque-dispatch-v1` version 1. Reserve synchronously, persist and fsync
 epoch plus message/reservation IDs and payload, then claim. Inject only after accepted claim; never convert opaque work to
-an ordinary message or automatically resend an indeterminate broker outcome. There is no confirmation or detach path.
+an ordinary message or automatically resend an indeterminate broker outcome. Treat `mailbox_queued` as accepted transport
+custody, not a terminal failure. There is no confirmation or detach path.
 
 ## When to Use
 

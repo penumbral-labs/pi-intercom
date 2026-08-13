@@ -16,6 +16,10 @@ export const MAX_OPAQUE_RECEIPTS = 20;
 export const MAX_OPAQUE_WAITERS = 8;
 export const MAX_OPAQUE_PAYLOAD_BYTES = 64 * 1024;
 
+const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
+  "consumer_refused", "consumer_failed", "consumer_threw", "consumer_unloaded", "consumer_missing", "malformed_consumer_result",
+]);
+
 export interface OpaqueEndpoint {
   sessionId: string;
   info: SessionInfo;
@@ -66,8 +70,6 @@ interface Reservation {
   id: string;
   targetSessionId: string;
   recipientNamespace: string;
-  attempt: number;
-  phase: "offered" | "reserved";
   timer: NodeJS.Timeout;
 }
 
@@ -82,7 +84,6 @@ interface RecordState {
   recipientNamespace: string;
   createdAt: number;
   payload?: unknown;
-  canonicalBytes?: number;
   status: "queued" | "offered" | "reserved" | "claimed" | "terminal";
   terminalStatus?: Exclude<OpaqueDispatchStatus, "queued" | "reserved">;
   terminalReason?: OpaqueDispatchReason;
@@ -236,7 +237,7 @@ export class OpaqueDispatchManager {
       clearTimeout(reservation.timer);
       record.reservation = undefined;
       if (record.status === "offered" && record.waiters.length > 0) {
-        this.rejectWaiters(record, "receiver_disconnected", "failed_closed");
+        this.ackWaiters(record, "mailbox_queued");
       }
       if (record.status === "offered" || record.status === "reserved") {
         if (record.attempt >= MAX_OPAQUE_ATTEMPTS) this.terminalize(record, "failed_closed", "attempt_limit");
@@ -328,7 +329,7 @@ export class OpaqueDispatchManager {
       key, digest, originSessionId: origin.sessionId, senderNamespace: frame.senderNamespace,
       requestId: frame.requestId, messageId: randomUUID(), targetSessionId: frame.toSessionId,
       recipientNamespace: frame.recipientNamespace, createdAt: now, payload: canonical.normalized,
-      canonicalBytes: Buffer.byteLength(canonical.json, "utf8"), status: "queued", attempt: 0,
+      status: "queued", attempt: 0,
       waiters: [{ operationId: frame.operationId, requestId: frame.requestId }], receipts: [], ackedThrough: 0,
     };
     record.activeTimer = setTimeout(() => this.expire(record), this.activeTtlMs());
@@ -344,14 +345,15 @@ export class OpaqueDispatchManager {
 
   private hasCapacity(originId: string, senderNamespace: string, targetId: string, recipientNamespace: string): boolean {
     let active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed");
+    if (active.filter((record) => principalKey(record.originSessionId, record.senderNamespace) === principalKey(originId, senderNamespace)).length >= MAX_OPAQUE_PRINCIPAL_RECORDS) return false;
+    if (active.filter((record) => targetKey(record.targetSessionId, record.recipientNamespace) === targetKey(targetId, recipientNamespace)).length >= MAX_OPAQUE_TARGET_RECORDS) return false;
     if (active.length >= MAX_OPAQUE_ACTIVE_RECORDS) {
       const oldestQueued = active.filter((record) => record.status === "queued").sort((a, b) => a.createdAt - b.createdAt)[0];
       if (!oldestQueued) return false;
       this.terminalize(oldestQueued, "expired", "limit_exceeded");
       active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed");
     }
-    if (active.filter((record) => principalKey(record.originSessionId, record.senderNamespace) === principalKey(originId, senderNamespace)).length >= MAX_OPAQUE_PRINCIPAL_RECORDS) return false;
-    return active.filter((record) => targetKey(record.targetSessionId, record.recipientNamespace) === targetKey(targetId, recipientNamespace)).length < MAX_OPAQUE_TARGET_RECORDS;
+    return active.length < MAX_OPAQUE_ACTIVE_RECORDS;
   }
 
   private offer(record: RecordState): void {
@@ -368,7 +370,7 @@ export class OpaqueDispatchManager {
       this.terminalize(record, "failed_closed", "reservation_timeout");
     }, this.reservationTimeoutMs());
     timer.unref?.();
-    record.reservation = { id: reservationId, targetSessionId: record.targetSessionId, recipientNamespace: record.recipientNamespace, attempt: record.attempt, phase: "offered", timer };
+    record.reservation = { id: reservationId, targetSessionId: record.targetSessionId, recipientNamespace: record.recipientNamespace, timer };
     record.status = "offered";
     const origin = this.hooks.endpoint(record.originSessionId);
     const offered = writeOpaqueTo(target, { namespace: record.recipientNamespace, role: "receive" }, {
@@ -395,18 +397,19 @@ export class OpaqueDispatchManager {
     const record = this.byMessageId.get(frame.messageId);
     const reservation = record?.reservation;
     if (!record || !reservation || reservation.id !== frame.reservationId || reservation.targetSessionId !== endpoint.sessionId
-      || (record.status !== "offered" && record.status !== "reserved")) return;
+      || (frame.decision === "reserved" ? record.status !== "offered" : (record.status !== "offered" && record.status !== "reserved"))) return;
     // An exact current receiver may fail closed after its capability-removal frame
     // has been read; accepting only the negative settlement preserves dispose order.
     if (frame.decision === "reserved" && !hasRole(endpoint, reservation.recipientNamespace, "receive")) return;
     clearTimeout(reservation.timer);
     if (frame.decision !== "reserved") {
-      this.endReservation(record, "failed_closed", frame.reason ?? (frame.decision === "refused" ? "consumer_refused" : "consumer_failed"));
-      this.rejectWaiters(record, frame.reason ?? (frame.decision === "refused" ? "consumer_refused" : "consumer_failed"), frame.decision === "refused" ? "refused" : "failed_closed");
-      this.terminalize(record, frame.decision === "refused" ? "refused" : "failed_closed", frame.reason ?? (frame.decision === "refused" ? "consumer_refused" : "consumer_failed"));
+      const fallback = frame.decision === "refused" ? "consumer_refused" : "consumer_failed";
+      const reason = frame.reason && OPAQUE_CONSUMER_REASONS.has(frame.reason) ? frame.reason : fallback;
+      this.endReservation(record, "failed_closed", reason);
+      this.rejectWaiters(record, reason, frame.decision === "refused" ? "refused" : "failed_closed");
+      this.terminalize(record, frame.decision === "refused" ? "refused" : "failed_closed", reason);
       return;
     }
-    reservation.phase = "reserved";
     reservation.timer = setTimeout(() => {
       if (record.reservation?.id !== reservation.id || record.status !== "reserved") return;
       this.endReservation(record, "failed_closed", "claim_timeout");
@@ -554,7 +557,6 @@ export class OpaqueDispatchManager {
 
   private clearPayload(record: RecordState): void {
     delete record.payload;
-    delete record.canonicalBytes;
   }
 
   private startTombstone(record: RecordState): void {

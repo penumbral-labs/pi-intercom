@@ -14,6 +14,8 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Hardened broker framing with capped outbound writes, single-allocation encoding, contained oversized deliveries, and atomic supersede/replacement validation; pending ask indexes now enforce global and per-session bounds during reply retargeting.
 
 ### Fixed
+- Keep offered-window disconnects queued instead of reporting a false terminal, release settled receiver reservations, preserve typed opaque errors, restrict receiver-supplied failure reasons, and make positive reservation settlement idempotent.
+- Gate active-record eviction behind sender/target admission and verify that non-advertising v0.10 peers receive no opaque frames.
 - Correlate concurrent ordinary send and cancel results without allowing a late legacy result to settle the wrong caller, while bounding the legacy late-result quarantine.
 - Emit ordinary mailbox `queued`, `expired`, and `cancelled` receipts under a reserved broker identity.
 - Report dead subagent relay dispatches accurately and send busy non-interactive notices only for asks.

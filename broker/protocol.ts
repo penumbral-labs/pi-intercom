@@ -164,6 +164,9 @@ const OPAQUE_REASONS = new Set<OpaqueDispatchReason>([
 const OPAQUE_STATUSES = new Set<OpaqueDispatchStatus>([
   "queued", "reserved", "claimed", "refused", "expired", "cancelled", "superseded", "failed_closed",
 ]);
+const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
+  "consumer_refused", "consumer_failed", "consumer_threw", "consumer_unloaded", "consumer_missing", "malformed_consumer_result",
+]);
 
 export function isOpaqueDispatchReason(value: unknown): value is OpaqueDispatchReason {
   return typeof value === "string" && OPAQUE_REASONS.has(value as OpaqueDispatchReason);
@@ -207,7 +210,9 @@ export function isOpaqueDispatchClientFrame(value: unknown): value is OpaqueDisp
       return hasExactKeys(value, ["type", "reservationId", "messageId", "decision"], ["reason"])
         && isUuid(value.reservationId) && isUuid(value.messageId)
         && (value.decision === "reserved" || value.decision === "refused" || value.decision === "failed_closed")
-        && (value.reason === undefined || isOpaqueDispatchReason(value.reason));
+        && (value.decision === "reserved"
+          ? value.reason === undefined
+          : value.reason === undefined || (isOpaqueDispatchReason(value.reason) && OPAQUE_CONSUMER_REASONS.has(value.reason)));
     case "opaque_dispatch_v1_claim":
       return hasExactKeys(value, ["type", "operationId", "reservationId", "messageId"])
         && isBoundedId(value.operationId) && isUuid(value.reservationId) && isUuid(value.messageId);
