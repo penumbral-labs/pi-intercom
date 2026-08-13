@@ -7,7 +7,7 @@ import { EventEmitter, once } from "node:events";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { MAX_PENDING_ASK_EDGES_PER_SESSION } from "./broker/ask-edges.ts";
-import type { BrokerMessage, Message, SessionInfo } from "./types.ts";
+import { BROKER_SESSION_ID, type BrokerMessage, type Message, type SessionInfo } from "./types.ts";
 import { INTERCOM_EXTENSION_REGISTER_EVENT, type IntercomExtensionChannel } from "./extension-api.ts";
 
 const repoDir = process.cwd();
@@ -2646,6 +2646,98 @@ test("broker reports queued and cancelled mailbox receipts without closing the s
     assert.ok(sessions.some((session) => session.id === orchestrator.sessionId));
     unsubscribeReceipts();
   } finally {
+    await cleanup();
+  }
+});
+
+test("broker wire-observes an expired receipt when mailbox capacity evicts a message", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+
+  try {
+    const disconnectedId = planner.sessionId!;
+    await planner.disconnect();
+    const observed: Array<{ from: SessionInfo; status: string; timestamp: number }> = [];
+    const unsubscribeReceipts = orchestrator.onMessageReceipt((from, receipt) => {
+      if (receipt.messageId === "mailbox-capacity-0") {
+        observed.push({ from, status: receipt.status, timestamp: receipt.timestamp });
+      }
+    });
+
+    for (let index = 0; index < 256; index += 1) {
+      assert.equal((await orchestrator.send(disconnectedId, {
+        messageId: `mailbox-capacity-${index}`,
+        text: `Queued mailbox message ${index}`,
+      })).delivered, true);
+      if (index === 199) {
+        // The broker permits a 240-message burst and refills 120 tokens/s.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    assert.equal((await orchestrator.send(disconnectedId, {
+      messageId: "mailbox-capacity-overflow",
+      text: "Evict the oldest queued mailbox message.",
+    })).delivered, true);
+
+    assert.deepEqual(observed.map(({ status }) => status), ["queued", "expired"]);
+    const expired = observed[1]!;
+    assert.deepEqual(Object.keys(expired.from).sort(), [
+      "cwd",
+      "id",
+      "lastActivity",
+      "model",
+      "name",
+      "pid",
+      "startedAt",
+      "status",
+      "trustedLocal",
+    ]);
+    assert.equal(expired.from.id, BROKER_SESSION_ID);
+    assert.equal(expired.from.name, "pi-intercom-broker");
+    assert.equal(expired.from.cwd, "");
+    assert.equal(expired.from.model, "broker");
+    assert.equal(expired.from.status, "broker");
+    assert.equal(expired.from.lastActivity, expired.timestamp);
+    assert.equal(expired.from.trustedLocal, process.platform !== "win32");
+    assert.equal(orchestrator.isConnected(), true);
+    unsubscribeReceipts();
+  } finally {
+    await cleanup();
+  }
+});
+
+test("broker rejects the reserved broker session ID on the registration wire", { concurrency: false }, async () => {
+  const net = await import("node:net");
+  const { getBrokerSocketPath } = await import("./broker/paths.ts");
+  const { createMessageReader, writeMessage } = await import("./broker/framing.ts");
+  const { orchestrator, cleanup } = await setupClients();
+  const socket = net.connect(getBrokerSocketPath());
+  const received: unknown[] = [];
+
+  try {
+    await once(socket, "connect");
+    const closed = once(socket, "close");
+    socket.on("error", () => undefined);
+    socket.on("data", createMessageReader((message) => received.push(message), (error) => socket.destroy(error)));
+    writeMessage(socket, {
+      type: "register",
+      sessionId: BROKER_SESSION_ID,
+      session: {
+        name: "reserved-id-collision",
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      },
+    });
+
+    await closed;
+    assert.deepEqual(received, [], "reserved identity must not receive a registered frame");
+    assert.equal(socket.destroyed, true);
+    const sessions = await orchestrator.listSessions();
+    assert.equal(sessions.some((session) => session.id === BROKER_SESSION_ID), false);
+  } finally {
+    socket.destroy();
     await cleanup();
   }
 });
