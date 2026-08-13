@@ -941,7 +941,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       if (!activeContext.isIdle()) {
         if (!activeContext.hasUI) {
           const activeClient = client;
-          if (!message.replyTo && activeClient?.isConnected()) {
+          if (message.expectsReply && activeClient?.isConnected()) {
             try {
               const result = await activeClient.send(from.id, {
                 text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
@@ -1311,11 +1311,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!parsed) return;
 
     const relayGeneration = runtimeGeneration;
-    void (async () => {
-      const relayStillLive = () => !runtimeStarted || Boolean(getLiveContext(runtimeContext, relayGeneration));
-      if (!relayStillLive()) {
-        return;
+    const relayStillLive = () => config.enabled && Boolean(getLiveContext(runtimeContext, relayGeneration));
+    if (!relayStillLive()) {
+      if (options.acknowledge) {
+        emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
       }
+      return;
+    }
+
+    void (async () => {
       if (currentSessionTargetMatches(parsed.to)) {
         deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
@@ -1328,13 +1332,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         activeClient = await ensureConnected("background");
         target = await resolveSessionTarget(activeClient, parsed.to) ?? parsed.to;
       } catch (error) {
-        if (!relayStillLive()) return;
+        if (!relayStillLive()) {
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+          return;
+        }
         recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, false, error);
         return;
       }
 
       if (!relayStillLive()) {
+        if (options.acknowledge) {
+          emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+        }
         return;
       }
       if (currentSessionTargetMatches(parsed.to, target, activeClient)) {
@@ -1345,7 +1355,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
       try {
         const result = await activeClient.send(target, { text: parsed.message });
-        if (!relayStillLive()) return;
+        if (!relayStillLive()) {
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+          return;
+        }
         if (!result.delivered) {
           const error = new Error(result.reason ?? "Session may not exist or has disconnected.");
           recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
@@ -1354,7 +1367,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
       } catch (error) {
-        if (!relayStillLive()) return;
+        if (!relayStillLive()) {
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+          return;
+        }
         recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, false, error);
       }
