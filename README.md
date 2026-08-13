@@ -226,11 +226,11 @@ This matters because the agent receiving the message doesn't need to reconstruct
 
 The broker keeps a bounded in-memory mailbox for recently disconnected explicitly named sessions. If a lightweight CLI sender asks a long-running session something and exits before the answer, the later `reply` is accepted into that mailbox instead of failing with `Session not found`; a process that reconnects with the same explicit name and directory receives the queued reply. Runtime-only unnamed-session aliases never transfer mailbox ownership, and routing never remaps mail back to its sender. This is per-broker runtime state, not durable storage across broker restarts.
 
-Incoming messages carry diagnostic metadata end to end: stable message ID, sender sequence, sender timestamp, broker receive/delivery timestamps, receiver receive timestamp, and injection timestamp. Connected interactive receivers emit `receiver_received`, `acknowledged`, and `injected` as they hand messages to Pi; duplicate IDs are acknowledged but injected at most once per receiving session. Broker mailbox delivery for temporarily disconnected targets can still report queued delivery. If an `ask` times out, the timeout names the message ID and last known delivery state. Timeout is not cancellation: an injected or broker-queued message may remain actionable unless an explicit cancellation path says otherwise.
+Incoming messages carry diagnostic metadata end to end: stable message ID, sender sequence, sender timestamp, broker receive/delivery timestamps, receiver receive timestamp, and injection timestamp. Connected interactive receivers emit `receiver_received`, `acknowledged`, and `injected` as they hand messages to Pi; duplicate IDs are acknowledged but injected at most once per receiving session. Broker mailbox lifecycle receipts use the reserved `pi-intercom-broker` identity and report `queued`, `expired`, and `cancelled` outcomes. If an `ask` times out, the timeout names the message ID and last known delivery state. Timeout is not cancellation: a late reply to a plain timeout remains visible with a late/abandoned annotation, while late replies to explicitly cancelled or superseded asks are dropped.
 
 Cancellation is explicit: call `intercom({ action: "cancel", messageId })` to request cancellation of a message you originally sent. Connected interactive messages are injected immediately, so the receiver normally reports `cancellation_requested` rather than pretending it removed work from a private queue. Supersede is also explicit: pass `supersedes: "old-message-id"` on a new `send` or `ask`. The broker only allows same sender → same receiver supersedes, marks the old message `superseded`, and sends the replacement with a new ID; an already-steered old message may still be processed. Retries are never automatic; a retry should be a new authored message, optionally linked with `retryOf`.
 
-The planner typically uses `send`. If you prefer manual approval for outgoing non-reply messages, turn on `confirmSend: true`. The worker uses `ask` for everything (no confirmation needed, gets answers inline), so it can operate autonomously either way.
+The planner typically uses `send`. If you prefer manual approval for outgoing non-reply messages, turn on `confirmSend: true`. The worker uses `ask` for everything (no confirmation needed, gets answers inline), so it can operate autonomously either way. Busy non-interactive sessions send their automatic unavailable notice only for asks; plain notifications do not receive a reply-shaped notice. Pi-intercom does not provide a detach mechanism.
 
 ## Workflow: Subagent-to-Supervisor Escalation
 
@@ -377,6 +377,17 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 **`cancel`** — Requests cancellation of a message previously sent by the current session. Queued messages are removed before injection; already-injected messages receive a visible cancellation request.
 
 **`status`** — Shows connection status, session ID, and total count of active sessions (including the current session).
+
+## Development verification
+
+Run the pinned strict TypeScript gate and the complete test suite before reviewing changes:
+
+```bash
+npm run typecheck
+npm test
+```
+
+The broker protocol version remains `1`; additive ordinary-operation correlation is negotiated through the `correlated-operations-v1` feature instead of a protocol-version bump.
 
 ## Keyboard Shortcuts
 

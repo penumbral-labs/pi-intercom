@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { MAX_PENDING_ASK_EDGES_PER_SESSION } from "./broker/ask-edges.ts";
 import type { BrokerMessage, Message, SessionInfo } from "./types.ts";
@@ -35,7 +35,7 @@ const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
 const { IntercomClient } = await import("./broker/client.ts");
-const { getTsxCliPath } = await import("./broker/spawn.ts");
+const { getBrokerLaunchSpec, getTsxCliPath } = await import("./broker/spawn.ts");
 test.after(() => {
   for (const key of Object.keys(process.env)) {
     if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) delete process.env[key];
@@ -374,6 +374,20 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     }
     rmSync(agentDir, { recursive: true, force: true });
   }
+});
+
+test("reconciliation baseline and production broker launch remain pinned", () => {
+  assert.equal(
+    execFileSync("git", ["merge-base", "0685e199", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
+    execFileSync("git", ["rev-parse", "0685e199"], { cwd: repoDir, encoding: "utf8" }).trim(),
+  );
+  const launch = getBrokerLaunchSpec(
+    path.join(repoDir, "broker", "broker.ts"),
+    "npx",
+    ["--no-install", "tsx"],
+  );
+  assert.ok(launch.command.length > 0);
+  assert.ok(launch.args.some((arg) => arg.endsWith(path.join("broker", "broker.ts"))));
 });
 
 async function setupClients() {

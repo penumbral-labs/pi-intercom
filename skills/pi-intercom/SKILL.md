@@ -227,6 +227,10 @@ it as a `contact_supervisor` escalation. A subagent may use regular `intercom` f
 peer coordination, including peers in other directories, but owner decisions and
 new visible project panes should go through the supervisor.
 
+## Delivery and stale-reply behavior
+
+The broker reports ordinary queued, expired, and cancelled mailbox outcomes. If an ask is explicitly cancelled or superseded, a late reply is discarded; a late reply after a plain waiter timeout remains visible and is marked as a late reply to an abandoned ask. Busy non-interactive sessions send their automatic unavailable response only for asks. Pi-intercom does not provide a detach mechanism.
+
 ## Key Differences
 
 | Action | Behavior | Use When |
@@ -349,6 +353,10 @@ Replies to recently disconnected explicitly named senders can be queued by the b
 // Override: set PI_INTERCOM_ASK_TIMEOUT_MS to a positive millisecond value
 // For longer tasks, use send + follow-up ask pattern
 ```
+
+## Contributor verification
+
+When changing the extension, run both `npm run typecheck` and `npm test`. The strict compiler/toolchain versions are pinned in the package lockfile.
 
 ## Troubleshooting
 
