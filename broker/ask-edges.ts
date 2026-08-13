@@ -62,15 +62,16 @@ export class AskEdges {
 
   // Whether adding an edge from `from` is allowed.
   //
-  // `replacingMessageId` names an edge this add would replace — replacing an existing edge does
-  // not consume additional capacity, so a reply that re-arms an ask must not be refused merely
-  // because the table is at its global cap.
+  // `replacingMessageId` names an edge this add would replace. Any replacement preserves global
+  // capacity, but it preserves this asker's capacity only when the replaced edge belongs to the
+  // same asker. Replacing a peer-owned ask must not let an already-capped sender add a 17th edge.
   canAdd(from: string, replacingMessageId?: string): AskEdgeCapacity {
-    const replaces = replacingMessageId !== undefined && this.edges.has(replacingMessageId);
-    if (!replaces && this.edges.size >= this.maxGlobal) {
+    const replaced = replacingMessageId === undefined ? undefined : this.edges.get(replacingMessageId);
+    if (!replaced && this.edges.size >= this.maxGlobal) {
       return { ok: false, reason: "Too many pending intercom asks" };
     }
-    if (!replaces && (this.byAsker.get(from) ?? 0) >= this.maxPerSession) {
+    const askerCountAfterReplacement = (this.byAsker.get(from) ?? 0) - (replaced?.from === from ? 1 : 0);
+    if (askerCountAfterReplacement >= this.maxPerSession) {
       return { ok: false, reason: "Too many pending intercom asks from this session" };
     }
     return { ok: true };

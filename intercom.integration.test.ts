@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
+import { MAX_PENDING_ASK_EDGES_PER_SESSION } from "./broker/ask-edges.ts";
 import type { BrokerMessage, Message, SessionInfo } from "./types.ts";
 import { INTERCOM_EXTENSION_REGISTER_EVENT, type IntercomExtensionChannel } from "./extension-api.ts";
 
@@ -21,6 +22,13 @@ const childEnvKeys = [
   "PI_SUBAGENT_INTERCOM_SESSION_NAME",
   "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
 ] as const;
+const inheritedIntercomEnv = new Map<string, string>();
+for (const [key, value] of Object.entries(process.env)) {
+  if ((key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) && value !== undefined) {
+    inheritedIntercomEnv.set(key, value);
+    delete process.env[key];
+  }
+}
 const sharedHomeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-home-"));
 const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
@@ -28,7 +36,11 @@ process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
 const { IntercomClient } = await import("./broker/client.ts");
 const { getTsxCliPath } = await import("./broker/spawn.ts");
-process.on("exit", () => {
+test.after(() => {
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) delete process.env[key];
+  }
+  for (const [key, value] of inheritedIntercomEnv) process.env[key] = value;
   process.env.HOME = previousHome;
   process.env.USERPROFILE = previousUserProfile;
   rmSync(sharedHomeDir, { recursive: true, force: true });
@@ -3493,6 +3505,97 @@ test("broker caps concurrent pending asks per session and keeps other sessions u
     await otherAsk;
   } finally {
     other.socket.destroy();
+    await cleanup();
+  }
+});
+
+test("broker refuses replacing a peer-owned ask when the sender is at its ask cap", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const sink = new IntercomClient();
+  try {
+    await sink.connect({
+      name: "ask-cap-sink",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+
+    const peerAskId = "peer-owned-cap-ask";
+    assert.equal((await orchestrator.send(planner.sessionId!, {
+      messageId: peerAskId,
+      text: "Answer and ask me something?",
+      expectsReply: true,
+    })).delivered, true);
+
+    for (let i = 0; i < MAX_PENDING_ASK_EDGES_PER_SESSION; i += 1) {
+      const result = await planner.send(sink.sessionId!, {
+        messageId: `different-asker-cap-${i}`,
+        text: `pending ask ${i}`,
+        expectsReply: true,
+      });
+      assert.equal(result.delivered, true, `ask ${i + 1} should fill the sender's own capacity`);
+    }
+
+    const refused = await planner.send(orchestrator.sessionId!, {
+      messageId: "different-asker-reply-and-ask",
+      text: "Answering, with a follow-up.",
+      replyTo: peerAskId,
+      expectsReply: true,
+    });
+    assert.equal(refused.delivered, false);
+    assert.match(refused.reason ?? "", /from this session/);
+
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: "different-asker-plain-reply",
+      text: "Answering without adding another ask.",
+      replyTo: peerAskId,
+    })).delivered, true, "the refusal must leave the peer-owned ask available for a plain reply");
+  } finally {
+    await sink.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broker allows replacing the sender's own ask when the sender is at its ask cap", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const sink = new IntercomClient();
+  try {
+    await sink.connect({
+      name: "same-asker-cap-sink",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+
+    for (let i = 0; i < MAX_PENDING_ASK_EDGES_PER_SESSION - 1; i += 1) {
+      const result = await planner.send(sink.sessionId!, {
+        messageId: `same-asker-cap-${i}`,
+        text: `pending ask ${i}`,
+        expectsReply: true,
+      });
+      assert.equal(result.delivered, true);
+    }
+
+    const ownAskId = "same-asker-self-ask";
+    assert.equal((await planner.send(planner.sessionId!, {
+      messageId: ownAskId,
+      text: "Self-directed ask at the cap.",
+      expectsReply: true,
+    })).delivered, true);
+
+    const replacement = await planner.send(planner.sessionId!, {
+      messageId: "same-asker-reply-and-ask",
+      text: "Replace my own pending ask.",
+      replyTo: ownAskId,
+      expectsReply: true,
+    });
+    assert.equal(replacement.delivered, true);
+  } finally {
+    await sink.disconnect().catch(() => undefined);
     await cleanup();
   }
 });

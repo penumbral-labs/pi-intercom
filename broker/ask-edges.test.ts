@@ -96,17 +96,21 @@ test("global cap refuses a new asker once the table is full", () => {
   assert.match(refusal.ok === false ? refusal.reason : "", /Too many pending intercom asks$/);
 });
 
-test("replacing an existing edge does not consume capacity at either cap", () => {
-  const edges = new AskEdges(2, 1);
-  edges.add("m1", "a", "b");
-  // "a" is at its per-session cap of 1 and the table is not full, but re-arming m1 is a
-  // replacement, so it must be allowed.
-  assert.equal(edges.canAdd("a", "m1").ok, true);
+test("replacing an existing edge discounts only capacity owned by the same asker", () => {
+  const edges = new AskEdges(3, 1);
+  edges.add("own-ask", "a", "b");
+  edges.add("peer-ask", "b", "a");
+
+  assert.equal(edges.canAdd("a", "own-ask").ok, true, "re-arming the asker's own edge preserves its capacity");
+
+  const peerReplacement = edges.canAdd("a", "peer-ask");
+  assert.equal(peerReplacement.ok, false, "replacing a peer-owned edge would add another edge for the capped asker");
+  assert.match(peerReplacement.ok === false ? peerReplacement.reason : "", /from this session/);
 
   const full = new AskEdges(1, 100);
   full.add("m1", "a", "b");
   assert.equal(full.canAdd("z").ok, false, "global cap refuses a genuinely new edge");
-  assert.equal(full.canAdd("z", "m1").ok, true, "replacing an existing edge is still allowed at the global cap");
+  assert.equal(full.canAdd("z", "m1").ok, true, "any replacement preserves global capacity");
 });
 
 test("add replaces an existing id without double-counting capacity", () => {
