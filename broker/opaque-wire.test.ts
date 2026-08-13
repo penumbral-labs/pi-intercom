@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { IntercomClient } from "./client.ts";
+import { createMessageReader, writeMessage } from "./framing.ts";
+import { ensureIntercomRuntimeDir, getBrokerSocketPath } from "./paths.ts";
 import { getTsxCliPath } from "./spawn.ts";
 import type { OpaqueDispatchBrokerFrame, SessionRegistration } from "../types.ts";
 
@@ -103,6 +106,79 @@ function nextClaimedReceipt(client: IntercomClient): Promise<Extract<OpaqueDispa
     });
   });
 }
+
+test("new client refuses opaque writes to a featureless v0.10-style broker and keeps ordinary operations live", { concurrency: false }, async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-intercom-old-broker-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  ensureIntercomRuntimeDir(join(agentDir, "intercom"));
+  const server = net.createServer((socket) => {
+    socket.on("data", createMessageReader((message) => {
+      if (typeof message !== "object" || message === null || !("type" in message)) return;
+      const frame = message as Record<string, unknown>;
+      if (frame.type === "register") writeMessage(socket, { type: "registered", sessionId: "new-client" });
+      if (frame.type === "list") writeMessage(socket, { type: "sessions", requestId: frame.requestId, sessions: [] });
+      if (frame.type === "send") {
+        const outbound = frame.message as { id?: unknown };
+        writeMessage(socket, { type: "delivered", messageId: outbound.id });
+      }
+    }, (error) => socket.destroy(error)));
+  });
+  const client = new IntercomClient();
+  try {
+    await new Promise<void>((resolve, reject) => server.listen(getBrokerSocketPath(process.platform, agentDir), resolve).once("error", reject));
+    await client.connect(registration("new-client", senderNamespace, "send"), "new-client");
+    await assert.rejects(client.sendOpaqueDispatch(senderNamespace, {
+      requestId: "unsupported-request",
+      toSessionId: "old-peer",
+      recipientNamespace: receiverNamespace,
+      payload: { secret: sentinel },
+    }), /unsupported_broker/);
+    assert.deepEqual(await client.listSessions(), []);
+    assert.equal((await client.send("old-peer", { text: "ordinary-still-live" })).delivered, true);
+  } finally {
+    await client.disconnect().catch(() => undefined);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("v0.10-style client remains ordinary-wire compatible with the new broker", { concurrency: false }, async () => {
+  await withWireClients(async (_sender, receiver) => {
+    const socket = net.connect(getBrokerSocketPath());
+    const received: unknown[] = [];
+    socket.on("data", createMessageReader((frame) => received.push(frame), (error) => socket.destroy(error)));
+    await once(socket, "connect");
+    const waitFor = async (predicate: (frame: unknown) => boolean): Promise<unknown> => {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        const match = received.find(predicate);
+        if (match !== undefined) return match;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error(`legacy wire response timeout: ${JSON.stringify(received)}`);
+    };
+    try {
+      writeMessage(socket, { type: "register", sessionId: "legacy-client", session: registration("legacy-client", "legacy/v1", "send") });
+      await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "registered");
+      writeMessage(socket, { type: "list", requestId: "legacy-list" });
+      const sessions = await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "sessions") as { sessions: Array<{ id: string }> };
+      assert.equal(sessions.sessions.some((session) => session.id === "wire-receiver"), true);
+      writeMessage(socket, {
+        type: "send",
+        to: "wire-receiver",
+        message: { id: "legacy-message", timestamp: Date.now(), content: { text: "legacy ordinary message" } },
+      });
+      const delivered = await waitFor((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "delivered") as { messageId: string };
+      assert.equal(delivered.messageId, "legacy-message");
+      assert.equal(receiver.isConnected(), true);
+    } finally {
+      socket.destroy();
+    }
+  });
+});
 
 test("wire-level opaque flow remains private and ordinary traffic remains usable", { concurrency: false }, async () => {
   await withWireClients(async (sender, receiver) => {
