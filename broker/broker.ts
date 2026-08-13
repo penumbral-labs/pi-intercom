@@ -43,6 +43,7 @@ import {
 import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
+import { OpaqueDispatchManager, type OpaqueEndpoint } from "./opaque-dispatch.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -92,6 +93,9 @@ interface ConnectionState {
   socket: net.Socket;
   tokens: number;
   lastRefillAt: number;
+  opaqueTokens: number;
+  opaqueLastRefillAt: number;
+  rateLimitedOpaqueOperations: Set<string>;
 }
 
 
@@ -127,11 +131,20 @@ class IntercomBroker {
   private namespaceOwners = new Map<string, NamespaceOwner>();
   private nextOwnerOrder = 1;
   private extensionStateManager: ExtensionStateManager;
+  private opaqueDispatch: OpaqueDispatchManager;
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
     assertNoLiveBroker(PID_PATH);
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
+    this.opaqueDispatch = new OpaqueDispatchManager({
+      brokerEpoch: BROKER_EPOCH,
+      endpoint: (sessionId) => this.opaqueEndpoint(sessionId),
+      owner: (namespace) => {
+        const owner = this.namespaceOwners.get(namespace);
+        return owner ? { sessionId: owner.sessionId, epoch: owner.epoch } : undefined;
+      },
+    });
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);
@@ -204,10 +217,25 @@ class IntercomBroker {
       socket,
       tokens: RATE_LIMIT_CAPACITY,
       lastRefillAt: Date.now(),
+      opaqueTokens: 60,
+      opaqueLastRefillAt: Date.now(),
+      rateLimitedOpaqueOperations: new Set(),
     };
 
     const reader = createMessageReader((msg) => {
-      if (!this.consumeToken(connection)) {
+      if (isOpaqueDispatchClientFrame(msg)) {
+        if (!this.consumeOpaqueToken(connection)) {
+          const operationId = "operationId" in msg ? msg.operationId : undefined;
+          if (operationId && connection.rateLimitedOpaqueOperations.has(operationId)) return;
+          if (operationId) connection.rateLimitedOpaqueOperations.add(operationId);
+          if (sessionId) {
+            const endpoint = this.opaqueEndpoint(sessionId);
+            if (endpoint) this.opaqueDispatch.rateLimited(endpoint, msg);
+          }
+          return;
+        }
+        if ("operationId" in msg) connection.rateLimitedOpaqueOperations.delete(msg.operationId);
+      } else if (!this.consumeToken(connection)) {
         writeMessage(socket, { type: "error", error: "Intercom broker rate limit exceeded" });
         socket.destroy(new Error("Intercom broker rate limit exceeded"));
         return;
@@ -237,6 +265,7 @@ class IntercomBroker {
           this.clearMessageReceiptRoutesForSession(sessionId);
           this.broadcast({ type: "session_left", sessionId }, sessionId);
           this.recomputeNamespaceOwners();
+          this.opaqueDispatch.endpointDisconnected(sessionId);
           this.scheduleShutdownCheck();
         }
       }
@@ -259,6 +288,17 @@ class IntercomBroker {
       this.unregisteredConnections.delete(oldest);
       oldest.destroy();
     }
+  }
+
+  private consumeOpaqueToken(connection: ConnectionState, now = Date.now()): boolean {
+    const elapsedMs = now - connection.opaqueLastRefillAt;
+    if (elapsedMs > 0) {
+      connection.opaqueTokens = Math.min(60, connection.opaqueTokens + elapsedMs * 30 / 1000);
+      connection.opaqueLastRefillAt = now;
+    }
+    if (connection.opaqueTokens < 1) return false;
+    connection.opaqueTokens -= 1;
+    return true;
   }
 
   private consumeToken(connection: ConnectionState, now = Date.now()): boolean {
@@ -421,6 +461,7 @@ class IntercomBroker {
         this.broadcast({ type: "session_joined", session: info }, id);
 
         this.recomputeNamespaceOwners();
+        this.opaqueDispatch.endpointAvailable(id);
         this.flushMailboxForSession(connectedSession);
 
         if (extensions) {
@@ -456,6 +497,7 @@ class IntercomBroker {
           this.clearMessageReceiptRoutesForSession(currentId);
           this.broadcast({ type: "session_left", sessionId: currentId }, currentId);
           this.recomputeNamespaceOwners();
+          this.opaqueDispatch.endpointDisconnected(currentId);
           this.scheduleShutdownCheck();
         }
         setId(null);
@@ -484,6 +526,7 @@ class IntercomBroker {
         if (opaqueDispatch) session.info.opaqueDispatch = opaqueDispatch;
         else delete session.info.opaqueDispatch;
         this.recomputeNamespaceOwners();
+        this.opaqueDispatch.capabilityChanged(currentId);
         for (const extension of extensions) {
           const owner = this.namespaceOwners.get(extension.namespace);
           writeMessage(socket, {
@@ -941,16 +984,10 @@ class IntercomBroker {
       case "opaque_dispatch_v1_fail":
       case "opaque_dispatch_v1_claim_status":
       case "opaque_dispatch_v1_receipt_ack": {
-        if (!isOpaqueDispatchClientFrame(clientMessage)) throw new Error("Invalid opaque dispatch frame");
-        if ("operationId" in clientMessage) {
-          writeMessage(socket, {
-            type: "opaque_dispatch_v1_rejected",
-            operationId: clientMessage.operationId,
-            ...("requestId" in clientMessage ? { requestId: clientMessage.requestId } : {}),
-            ...("messageId" in clientMessage ? { messageId: clientMessage.messageId } : {}),
-            code: "unsupported_broker",
-          });
-        }
+        if (!currentId || !isOpaqueDispatchClientFrame(clientMessage)) throw new Error("Invalid opaque dispatch frame");
+        const endpoint = this.opaqueEndpoint(currentId);
+        if (!endpoint || endpoint.write === undefined) throw new Error("Opaque endpoint not found");
+        this.opaqueDispatch.handle(endpoint, clientMessage);
         break;
       }
 
@@ -967,6 +1004,31 @@ class IntercomBroker {
       default:
         throw new Error(`Unknown client message type: ${clientMessage.type}`);
     }
+  }
+
+  private opaqueEndpoint(sessionId: string): OpaqueEndpoint | undefined {
+    const connected = this.sessions.get(sessionId);
+    if (connected) {
+      return {
+        sessionId,
+        info: connected.info,
+        extensions: connected.extensions,
+        connected: true,
+        write: (frame) => writeMessage(connected.socket, frame),
+      };
+    }
+    const disconnected = this.disconnectedSessions.get(sessionId);
+    if (!disconnected) return undefined;
+    return {
+      sessionId,
+      info: disconnected.info,
+      extensions: disconnected.info.opaqueDispatch?.namespaces.map((entry) => ({
+        namespace: entry.namespace,
+        ownerEligible: false,
+        opaqueDispatch: { version: 1, roles: [...entry.roles] },
+      })),
+      connected: false,
+    };
   }
 
   private rememberDisconnectedSession(info: SessionInfo, now = Date.now()): void {
@@ -1555,6 +1617,7 @@ class IntercomBroker {
     this.messageReceiptRoutes.clear();
     this.disconnectedSessions.clear();
     this.mailboxMessages.length = 0;
+    this.opaqueDispatch.shutdown();
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);
