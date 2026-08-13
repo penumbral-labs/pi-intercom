@@ -485,9 +485,14 @@ no ordinary name/prefix/cwd/mailbox fallback and no confirmation dialog.
 Consumers must persist and fsync the broker epoch, message ID, reservation ID, and payload before calling `claim()`. Only
 an accepted claim result authorizes consumer-owned model injection. Active records live 24 hours; terminal replay lives one
 hour. Attempts are capped at 8, receipts at 20, active records at 256 globally and 32 per sender/target namespace, and
-tombstones at 512. Same-epoch restart can reconcile retained claim history; epoch/history loss is indeterminate and never
+tombstones at 512 globally and 64 per sender/target namespace. Pending operations are capped at 256 globally and 32 per
+namespace. Same-epoch restart can reconcile retained claim history; epoch/history loss is indeterminate and never
 automatically injects or resends. Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
 extension events, or model context. This local same-user transport is not remote authorization and provides no detach.
+
+`refreshState()` intentionally returns `ExtensionStateRefreshResult` rather than a bare snapshot: successful results carry
+`{ok:true,state}`, while old-broker and disconnected paths return typed `{ok:false,code}` outcomes before any unsupported
+write. This is the approved extension API contract for state refresh.
 
 ## How It Works
 

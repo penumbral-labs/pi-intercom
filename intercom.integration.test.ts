@@ -1034,6 +1034,84 @@ test("extension channels register locally without creating conversation messages
   assert.deepEqual(harness.entries, []);
 });
 
+test("opaque extension sends consumer_unloaded before dispose removes capability", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const sender = new IntercomClient();
+  const harness = createExtensionHarness("opaque-receiver", { hasUI: true, sessionId: "opaque-receiver" });
+  let receiverChannel: IntercomExtensionChannel | undefined;
+  let senderChannel: IntercomExtensionChannel | undefined;
+  try {
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "opaque/receiver",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["receive"],
+        onReserve: () => "reserved",
+      },
+      onReady: (channel: IntercomExtensionChannel) => { receiverChannel = channel; },
+      onEvent: () => undefined,
+    });
+    await harness.emitLifecycle("session_start");
+    await sender.connect({
+      name: "opaque-sender",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      extensions: [{ namespace: "opaque/sender", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "opaque-sender");
+    const receiverSession = await waitForSessionId(sender, "opaque-receiver");
+    assert.equal(receiverSession.opaqueDispatch?.namespaces.some((entry) => entry.namespace === "opaque/receiver" && entry.roles.includes("receive")), true);
+    senderChannel = {
+      namespace: "opaque/sender",
+      snapshot: () => ({ connected: true, capabilities: { extensionBus: true, opaqueDispatchVersion: 1 } }),
+      publish: () => undefined,
+      commitState: () => undefined,
+      refreshState: async () => ({ ok: false, code: "connection_lost" }),
+      listSessions: () => sender.listSessions(),
+      peerCapability: (sessionId, recipientNamespace) => sender.peerCapability(sessionId, recipientNamespace),
+      sendOpaqueDispatch: (input) => sender.sendOpaqueDispatch("opaque/sender", input),
+      cancelMessage: (messageId) => sender.cancelOpaqueDispatch("opaque/sender", messageId),
+      reconcileClaim: (input) => sender.reconcileOpaqueClaim("opaque/sender", input),
+      dispose: () => undefined,
+    };
+    const terminalReceipt = new Promise<Extract<BrokerMessage, { type: "opaque_dispatch_v1_receipt" }>>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        stop();
+        reject(new Error("consumer_unloaded receipt timeout"));
+      }, 2_000);
+      const stop = sender.onOpaqueDispatch((frame) => {
+        if (frame.type !== "opaque_dispatch_v1_receipt" || frame.receipt.status !== "failed_closed") return;
+        clearTimeout(timeout);
+        stop();
+        resolve(frame);
+      });
+    });
+    const result = await senderChannel.sendOpaqueDispatch({
+      requestId: "dispose-request",
+      toSessionId: "opaque-receiver",
+      recipientNamespace: "opaque/receiver",
+      payload: { private: true },
+    });
+    assert.equal(result.accepted, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    receiverChannel?.dispose();
+    assert.equal((await terminalReceipt).receipt.reason, "consumer_unloaded");
+    assert.equal(sender.isConnected(), true);
+    assert.equal((await sender.listSessions()).some((session) => session.id === "opaque-receiver"), true);
+  } finally {
+    receiverChannel?.dispose();
+    senderChannel?.dispose();
+    await sender.disconnect().catch(() => undefined);
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("late extension registration advertises before an onReady publish", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const observer = new IntercomClient();

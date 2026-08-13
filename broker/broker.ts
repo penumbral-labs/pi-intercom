@@ -43,7 +43,7 @@ import {
 import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
-import { OpaqueDispatchManager, type OpaqueEndpoint } from "./opaque-dispatch.ts";
+import { OpaqueDispatchManager, writeOpaqueTo, type OpaqueEndpoint } from "./opaque-dispatch.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -64,6 +64,7 @@ const MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000;
 const DISCONNECTED_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
+const MAX_RATE_LIMITED_OPAQUE_OPERATIONS = 256;
 const BROKER_STARTED_AT = Date.now();
 
 function serializedPayloadSize(payload: unknown): number | null {
@@ -227,7 +228,14 @@ class IntercomBroker {
         if (!this.consumeOpaqueToken(connection)) {
           const operationId = "operationId" in msg ? msg.operationId : undefined;
           if (operationId && connection.rateLimitedOpaqueOperations.has(operationId)) return;
-          if (operationId) connection.rateLimitedOpaqueOperations.add(operationId);
+          if (operationId) {
+            connection.rateLimitedOpaqueOperations.add(operationId);
+            while (connection.rateLimitedOpaqueOperations.size > MAX_RATE_LIMITED_OPAQUE_OPERATIONS) {
+              const oldest = connection.rateLimitedOpaqueOperations.values().next().value;
+              if (typeof oldest !== "string") break;
+              connection.rateLimitedOpaqueOperations.delete(oldest);
+            }
+          }
           if (sessionId) {
             const endpoint = this.opaqueEndpoint(sessionId);
             if (endpoint) this.opaqueDispatch.rateLimited(endpoint, msg);
@@ -295,6 +303,7 @@ class IntercomBroker {
     if (elapsedMs > 0) {
       connection.opaqueTokens = Math.min(60, connection.opaqueTokens + elapsedMs * 30 / 1000);
       connection.opaqueLastRefillAt = now;
+      if (connection.opaqueTokens >= 60) connection.rateLimitedOpaqueOperations.clear();
     }
     if (connection.opaqueTokens < 1) return false;
     connection.opaqueTokens -= 1;
@@ -966,7 +975,7 @@ class IntercomBroker {
           ?? this.disconnectedSessions.get(clientMessage.toSessionId)?.info;
         const receive = target?.opaqueDispatch?.namespaces.some((entry) =>
           entry.namespace === clientMessage.recipientNamespace && entry.roles.includes("receive"));
-        writeMessage(socket, {
+        writeOpaqueTo(this.opaqueEndpoint(currentId), { anyOpaqueCapability: true }, {
           type: "opaque_dispatch_v1_peer_capability_result",
           operationId: clientMessage.operationId,
           toSessionId: clientMessage.toSessionId,
@@ -1014,7 +1023,13 @@ class IntercomBroker {
         info: connected.info,
         extensions: connected.extensions,
         connected: true,
-        write: (frame) => writeMessage(connected.socket, frame),
+        write: (frame) => {
+          try {
+            writeMessage(connected.socket, frame);
+          } catch {
+            // The opaque state machine contains a synchronous destination write failure.
+          }
+        },
       };
     }
     const disconnected = this.disconnectedSessions.get(sessionId);

@@ -23,6 +23,44 @@ test("opaque client refuses before write when broker capability is absent", asyn
   assert.equal(writes, 0);
 });
 
+test("opaque pending operations enforce a 32-per-namespace cap", async () => {
+  const client = new IntercomClient();
+  const raw = internals(client);
+  raw._sessionId = "sender";
+  raw._features = new Set([OPAQUE_DISPATCH_FEATURE]);
+  const operationIds: string[] = [];
+  raw.socket = {
+    destroyed: false,
+    writableEnded: false,
+    writable: true,
+    write: (data) => {
+      const buffer = Buffer.from(data);
+      const frame = JSON.parse(buffer.subarray(4, 4 + buffer.readUInt32BE(0)).toString("utf8")) as { operationId: string };
+      operationIds.push(frame.operationId);
+      return true;
+    },
+  };
+  const pending = Array.from({ length: 32 }, (_, index) => client.sendOpaqueDispatch("sender/v1", {
+    requestId: `request-${index}`,
+    toSessionId: "receiver",
+    recipientNamespace: "receiver/v1",
+    payload: null,
+  }));
+  await assert.rejects(client.sendOpaqueDispatch("sender/v1", {
+    requestId: "request-over-limit",
+    toSessionId: "receiver",
+    recipientNamespace: "receiver/v1",
+    payload: null,
+  }), /limit_exceeded/);
+  operationIds.forEach((operationId, index) => raw.handleBrokerMessage({
+    type: "opaque_dispatch_v1_rejected",
+    operationId,
+    requestId: `request-${index}`,
+    code: "unsupported_target",
+  }));
+  await Promise.all(pending);
+});
+
 test("opaque claim result settles only the correlated operation", async () => {
   const client = new IntercomClient();
   const raw = internals(client);
@@ -40,7 +78,7 @@ test("opaque claim result settles only the correlated operation", async () => {
     return true;
   };
   raw.socket = socket;
-  const pending = client.claimOpaqueDispatch("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+  const pending = client.claimOpaqueDispatch("receiver/v1", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
   raw.handleBrokerMessage({
     type: "opaque_dispatch_v1_claim_result",
     operationId,

@@ -1,51 +1,96 @@
 import assert from "node:assert/strict";
-import { closeSync, fsyncSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionCapability, OpaqueDispatchBrokerFrame, SessionInfo } from "../../types.ts";
-import { OpaqueDispatchManager, type OpaqueEndpoint } from "../../broker/opaque-dispatch.ts";
+import { IntercomClient } from "../../broker/client.ts";
+import { spawnBrokerIfNeeded } from "../../broker/spawn.ts";
+import type { OpaqueDispatchBrokerFrame, SessionRegistration } from "../../types.ts";
 
-const runtimeDir = mkdtempSync(join(tmpdir(), "pi-intercom-opaque-dogfood-"));
+const runtimeDir = process.env.PI_CODING_AGENT_DIR?.trim() || mkdtempSync(join(tmpdir(), "pi-intercom-opaque-dogfood-"));
+const ownsRuntimeDir = !process.env.PI_CODING_AGENT_DIR?.trim();
+process.env.PI_CODING_AGENT_DIR = runtimeDir;
 const durablePath = join(runtimeDir, "consumer-record.json");
-const senderFrames: OpaqueDispatchBrokerFrame[] = [];
-const receiverFrames: OpaqueDispatchBrokerFrame[] = [];
-const brokerEpoch = "33333333-3333-4333-8333-333333333333";
-const senderCapabilities: ExtensionCapability[] = [{ namespace: "dogfood/sender", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }];
-const receiverCapabilities: ExtensionCapability[] = [{ namespace: "dogfood/receiver", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }];
-const info = (id: string): SessionInfo => ({ id, cwd: runtimeDir, model: "dogfood", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(), trustedLocal: true });
-const endpoints = new Map<string, OpaqueEndpoint>([
-  ["dogfood-sender", { sessionId: "dogfood-sender", info: info("dogfood-sender"), extensions: senderCapabilities, connected: true, write: (frame) => senderFrames.push(frame) }],
-  ["dogfood-receiver", { sessionId: "dogfood-receiver", info: info("dogfood-receiver"), extensions: receiverCapabilities, connected: true, write: (frame) => receiverFrames.push(frame) }],
-]);
-const manager = new OpaqueDispatchManager({ brokerEpoch, endpoint: (id) => endpoints.get(id), owner: () => undefined });
+const sentinel = "opaque-dogfood-privacy-sentinel";
+const senderNamespace = "dogfood/sender";
+const receiverNamespace = "dogfood/receiver";
+const sender = new IntercomClient();
+const receiver = new IntercomClient();
+
+function registration(name: string, namespace: string, role: "send" | "receive"): SessionRegistration {
+  return {
+    name,
+    cwd: process.cwd(),
+    model: "dogfood",
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+    extensions: [{ namespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: [role] } }],
+  };
+}
+
+function nextOffer(): Promise<Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_offer" }>> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      stop();
+      reject(new Error("dogfood offer timeout"));
+    }, 5_000);
+    const stop = receiver.onOpaqueDispatch((frame) => {
+      if (frame.type !== "opaque_dispatch_v1_offer") return;
+      clearTimeout(timeout);
+      stop();
+      resolve(frame);
+    });
+  });
+}
 
 try {
-  manager.handle(endpoints.get("dogfood-sender")!, {
-    type: "opaque_dispatch_v1_send",
-    operationId: "dogfood-send",
-    requestId: "dogfood-request",
-    senderNamespace: "dogfood/sender",
-    toSessionId: "dogfood-receiver",
-    recipientNamespace: "dogfood/receiver",
-    payload: { sentinel: "opaque-dogfood-sentinel", action: "persist-before-claim" },
-  });
-  const offer = receiverFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_offer" }> => frame.type === "opaque_dispatch_v1_offer");
-  assert.ok(offer);
-  manager.handle(endpoints.get("dogfood-receiver")!, { type: "opaque_dispatch_v1_reservation_result", messageId: offer.messageId, reservationId: offer.reservationId, decision: "reserved" });
+  await spawnBrokerIfNeeded(process.execPath, [join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs")]);
+  await receiver.connect(registration("dogfood-receiver", receiverNamespace, "receive"), "dogfood-receiver");
+  await sender.connect(registration("dogfood-sender", senderNamespace, "send"), "dogfood-sender");
 
-  writeFileSync(durablePath, JSON.stringify({ brokerEpoch, messageId: offer.messageId, reservationId: offer.reservationId, payload: offer.payload }));
+  const ordinaryMessages: unknown[] = [];
+  const genericBrokerMessages: unknown[] = [];
+  receiver.on("message", (...args) => ordinaryMessages.push(args));
+  receiver.onBrokerMessage((message) => genericBrokerMessages.push(message));
+
+  const offered = nextOffer();
+  const acceptedPromise = sender.sendOpaqueDispatch(senderNamespace, {
+    requestId: "dogfood-request",
+    toSessionId: "dogfood-receiver",
+    recipientNamespace: receiverNamespace,
+    payload: { sentinel, action: "persist-before-claim" },
+  });
+  const offer = await offered;
+  receiver.sendOpaqueReservationResult(offer.messageId, offer.reservationId, "reserved");
+  const accepted = await acceptedPromise;
+  assert.equal(accepted.accepted, true);
+
+  writeFileSync(durablePath, JSON.stringify({ brokerEpoch: offer.brokerEpoch, messageId: offer.messageId, reservationId: offer.reservationId, payload: offer.payload }));
   const file = openSync(durablePath, "r");
   fsyncSync(file);
   closeSync(file);
 
-  manager.handle(endpoints.get("dogfood-receiver")!, { type: "opaque_dispatch_v1_claim", operationId: "dogfood-claim", messageId: offer.messageId, reservationId: offer.reservationId });
-  manager.handle(endpoints.get("dogfood-receiver")!, { type: "opaque_dispatch_v1_claim_status", operationId: "dogfood-reconcile", recipientNamespace: "dogfood/receiver", brokerEpoch, messageId: offer.messageId, reservationId: offer.reservationId });
-  assert.equal(receiverFrames.some((frame) => frame.type === "opaque_dispatch_v1_claim_result" && frame.claimed), true);
-  assert.equal(receiverFrames.some((frame) => frame.type === "opaque_dispatch_v1_claim_status_result" && frame.result.state === "claimed"), true);
-  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "claimed"), true);
-  assert.match(readFileSync(durablePath, "utf8"), /opaque-dogfood-sentinel/);
-  console.log(JSON.stringify({ ok: true, brokerEpoch, messageId: offer.messageId, durablePath }));
+  assert.deepEqual(await receiver.claimOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId), { claimed: true });
+  assert.deepEqual(await receiver.reconcileOpaqueClaim(receiverNamespace, {
+    brokerEpoch: offer.brokerEpoch,
+    messageId: offer.messageId,
+    reservationId: offer.reservationId,
+  }), { state: "claimed" });
+  assert.match(readFileSync(durablePath, "utf8"), new RegExp(sentinel));
+  assert.equal(JSON.stringify(ordinaryMessages).includes(sentinel), false);
+  assert.equal(JSON.stringify(genericBrokerMessages).includes(sentinel), false);
+  assert.equal((await sender.send("dogfood-receiver", { text: "ordinary-dogfood-after-opaque" })).delivered, true);
+  console.log(JSON.stringify({ ok: true, brokerEpoch: offer.brokerEpoch, messageId: offer.messageId, durablePath, privacySentinel: "absent-from-ordinary-and-generic-paths" }));
 } finally {
-  manager.shutdown();
-  rmSync(runtimeDir, { recursive: true, force: true });
+  await sender.disconnect().catch(() => undefined);
+  await receiver.disconnect().catch(() => undefined);
+  const pidPath = join(runtimeDir, "intercom", "broker.pid");
+  if (existsSync(pidPath)) {
+    const pid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+    if (Number.isFinite(pid)) {
+      try { process.kill(pid, "SIGTERM"); } catch { /* broker already exited */ }
+    }
+  }
+  rmSync(durablePath, { force: true });
+  if (ownsRuntimeDir) rmSync(runtimeDir, { recursive: true, force: true });
 }
