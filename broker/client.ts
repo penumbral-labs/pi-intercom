@@ -4,7 +4,7 @@ import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
-import { EXTENSION_BUS_FEATURE } from "../types.ts";
+import { CORRELATED_OPERATIONS_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -31,6 +31,14 @@ interface SendResult {
   delivered: boolean;
   reason?: string;
 }
+
+interface PendingOperation {
+  messageId: string;
+  resolve: (result: SendResult) => void;
+  reject: (error: Error) => void;
+}
+
+const MAX_PENDING_OPERATIONS = 256;
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -64,7 +72,9 @@ export class IntercomClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _features = new Set<string>();
-  private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
+  private pendingOperations = new Map<string, PendingOperation>();
+  private legacyOperations = new Map<string, string>();
+  private poisonedLegacyMessageIds = new Set<string>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private nextSenderSequence = 1;
   private disconnecting = false;
@@ -73,10 +83,12 @@ export class IntercomClient extends EventEmitter {
   private livenessInFlight = false;
 
   private failPending(error: Error): void {
-    for (const pending of this.pendingSends.values()) {
+    for (const pending of this.pendingOperations.values()) {
       pending.reject(error);
     }
-    this.pendingSends.clear();
+    this.pendingOperations.clear();
+    this.legacyOperations.clear();
+    this.poisonedLegacyMessageIds.clear();
     for (const pending of this.pendingLists.values()) {
       pending.reject(error);
     }
@@ -366,36 +378,24 @@ export class IntercomClient extends EventEmitter {
       }
 
       case "delivered": {
-        const { messageId } = brokerMessage;
-        if (typeof messageId !== "string") {
+        const { messageId, operationId } = brokerMessage;
+        if (typeof messageId !== "string" || (operationId !== undefined && typeof operationId !== "string")) {
           throw new Error("Invalid delivered message");
         }
-
-        const pending = this.pendingSends.get(messageId);
-        if (!pending) {
-          // Late send responses are harmless once the caller has already timed out.
-          return;
-        }
-
-        this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: true });
+        this.settleOperation(messageId, operationId, { id: messageId, delivered: true });
         break;
       }
 
       case "delivery_failed": {
-        const { messageId, reason } = brokerMessage;
-        if (typeof messageId !== "string" || typeof reason !== "string") {
+        const { messageId, operationId, reason } = brokerMessage;
+        if (
+          typeof messageId !== "string"
+          || (operationId !== undefined && typeof operationId !== "string")
+          || typeof reason !== "string"
+        ) {
           throw new Error("Invalid delivery_failed message");
         }
-
-        const pending = this.pendingSends.get(messageId);
-        if (!pending) {
-          // Late send responses are harmless once the caller has already timed out.
-          return;
-        }
-
-        this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: false, reason });
+        this.settleOperation(messageId, operationId, { id: messageId, delivered: false, reason });
         break;
       }
 
@@ -528,6 +528,81 @@ export class IntercomClient extends EventEmitter {
     }
   }
 
+  private settleOperation(messageId: string, operationId: unknown, result: SendResult): void {
+    if (typeof operationId === "string") {
+      const pending = this.pendingOperations.get(operationId);
+      if (!pending || pending.messageId !== messageId) {
+        return;
+      }
+      this.pendingOperations.delete(operationId);
+      pending.resolve(result);
+      return;
+    }
+
+    if (this.poisonedLegacyMessageIds.delete(messageId)) {
+      return;
+    }
+    const operationKey = this.legacyOperations.get(messageId);
+    if (!operationKey) {
+      return;
+    }
+    const pending = this.pendingOperations.get(operationKey);
+    this.legacyOperations.delete(messageId);
+    this.pendingOperations.delete(operationKey);
+    pending?.resolve(result);
+  }
+
+  private runMessageOperation(
+    messageId: string,
+    timeoutLabel: "Send" | "Cancel",
+    write: (operationId: string | undefined) => void,
+  ): Promise<SendResult> {
+    if (this.pendingOperations.size >= MAX_PENDING_OPERATIONS) {
+      return Promise.reject(new Error("Too many pending intercom operations"));
+    }
+
+    const correlated = this.supportsFeature(CORRELATED_OPERATIONS_FEATURE);
+    if (!correlated && (this.legacyOperations.has(messageId) || this.poisonedLegacyMessageIds.has(messageId))) {
+      return Promise.reject(new Error("uncorrelated_operation_pending"));
+    }
+
+    const operationId = correlated ? randomUUID() : undefined;
+    const operationKey = operationId ?? messageId;
+    return new Promise((resolve, reject) => {
+      const wrappedResolve = (result: SendResult) => {
+        clearTimeout(timeout);
+        resolve(result);
+      };
+      const wrappedReject = (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      };
+      const timeout = setTimeout(() => {
+        if (!this.pendingOperations.delete(operationKey)) {
+          return;
+        }
+        if (!correlated) {
+          this.legacyOperations.delete(messageId);
+          this.poisonedLegacyMessageIds.add(messageId);
+        }
+        wrappedReject(new Error(`${timeoutLabel} timeout`));
+      }, 10000);
+
+      this.pendingOperations.set(operationKey, { messageId, resolve: wrappedResolve, reject: wrappedReject });
+      if (!correlated) {
+        this.legacyOperations.set(messageId, operationKey);
+      }
+      try {
+        write(operationId);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingOperations.delete(operationKey);
+        this.legacyOperations.delete(messageId);
+        reject(toError(error));
+      }
+    });
+  }
+
   async disconnect(): Promise<void> {
     const socket = this.socket;
     if (!socket) {
@@ -636,30 +711,8 @@ export class IntercomClient extends EventEmitter {
       },
     };
 
-    return new Promise((resolve, reject) => {
-      const wrappedResolve = (result: SendResult) => {
-        clearTimeout(timeout);
-        resolve(result);
-      };
-      const wrappedReject = (error: Error) => {
-        clearTimeout(timeout);
-        reject(error);
-      };
-      const timeout = setTimeout(() => {
-        if (this.pendingSends.has(messageId)) {
-          this.pendingSends.delete(messageId);
-          wrappedReject(new Error("Send timeout"));
-        }
-      }, 10000);
-      this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
-
-      try {
-        writeMessage(socket, { type: "send", to, message });
-      } catch (error) {
-        clearTimeout(timeout);
-        this.pendingSends.delete(messageId);
-        reject(toError(error));
-      }
+    return this.runMessageOperation(messageId, "Send", (operationId) => {
+      writeMessage(socket, { type: "send", to, message, ...(operationId ? { operationId } : {}) });
     });
   }
 
@@ -671,30 +724,8 @@ export class IntercomClient extends EventEmitter {
       return Promise.reject(toError(error));
     }
 
-    return new Promise((resolve, reject) => {
-      const wrappedResolve = (result: SendResult) => {
-        clearTimeout(timeout);
-        resolve(result);
-      };
-      const wrappedReject = (error: Error) => {
-        clearTimeout(timeout);
-        reject(error);
-      };
-      const timeout = setTimeout(() => {
-        if (this.pendingSends.has(messageId)) {
-          this.pendingSends.delete(messageId);
-          wrappedReject(new Error("Cancel timeout"));
-        }
-      }, 10000);
-      this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
-
-      try {
-        writeMessage(socket, { type: "cancel_message", messageId });
-      } catch (error) {
-        clearTimeout(timeout);
-        this.pendingSends.delete(messageId);
-        reject(toError(error));
-      }
+    return this.runMessageOperation(messageId, "Cancel", (operationId) => {
+      writeMessage(socket, { type: "cancel_message", messageId, ...(operationId ? { operationId } : {}) });
     });
   }
 

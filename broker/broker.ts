@@ -23,8 +23,8 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { EXTENSION_BUS_FEATURE } from "../types.ts";
-import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl } from "../types.ts";
+import { BROKER_SESSION_ID, CORRELATED_OPERATIONS_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
+import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 
@@ -46,6 +46,7 @@ const MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000;
 const DISCONNECTED_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
+const BROKER_STARTED_AT = Date.now();
 
 function serializedPayloadSize(payload: unknown): number | null {
   try {
@@ -326,6 +327,9 @@ class IntercomBroker {
           }
           id = clientMessage.sessionId;
         }
+        if (id === BROKER_SESSION_ID) {
+          throw new Error("Reserved broker sessionId");
+        }
         const session = clientMessage.session;
         const extensions = session.extensions;
         if (extensions !== undefined) {
@@ -387,7 +391,7 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, CORRELATED_OPERATIONS_FEATURE],
         });
         this.broadcast({ type: "session_joined", session: info }, id);
 
@@ -491,6 +495,17 @@ class IntercomBroker {
       }
 
       case "send": {
+        const operationId = typeof clientMessage.operationId === "string" ? clientMessage.operationId : undefined;
+        const delivered = (messageId: string) => ({ type: "delivered" as const, messageId, ...(operationId ? { operationId } : {}) });
+        const deliveryFailed = (messageId: string, reason: string) => ({
+          type: "delivery_failed" as const,
+          messageId,
+          ...(operationId ? { operationId } : {}),
+          reason,
+        });
+        if (clientMessage.operationId !== undefined && !operationId) {
+          throw new Error("Invalid send operationId");
+        }
         if (!currentId) {
           throw new Error("Received send before register");
         }
@@ -498,11 +513,7 @@ class IntercomBroker {
         const messageId = isMessage(message) ? message.id : "unknown";
 
         if (typeof clientMessage.to !== "string" || !isMessage(message)) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId,
-            reason: "Invalid message format",
-          });
+          writeMessage(socket, deliveryFailed(messageId, "Invalid message format"));
           break;
         }
 
@@ -514,68 +525,40 @@ class IntercomBroker {
         const targets = this.findSessions(clientMessage.to);
         if (targets.length === 1) {
           if (message.replyTo && !replyEdge) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match a pending ask",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match a pending ask"));
             break;
           }
           const fromSession = this.sessions.get(currentId);
           if (!fromSession || fromSession.socket !== socket) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Sender session not found",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Sender session not found"));
             break;
           }
           const target = targets[0];
           if (message.supersedes) {
             const supersededRoute = this.messageReceiptRoutes.get(message.supersedes);
             if (!supersededRoute || supersededRoute.from !== currentId || supersededRoute.to !== target.info.id) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: "Supersede target does not match a previous message from this sender to this receiver",
-              });
+              writeMessage(socket, deliveryFailed(message.id, "Supersede target does not match a previous message from this sender to this receiver"));
               break;
             }
           }
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.info.id)) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match the pending ask",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask"));
             break;
           }
           if (message.expectsReply) {
             if (this.askEdges.hasReverse(currentId, target.info.id, message.replyTo)) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: "Mutual ask refused: target session is already waiting for a reply from this session.",
-              });
+              writeMessage(socket, deliveryFailed(message.id, "Mutual ask refused: target session is already waiting for a reply from this session."));
               break;
             }
             // A message id that already names a pending ask must not silently displace it: the
             // original asker would wait forever on an edge that no longer exists.
             if (this.askEdges.has(message.id)) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: "Duplicate pending ask message ID",
-              });
+              writeMessage(socket, deliveryFailed(message.id, "Duplicate pending ask message ID"));
               break;
             }
             const capacity = this.askEdges.canAdd(currentId, message.replyTo);
             if (!capacity.ok) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: capacity.reason,
-              });
+              writeMessage(socket, deliveryFailed(message.id, capacity.reason));
               break;
             }
           }
@@ -615,11 +598,7 @@ class IntercomBroker {
             }
           } catch (error) {
             if (error instanceof IntercomFrameTooLargeError) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: "Message is too large after broker metadata was added",
-              });
+              writeMessage(socket, deliveryFailed(message.id, "Message is too large after broker metadata was added"));
               break;
             }
             throw error;
@@ -635,61 +614,37 @@ class IntercomBroker {
             this.askEdges.delete(message.replyTo);
           }
           this.messageReceiptRoutes.set(message.id, { from: currentId, to: target.info.id, createdAt: brokerReceivedAt });
-          writeMessage(socket, { type: "delivered", messageId: message.id });
+          writeMessage(socket, delivered(message.id));
           break;
         }
 
         if (targets.length > 1) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId: message.id,
-            reason: `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`,
-          });
+          writeMessage(socket, deliveryFailed(message.id, `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`));
           break;
         }
 
         const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to);
         if (disconnectedTargets.length === 1) {
           if (message.replyTo && !replyEdge) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match a pending ask",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match a pending ask"));
             break;
           }
           const fromSession = this.sessions.get(currentId);
           if (!fromSession || fromSession.socket !== socket) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Sender session not found",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Sender session not found"));
             break;
           }
           const target = disconnectedTargets[0]!.info;
           if (message.supersedes) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Supersede target is not connected",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Supersede target is not connected"));
             break;
           }
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.id)) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match the pending ask",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask"));
             break;
           }
           if (message.expectsReply) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Target session is not currently connected; blocking asks are not queued",
-            });
+            writeMessage(socket, deliveryFailed(message.id, "Target session is not currently connected; blocking asks are not queued"));
             break;
           }
           const liveMailboxTarget = this.findUniqueLiveSessionForDisconnectedSession(target, currentId);
@@ -707,11 +662,7 @@ class IntercomBroker {
               });
             } catch (error) {
               if (error instanceof IntercomFrameTooLargeError) {
-                writeMessage(socket, {
-                  type: "delivery_failed",
-                  messageId: message.id,
-                  reason: "Message is too large after broker metadata was added",
-                });
+                writeMessage(socket, deliveryFailed(message.id, "Message is too large after broker metadata was added"));
                 break;
               }
               throw error;
@@ -723,24 +674,16 @@ class IntercomBroker {
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
           }
-          writeMessage(socket, { type: "delivered", messageId: message.id });
+          writeMessage(socket, delivered(message.id));
           break;
         }
 
         if (disconnectedTargets.length > 1) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId: message.id,
-            reason: `Multiple disconnected sessions named \"${clientMessage.to}\" can receive queued mail. Use the session ID instead.`,
-          });
+          writeMessage(socket, deliveryFailed(message.id, `Multiple disconnected sessions named \"${clientMessage.to}\" can receive queued mail. Use the session ID instead.`));
           break;
         }
 
-        writeMessage(socket, {
-          type: "delivery_failed",
-          messageId: message.id,
-          reason: "Session not found",
-        });
+        writeMessage(socket, deliveryFailed(message.id, "Session not found"));
         break;
       }
 
@@ -766,6 +709,17 @@ class IntercomBroker {
       }
 
       case "cancel_message": {
+        const operationId = typeof clientMessage.operationId === "string" ? clientMessage.operationId : undefined;
+        const delivered = (messageId: string) => ({ type: "delivered" as const, messageId, ...(operationId ? { operationId } : {}) });
+        const deliveryFailed = (messageId: string, reason: string) => ({
+          type: "delivery_failed" as const,
+          messageId,
+          ...(operationId ? { operationId } : {}),
+          reason,
+        });
+        if (clientMessage.operationId !== undefined && !operationId) {
+          throw new Error("Invalid cancel_message operationId");
+        }
         if (!currentId) {
           throw new Error("Received cancel_message before register");
         }
@@ -782,17 +736,14 @@ class IntercomBroker {
           if (edge?.from === currentId) {
             this.askEdges.delete(clientMessage.messageId);
           }
-          writeMessage(socket, { type: "delivered", messageId: clientMessage.messageId });
+          this.emitBrokerReceipt(socket, clientMessage.messageId, "cancelled");
+          writeMessage(socket, delivered(clientMessage.messageId));
           break;
         }
         const route = this.messageReceiptRoutes.get(clientMessage.messageId);
         const receiver = route ? this.sessions.get(route.to) : undefined;
         if (route?.from !== currentId || sender?.socket !== socket || !receiver) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId: clientMessage.messageId,
-            reason: "Message cannot be cancelled by this session",
-          });
+          writeMessage(socket, deliveryFailed(clientMessage.messageId, "Message cannot be cancelled by this session"));
           break;
         }
         writeMessage(receiver.socket, {
@@ -808,7 +759,7 @@ class IntercomBroker {
         if (edge?.from === currentId) {
           this.askEdges.delete(clientMessage.messageId);
         }
-        writeMessage(socket, { type: "delivered", messageId: clientMessage.messageId });
+        writeMessage(socket, delivered(clientMessage.messageId));
         break;
       }
 
@@ -941,6 +892,31 @@ class IntercomBroker {
     }
   }
 
+  private brokerSessionInfo(receiptAt: number): SessionInfo {
+    return {
+      id: BROKER_SESSION_ID,
+      name: "pi-intercom-broker",
+      cwd: "",
+      model: "broker",
+      pid: process.pid,
+      startedAt: BROKER_STARTED_AT,
+      lastActivity: receiptAt,
+      status: "broker",
+      trustedLocal: typeof LISTEN_TARGET === "string" && process.platform !== "win32",
+    };
+  }
+
+  private emitBrokerReceipt(socket: net.Socket | undefined, messageId: string, status: MessageReceiptStatus, timestamp = Date.now()): void {
+    if (!socket || socket.destroyed || socket.writableEnded || !socket.writable) {
+      return;
+    }
+    writeMessage(socket, {
+      type: "message_receipt",
+      from: this.brokerSessionInfo(timestamp),
+      receipt: { messageId, status, timestamp },
+    });
+  }
+
   private pruneMailboxMessages(now = Date.now()): void {
     for (let index = this.mailboxMessages.length - 1; index >= 0; index -= 1) {
       const entry = this.mailboxMessages[index]!;
@@ -948,6 +924,7 @@ class IntercomBroker {
         if (entry.message.expectsReply) {
           this.askEdges.delete(entry.message.id);
         }
+        this.emitBrokerReceipt(this.sessions.get(entry.from.id)?.socket, entry.message.id, "expired", now);
         this.messageReceiptRoutes.delete(entry.message.id);
         this.mailboxMessages.splice(index, 1);
       }
@@ -962,6 +939,7 @@ class IntercomBroker {
       if (evicted.message.expectsReply) {
         this.askEdges.delete(evicted.message.id);
       }
+      this.emitBrokerReceipt(this.sessions.get(evicted.from.id)?.socket, evicted.message.id, "expired", brokerReceivedAt);
       this.messageReceiptRoutes.delete(evicted.message.id);
     }
     this.mailboxMessages.push({
@@ -970,6 +948,7 @@ class IntercomBroker {
       message: { ...message, brokerReceivedAt },
       queuedAt: brokerReceivedAt,
     });
+    this.emitBrokerReceipt(this.sessions.get(from.id)?.socket, message.id, "queued", brokerReceivedAt);
   }
 
   private flushMailboxForSession(session: ConnectedSession, now = Date.now()): void {
@@ -1026,7 +1005,7 @@ class IntercomBroker {
       this.messageReceiptRoutes.set(entry.message.id, {
         from: entry.from.id,
         to: session.info.id,
-        createdAt: entry.message.brokerReceivedAt ?? entry.queuedAt,
+        createdAt: now,
       });
     }
   }

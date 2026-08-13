@@ -67,6 +67,50 @@ test("malformed extension broker messages are rejected", () => {
   }));
 });
 
+test("correlated operation results settle only their exact waiter", () => {
+  const client = new IntercomClient();
+  (client as any)._sessionId = "session-1";
+  const resolved: string[] = [];
+  (client as any).pendingOperations.set("send-operation", {
+    messageId: "shared-message",
+    resolve: () => resolved.push("send"),
+    reject: () => undefined,
+  });
+  (client as any).pendingOperations.set("cancel-operation", {
+    messageId: "shared-message",
+    resolve: () => resolved.push("cancel"),
+    reject: () => undefined,
+  });
+
+  (client as any).handleBrokerMessage({
+    type: "delivered",
+    messageId: "shared-message",
+    operationId: "cancel-operation",
+  });
+
+  assert.deepEqual(resolved, ["cancel"]);
+  assert.equal((client as any).pendingOperations.has("send-operation"), true);
+});
+
+test("late legacy results consume poison instead of settling a later operation", () => {
+  const client = new IntercomClient();
+  (client as any)._sessionId = "session-1";
+  const resolved: string[] = [];
+  (client as any).poisonedLegacyMessageIds.add("shared-message");
+  (client as any).pendingOperations.set("shared-message", {
+    messageId: "shared-message",
+    resolve: () => resolved.push("later"),
+    reject: () => undefined,
+  });
+  (client as any).legacyOperations.set("shared-message", "shared-message");
+
+  (client as any).handleBrokerMessage({ type: "delivered", messageId: "shared-message" });
+
+  assert.deepEqual(resolved, []);
+  assert.equal((client as any).poisonedLegacyMessageIds.has("shared-message"), false);
+  assert.equal((client as any).pendingOperations.has("shared-message"), true);
+});
+
 test("cancelAsk ignores synchronous socket write failures", () => {
   const client = new IntercomClient();
   (client as any)._sessionId = "session-1";

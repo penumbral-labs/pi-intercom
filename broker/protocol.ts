@@ -34,7 +34,7 @@ export function isMessageReceipt(value: unknown): value is MessageReceipt {
 }
 
 export function isMessageControl(value: unknown): value is MessageControl {
-  if (!isRecord(value)) {
+  if (!isRecord(value) || Object.hasOwn(value, "detail")) {
     return false;
   }
   if (typeof value.messageId !== "string" || typeof value.timestamp !== "number") {
@@ -43,10 +43,7 @@ export function isMessageControl(value: unknown): value is MessageControl {
   if (value.action !== "cancel" && value.action !== "supersede") {
     return false;
   }
-  if (value.supersededBy !== undefined && typeof value.supersededBy !== "string") {
-    return false;
-  }
-  return value.detail === undefined || typeof value.detail === "string";
+  return value.supersededBy === undefined || typeof value.supersededBy === "string";
 }
 
 function isAttachment(value: unknown): value is Attachment {

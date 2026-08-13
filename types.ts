@@ -1,4 +1,6 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
+export const CORRELATED_OPERATIONS_FEATURE = "correlated-operations-v1";
+export const BROKER_SESSION_ID = "__pi_intercom_broker__";
 
 export interface SessionInfo {
   id: string;
@@ -64,7 +66,6 @@ export interface MessageControl {
   action: MessageControlAction;
   timestamp: number;
   supersededBy?: string;
-  detail?: string;
 }
 
 export interface ExtensionCapability {
@@ -81,9 +82,9 @@ export type ClientMessage =
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
-  | { type: "send"; to: string; message: Message }
+  | { type: "send"; to: string; message: Message; operationId?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
-  | { type: "cancel_message"; messageId: string }
+  | { type: "cancel_message"; messageId: string; operationId?: string }
   | { type: "cancel_ask"; messageId: string }
   | { type: "presence"; name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
   | {
@@ -110,8 +111,8 @@ export type BrokerMessage =
   | { type: "session_joined"; session: SessionInfo }
   | { type: "session_left"; sessionId: string }
   | { type: "error"; error: string }
-  | { type: "delivered"; messageId: string }
-  | { type: "delivery_failed"; messageId: string; reason: string }
+  | { type: "delivered"; messageId: string; operationId?: string }
+  | { type: "delivery_failed"; messageId: string; operationId?: string; reason: string }
   | { type: "message_receipt"; from: SessionInfo; receipt: MessageReceipt }
   | { type: "message_control"; from: SessionInfo; control: MessageControl }
   | { type: "extension_owner"; namespace: string; ownerId?: string; ownerEpoch?: string }
