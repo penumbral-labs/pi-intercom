@@ -21,6 +21,7 @@ import {
   type IntercomExtensionState,
 } from "./extension-api.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
+import { StaleAsks, type StaleAskTier } from "./stale-asks.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
@@ -524,6 +525,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let agentRunning = false;
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
+  const staleAsks = new StaleAsks();
   const seenInboundMessages = new Map<string, number>();
   const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; detail?: string }>();
   function dismissIncomingAsk(messageId: string): void {
@@ -580,6 +582,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
   } | null = null;
+  function classifyAbandonedAsk(replyTo: string, principal: string, tier: StaleAskTier): void {
+    staleAsks.record(replyTo, principal, tier);
+  }
   function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
     if (replyWaiter) {
       return Promise.reject(new Error("Already waiting for a reply"));
@@ -589,6 +594,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        classifyAbandonedAsk(replyTo, from, "timed_out");
         const timeoutDescription = askTimeoutMs % 60000 === 0 ? `${askTimeoutMs / 60000} minutes` : `${askTimeoutMs}ms`;
         rejectReplyWaiter(new Error(`No reply from "${from}" for message ${replyTo} within ${timeoutDescription}. Last known delivery state: ${getDeliveryState()}. This waiter timeout is not cancellation; the delivered message may still be queued or actionable in the recipient session.`));
       }, askTimeoutMs);
@@ -600,6 +606,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
       };
       const onAbort = () => {
+        classifyAbandonedAsk(replyTo, from, "cancelled");
         cancelOnAbort?.();
         cleanup();
         reject(new Error("Cancelled"));
@@ -912,6 +919,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     const receivedMessage = { ...message, receiverReceivedAt };
     emitMessageReceipt(receivedMessage.id, "receiver_received");
+    if (receivedMessage.replyTo) {
+      const tier = staleAsks.classify(receivedMessage.replyTo, from.id)
+        ?? (from.name ? staleAsks.classify(receivedMessage.replyTo, from.name) : undefined);
+      if (tier === "cancelled" || tier === "superseded") {
+        emitMessageReceipt(receivedMessage.id, "acknowledged", `late reply dropped after ${tier}`);
+        return;
+      }
+      if (tier === "timed_out") {
+        receivedMessage.content = {
+          ...receivedMessage.content,
+          text: `[Late reply to abandoned ask ${receivedMessage.replyTo}]\n\n${receivedMessage.content.text}`,
+        };
+        staleAsks.delete(receivedMessage.replyTo);
+      }
+    }
     if (replyWaiter) {
       const senderTarget = from.name || from.id;
       const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase()
@@ -1425,6 +1447,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
+    staleAsks.clear();
     agentRunning = false;
     activeTools.clear();
     if (client) {
@@ -2169,6 +2192,9 @@ Usage:
               };
             }
             questionId = randomUUID();
+            if (supersedes) {
+              classifyAbandonedAsk(supersedes, sendTo, "superseded");
+            }
             replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
             replyPromise.catch(() => undefined);
             const sendResult = await connectedClient.send(sendTo, {
