@@ -9,7 +9,17 @@ import {
   IntercomFrameTooLargeError,
 } from "./framing.ts";
 import { AskEdges } from "./ask-edges.ts";
-import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
+import {
+  isBoundedId,
+  isExtensionCapability,
+  isMessage,
+  isMessageReceipt,
+  isNamespace,
+  isOpaqueDispatchClientFrame,
+  isSessionId,
+  isSessionRegistration,
+  opaqueSessionCapability,
+} from "./protocol.ts";
 import {
   ensureIntercomRuntimeDir,
   getBrokerListenTarget,
@@ -23,7 +33,13 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { BROKER_SESSION_ID, CORRELATED_OPERATIONS_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
+import {
+  BROKER_SESSION_ID,
+  CORRELATED_OPERATIONS_FEATURE,
+  EXTENSION_BUS_FEATURE,
+  EXTENSION_STATE_REFRESH_FEATURE,
+  OPAQUE_DISPATCH_FEATURE,
+} from "../types.ts";
 import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
@@ -33,6 +49,7 @@ const LISTEN_TARGET = getBrokerListenTarget();
 const PID_PATH = join(INTERCOM_DIR, "broker.pid");
 const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
 const BROKER_STATE_ID = randomUUID();
+const BROKER_EPOCH = randomUUID();
 const MAX_SESSIONS = 128;
 const MAX_UNREGISTERED_CONNECTIONS = 32;
 const REGISTRATION_TIMEOUT_MS = 1000;
@@ -357,6 +374,7 @@ class IntercomBroker {
           previous.socket.end();
         }
         setId(id);
+        const opaqueDispatch = opaqueSessionCapability(extensions);
         const info: SessionInfo = {
           id,
           ...(session.name !== undefined ? { name: session.name } : {}),
@@ -368,6 +386,7 @@ class IntercomBroker {
           lastActivity: session.lastActivity,
           ...(session.status !== undefined ? { status: session.status } : {}),
           trustedLocal: typeof LISTEN_TARGET === "string" && process.platform !== "win32",
+          ...(opaqueDispatch ? { opaqueDispatch } : {}),
         };
 
         const connectedSession: ConnectedSession = {
@@ -391,7 +410,13 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, CORRELATED_OPERATIONS_FEATURE],
+          features: [
+            EXTENSION_BUS_FEATURE,
+            CORRELATED_OPERATIONS_FEATURE,
+            EXTENSION_STATE_REFRESH_FEATURE,
+            OPAQUE_DISPATCH_FEATURE,
+          ],
+          brokerEpoch: BROKER_EPOCH,
         });
         this.broadcast({ type: "session_joined", session: info }, id);
 
@@ -455,6 +480,9 @@ class IntercomBroker {
           }
         }
         session.extensions = extensions;
+        const opaqueDispatch = opaqueSessionCapability(extensions);
+        if (opaqueDispatch) session.info.opaqueDispatch = opaqueDispatch;
+        else delete session.info.opaqueDispatch;
         this.recomputeNamespaceOwners();
         for (const extension of extensions) {
           const owner = this.namespaceOwners.get(extension.namespace);
@@ -864,6 +892,68 @@ class IntercomBroker {
         break;
       }
 
+      case "extension_state_get": {
+        if (!currentId) throw new Error("Received extension_state_get before register");
+        const session = this.sessions.get(currentId);
+        if (!session || session.socket !== socket) throw new Error("Extension state session not found");
+        if (!isBoundedId(clientMessage.requestId) || !isNamespace(clientMessage.namespace)) {
+          throw new Error("Invalid extension_state_get");
+        }
+        if (!session.extensions?.some((extension) => extension.namespace === clientMessage.namespace)) {
+          throw new Error("Extension state namespace capability required");
+        }
+        const state = this.extensionStateManager.loadState(clientMessage.namespace);
+        writeMessage(socket, {
+          type: "extension_state_snapshot",
+          requestId: clientMessage.requestId,
+          snapshot: state
+            ? { namespace: clientMessage.namespace, revision: state.revision, present: true, payload: state.payload }
+            : { namespace: clientMessage.namespace, revision: 0, present: false },
+        });
+        break;
+      }
+
+      case "opaque_dispatch_v1_peer_capability_get": {
+        if (!currentId || !isOpaqueDispatchClientFrame(clientMessage) || clientMessage.type !== "opaque_dispatch_v1_peer_capability_get") {
+          throw new Error("Invalid opaque peer capability query");
+        }
+        const origin = this.sessions.get(currentId);
+        if (!origin || origin.socket !== socket) throw new Error("Opaque query origin not found");
+        const target = this.sessions.get(clientMessage.toSessionId)?.info
+          ?? this.disconnectedSessions.get(clientMessage.toSessionId)?.info;
+        const receive = target?.opaqueDispatch?.namespaces.some((entry) =>
+          entry.namespace === clientMessage.recipientNamespace && entry.roles.includes("receive"));
+        writeMessage(socket, {
+          type: "opaque_dispatch_v1_peer_capability_result",
+          operationId: clientMessage.operationId,
+          toSessionId: clientMessage.toSessionId,
+          recipientNamespace: clientMessage.recipientNamespace,
+          state: target ? (receive ? "present" : "absent") : "unknown",
+          ...(receive ? { version: 1 } : {}),
+        });
+        break;
+      }
+
+      case "opaque_dispatch_v1_send":
+      case "opaque_dispatch_v1_cancel":
+      case "opaque_dispatch_v1_reservation_result":
+      case "opaque_dispatch_v1_claim":
+      case "opaque_dispatch_v1_fail":
+      case "opaque_dispatch_v1_claim_status":
+      case "opaque_dispatch_v1_receipt_ack": {
+        if (!isOpaqueDispatchClientFrame(clientMessage)) throw new Error("Invalid opaque dispatch frame");
+        if ("operationId" in clientMessage) {
+          writeMessage(socket, {
+            type: "opaque_dispatch_v1_rejected",
+            operationId: clientMessage.operationId,
+            ...("requestId" in clientMessage ? { requestId: clientMessage.requestId } : {}),
+            ...("messageId" in clientMessage ? { messageId: clientMessage.messageId } : {}),
+            code: "unsupported_broker",
+          });
+        }
+        break;
+      }
+
       case "extension_publish": {
         this.handleExtensionPublish(socket, currentId, clientMessage);
         break;
@@ -1116,14 +1206,7 @@ class IntercomBroker {
   }
 
   private validateExtensionCapability(cap: unknown): cap is ExtensionCapability {
-    if (typeof cap !== "object" || cap === null) {
-      return false;
-    }
-    const c = cap as Record<string, unknown>;
-    if (typeof c.namespace !== "string" || typeof c.ownerEligible !== "boolean") {
-      return false;
-    }
-    return this.validateNamespace(c.namespace);
+    return isExtensionCapability(cap);
   }
 
   private validateNamespace(ns: string): boolean {

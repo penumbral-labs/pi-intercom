@@ -3,8 +3,20 @@ import net from "net";
 import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
-import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
-import { CORRELATED_OPERATIONS_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
+import {
+  isExtensionStateSnapshot,
+  isMessage,
+  isMessageControl,
+  isMessageReceipt,
+  isOpaqueDispatchBrokerFrame,
+  isSessionInfo,
+} from "./protocol.ts";
+import {
+  CORRELATED_OPERATIONS_FEATURE,
+  EXTENSION_BUS_FEATURE,
+  EXTENSION_STATE_REFRESH_FEATURE,
+  OPAQUE_DISPATCH_FEATURE,
+} from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -12,6 +24,8 @@ import type {
   Message,
   MessageControl,
   MessageReceipt,
+  ExtensionStateSnapshot,
+  OpaqueDispatchBrokerFrame,
   SessionInfo,
   SessionRegistration,
 } from "../types.ts";
@@ -30,6 +44,11 @@ interface SendResult {
   id: string;
   delivered: boolean;
   reason?: string;
+}
+
+interface PendingRequest<T> {
+  resolve: (result: T) => void;
+  reject: (error: Error) => void;
 }
 
 interface PendingOperation {
@@ -73,10 +92,13 @@ export class IntercomClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _features = new Set<string>();
+  private _brokerEpoch: string | null = null;
   private pendingOperations = new Map<string, PendingOperation>();
   private legacyOperations = new Map<string, string>();
   private poisonedLegacyMessageIds = new Set<string>();
-  private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
+  private pendingLists = new Map<string, PendingRequest<SessionInfo[]>>();
+  private pendingStateRefreshes = new Map<string, PendingRequest<ExtensionStateSnapshot>>();
+  private pendingPeerQueries = new Map<string, PendingRequest<Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_peer_capability_result" }>>>();
   private nextSenderSequence = 1;
   private disconnecting = false;
   private disconnectError: Error | null = null;
@@ -94,10 +116,18 @@ export class IntercomClient extends EventEmitter {
       pending.reject(error);
     }
     this.pendingLists.clear();
+    for (const pending of this.pendingStateRefreshes.values()) pending.reject(error);
+    this.pendingStateRefreshes.clear();
+    for (const pending of this.pendingPeerQueries.values()) pending.reject(error);
+    this.pendingPeerQueries.clear();
   }
 
   get sessionId(): string | null {
     return this._sessionId;
+  }
+
+  get brokerEpoch(): string | null {
+    return this._brokerEpoch;
   }
 
   supportsFeature(feature: string): boolean {
@@ -235,6 +265,7 @@ export class IntercomClient extends EventEmitter {
         }
         this._sessionId = null;
         this._features.clear();
+        this._brokerEpoch = null;
         this.disconnectError = null;
         if (connectionEstablished && !wasDisconnecting) {
           this.emit("disconnected", disconnectError);
@@ -339,12 +370,21 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid registered features");
         }
 
+        if (brokerMessage.brokerEpoch !== undefined && typeof brokerMessage.brokerEpoch !== "string") {
+          throw new Error("Invalid registered brokerEpoch");
+        }
+        const advertisedFeatures = new Set((brokerMessage.features as string[] | undefined) ?? []);
+        if (advertisedFeatures.has(OPAQUE_DISPATCH_FEATURE) && typeof brokerMessage.brokerEpoch !== "string") {
+          throw new Error("Opaque dispatch broker omitted brokerEpoch");
+        }
         this._sessionId = brokerMessage.sessionId;
-        this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
+        this._features = advertisedFeatures;
+        this._brokerEpoch = typeof brokerMessage.brokerEpoch === "string" ? brokerMessage.brokerEpoch : null;
         const registered: BrokerMessage = {
           type: "registered",
           sessionId: brokerMessage.sessionId,
           ...(this._features.size > 0 ? { features: [...this._features] } : {}),
+          ...(this._brokerEpoch ? { brokerEpoch: this._brokerEpoch } : {}),
         };
         this.emit("broker_message", registered);
         this.emit("_registered", registered);
@@ -506,6 +546,42 @@ export class IntercomClient extends EventEmitter {
         }
         this.emit("broker_message", brokerMessage as BrokerMessage);
         this.emit("extension_state", brokerMessage);
+        break;
+      }
+
+      case "extension_state_snapshot": {
+        if (typeof brokerMessage.requestId !== "string" || !isExtensionStateSnapshot(brokerMessage.snapshot)) {
+          throw new Error("Invalid extension_state_snapshot");
+        }
+        const pending = this.pendingStateRefreshes.get(brokerMessage.requestId);
+        if (!pending) break;
+        this.pendingStateRefreshes.delete(brokerMessage.requestId);
+        pending.resolve(brokerMessage.snapshot);
+        break;
+      }
+
+      case "opaque_dispatch_v1_peer_capability_result": {
+        if (!isOpaqueDispatchBrokerFrame(brokerMessage) || brokerMessage.type !== "opaque_dispatch_v1_peer_capability_result") {
+          throw new Error("Invalid opaque peer capability result");
+        }
+        const pending = this.pendingPeerQueries.get(brokerMessage.operationId);
+        if (!pending) break;
+        this.pendingPeerQueries.delete(brokerMessage.operationId);
+        pending.resolve(brokerMessage);
+        break;
+      }
+
+      case "opaque_dispatch_v1_ack":
+      case "opaque_dispatch_v1_rejected":
+      case "opaque_dispatch_v1_offer":
+      case "opaque_dispatch_v1_reservation_ended":
+      case "opaque_dispatch_v1_receipt":
+      case "opaque_dispatch_v1_claim_result":
+      case "opaque_dispatch_v1_fail_result":
+      case "opaque_dispatch_v1_claim_status_result":
+      case "opaque_dispatch_v1_cancel_result": {
+        if (!isOpaqueDispatchBrokerFrame(brokerMessage)) throw new Error("Invalid opaque dispatch message");
+        this.emit("opaque_dispatch", brokerMessage);
         break;
       }
 
@@ -781,6 +857,48 @@ export class IntercomClient extends EventEmitter {
     }
 
     writeMessage(socket, { type: "presence", ...updates });
+  }
+
+  refreshExtensionState(namespace: string, options: { timeoutMs?: number } = {}): Promise<ExtensionStateSnapshot> {
+    if (!this.supportsFeature(EXTENSION_STATE_REFRESH_FEATURE)) return Promise.reject(new Error("unsupported_broker"));
+    let socket: net.Socket;
+    try { socket = this.requireActiveSocket(); } catch (error) { return Promise.reject(toError(error)); }
+    if (this.pendingStateRefreshes.size >= MAX_PENDING_OPERATIONS) return Promise.reject(new Error("limit_exceeded"));
+    return new Promise((resolve, reject) => {
+      const requestId = randomUUID();
+      const timeout = setTimeout(() => {
+        if (this.pendingStateRefreshes.delete(requestId)) reject(new Error("connection_lost"));
+      }, options.timeoutMs ?? 5000);
+      const settle = (value: ExtensionStateSnapshot) => { clearTimeout(timeout); resolve(value); };
+      const fail = (error: Error) => { clearTimeout(timeout); reject(error); };
+      this.pendingStateRefreshes.set(requestId, { resolve: settle, reject: fail });
+      try { writeMessage(socket, { type: "extension_state_get", requestId, namespace }); }
+      catch (error) { this.pendingStateRefreshes.delete(requestId); fail(toError(error)); }
+    });
+  }
+
+  peerCapability(toSessionId: string, recipientNamespace: string, options: { timeoutMs?: number } = {}): Promise<
+    { state: "present"; version: 1 } | { state: "absent" } | { state: "unknown" }
+  > {
+    if (!this.supportsFeature(OPAQUE_DISPATCH_FEATURE)) return Promise.reject(new Error("unsupported_broker"));
+    let socket: net.Socket;
+    try { socket = this.requireActiveSocket(); } catch (error) { return Promise.reject(toError(error)); }
+    if (this.pendingPeerQueries.size >= MAX_PENDING_OPERATIONS) return Promise.reject(new Error("limit_exceeded"));
+    return new Promise((resolve, reject) => {
+      const operationId = randomUUID();
+      const timeout = setTimeout(() => {
+        if (this.pendingPeerQueries.delete(operationId)) reject(new Error("connection_lost"));
+      }, options.timeoutMs ?? 5000);
+      const settle = (result: Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_peer_capability_result" }>) => {
+        clearTimeout(timeout);
+        if (result.state === "present") resolve({ state: "present", version: 1 });
+        else resolve({ state: result.state });
+      };
+      const fail = (error: Error) => { clearTimeout(timeout); reject(error); };
+      this.pendingPeerQueries.set(operationId, { resolve: settle, reject: fail });
+      try { writeMessage(socket, { type: "opaque_dispatch_v1_peer_capability_get", operationId, toSessionId, recipientNamespace }); }
+      catch (error) { this.pendingPeerQueries.delete(operationId); fail(toError(error)); }
+    });
   }
 
   sendExtensionMessage(message: Extract<ClientMessage, { type: "extension_publish" | "extension_state_commit" }>): void {

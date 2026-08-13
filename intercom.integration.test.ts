@@ -362,11 +362,19 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
         lastActivity: Date.now(),
       },
     }, true);
-    assert.deepEqual(registerMessages, [{
+    assert.equal(registerMessages.length, 1);
+    assert.deepEqual(registerMessages[0], {
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "correlated-operations-v1"],
-    }]);
+      features: [
+        "extension-bus-v1",
+        "correlated-operations-v1",
+        "extension-state-refresh-v1",
+        "opaque-dispatch-v1",
+      ],
+      brokerEpoch: (registerMessages[0] as { brokerEpoch: string }).brokerEpoch,
+    });
+    assert.match((registerMessages[0] as { brokerEpoch: string }).brokerEpoch, /^[0-9a-f-]{36}$/);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
       broker.kill("SIGTERM");
@@ -1019,7 +1027,7 @@ test("extension channels register locally without creating conversation messages
   assert.equal(channel?.namespace, "test-extension/v1");
   assert.deepEqual(channel?.snapshot(), {
     connected: false,
-    supported: false,
+    capabilities: { extensionBus: false },
   });
   assert.deepEqual(extensionEvents, []);
   assert.deepEqual(harness.sentMessages, []);

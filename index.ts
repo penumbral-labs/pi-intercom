@@ -9,7 +9,7 @@ import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
-import { EXTENSION_BUS_FEATURE } from "./types.ts";
+import { EXTENSION_BUS_FEATURE, EXTENSION_STATE_REFRESH_FEATURE, OPAQUE_DISPATCH_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
@@ -503,7 +503,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     channel: IntercomExtensionChannel;
     owner?: IntercomExtensionOwner;
     state?: IntercomExtensionState;
+    generation: number;
   }>();
+  let nextExtensionGeneration = 1;
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   let currentIntercomSessionId: string | null = null;
@@ -692,14 +694,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       // One local extension must not break intercom or other extension channels.
     }
   }
-  function createExtensionChannel(namespace: string): IntercomExtensionChannel {
+  function createExtensionChannel(namespace: string, generation: number): IntercomExtensionChannel {
+    const current = () => localExtensions.get(namespace)?.generation === generation;
     return {
       namespace,
       snapshot() {
         const extension = localExtensions.get(namespace);
         return {
           connected: Boolean(client?.isConnected()),
-          supported: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
+          ...(client?.brokerEpoch ? { brokerEpoch: client.brokerEpoch } : {}),
+          capabilities: {
+            extensionBus: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
+            ...(client?.supportsFeature(EXTENSION_STATE_REFRESH_FEATURE) ? { extensionStateRefreshVersion: 1 as const } : {}),
+            ...(client?.supportsFeature(OPAQUE_DISPATCH_FEATURE) ? { opaqueDispatchVersion: 1 as const } : {}),
+          },
           ...(extension?.owner ? { owner: extension.owner } : {}),
           ...(extension?.state ? { state: extension.state } : {}),
         };
@@ -735,10 +743,54 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           payload,
         });
       },
+      async refreshState() {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected()) return { ok: false as const, code: "connection_lost" as const };
+        if (!activeClient.supportsFeature(EXTENSION_STATE_REFRESH_FEATURE)) {
+          return { ok: false as const, code: "unsupported_broker" as const };
+        }
+        try {
+          const state = await activeClient.refreshExtensionState(namespace);
+          if (!current()) return { ok: false as const, code: "connection_lost" as const };
+          const extension = localExtensions.get(namespace);
+          if (state.present && extension) extension.state = { revision: state.revision, payload: state.payload };
+          return { ok: true as const, state };
+        } catch {
+          return { ok: false as const, code: "connection_lost" as const };
+        }
+      },
       async listSessions() {
         const activeClient = client;
-        if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
+        if (!current() || !activeClient?.isConnected()) throw new Error("Intercom is not connected");
         return activeClient.listSessions();
+      },
+      async peerCapability(sessionId, recipientNamespace) {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+          return { state: "unknown" as const };
+        }
+        try { return await activeClient.peerCapability(sessionId, recipientNamespace); }
+        catch { return { state: "unknown" as const }; }
+      },
+      async sendOpaqueDispatch(input) {
+        return { accepted: false as const, requestId: input.requestId, code: "unsupported_broker" as const };
+      },
+      async cancelMessage() {
+        return { cancelled: false as const, code: "unsupported_broker" as const };
+      },
+      async reconcileClaim(input) {
+        return {
+          state: "indeterminate" as const,
+          code: input.brokerEpoch === client?.brokerEpoch ? "claim_history_unavailable" as const : "broker_epoch_changed" as const,
+        };
+      },
+      dispose() {
+        if (!current()) return;
+        localExtensions.delete(namespace);
+        const activeClient = client;
+        if (activeClient?.isConnected() && activeClient.supportsFeature(EXTENSION_BUS_FEATURE)) {
+          activeClient.updateExtensionCapabilities(currentExtensionCapabilities());
+        }
       },
     };
   }
@@ -746,6 +798,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return [...localExtensions.values()].map(({ registration }) => ({
       namespace: registration.namespace,
       ownerEligible: registration.ownerEligible,
+      ...(registration.opaqueDispatch ? {
+        opaqueDispatch: { version: 1 as const, roles: [...registration.opaqueDispatch.roles] },
+      } : {}),
     }));
   }
   function registerLocalExtension(registration: IntercomExtensionRegistration): void {
@@ -755,8 +810,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (localExtensions.has(registration.namespace)) {
       throw new Error(`Intercom extension namespace already registered: ${registration.namespace}`);
     }
-    const channel = createExtensionChannel(registration.namespace);
-    localExtensions.set(registration.namespace, { registration, channel });
+    const roles = registration.opaqueDispatch?.roles;
+    if (registration.opaqueDispatch) {
+      if (registration.opaqueDispatch.version !== 1 || !Array.isArray(roles) || roles.length === 0
+        || roles.some((role) => role !== "send" && role !== "receive") || new Set(roles).size !== roles.length
+        || (roles.includes("receive") && typeof registration.opaqueDispatch.onReserve !== "function")) {
+        throw new Error(`Invalid opaque dispatch registration: ${registration.namespace}`);
+      }
+    }
+    const generation = nextExtensionGeneration++;
+    const channel = createExtensionChannel(registration.namespace, generation);
+    localExtensions.set(registration.namespace, { registration, channel, generation });
     const activeClient = client;
     const connected = Boolean(activeClient?.isConnected());
     const supported = Boolean(activeClient?.supportsFeature(EXTENSION_BUS_FEATURE));
@@ -1411,7 +1475,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     registerLocalExtension(registration as IntercomExtensionRegistration);
   });
-  pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, { version: 1 });
+  pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, {
+    version: 2,
+    capabilities: { extensionBus: 1, extensionStateRefresh: 1, opaqueDispatch: 1 },
+  });
   const unsubscribeSubagentControlIntercom = pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
     relaySubagentIntercomPayload(payload, {
       sender: "subagent-control",
