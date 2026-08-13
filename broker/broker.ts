@@ -4,11 +4,9 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import {
   writeMessage,
+  writeMessages,
   createMessageReader,
-  encodeFrame,
-  writeEncodedFrames,
   IntercomFrameTooLargeError,
-  type EncodedFrame,
 } from "./framing.ts";
 import { AskEdges } from "./ask-edges.ts";
 import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
@@ -586,13 +584,11 @@ class IntercomBroker {
             brokerReceivedAt,
             brokerDeliveredAt: Date.now(),
           };
-          // A supersede is two frames that mean nothing apart: the control retires the old ID and
-          // the message supplies its replacement. Encoding both before writing either keeps them
-          // atomic with respect to the frame cap. Writing the control first and then failing the
-          // replacement would leave the receiver having retired an ID whose replacement never
-          // arrives, with no way to undo it.
-          let supersedeFrame: EncodedFrame | undefined;
-          let messageFrame: EncodedFrame;
+          const deliveredEnvelope = {
+            type: "message",
+            from: fromSession.info,
+            message: deliveredMessage,
+          };
           try {
             if (message.supersedes) {
               const control: MessageControl = {
@@ -601,17 +597,22 @@ class IntercomBroker {
                 supersededBy: message.id,
                 timestamp: Date.now(),
               };
-              supersedeFrame = encodeFrame({
-                type: "message_control",
-                from: fromSession.info,
-                control,
-              });
+              // A supersede is two frames that mean nothing apart: the control retires the old ID
+              // and the message supplies its replacement. The sink privately encodes both before
+              // writing either, keeping them atomic with respect to the frame cap while preserving
+              // control-before-message wire order.
+              writeMessages(
+                target.socket,
+                {
+                  type: "message_control",
+                  from: fromSession.info,
+                  control,
+                },
+                deliveredEnvelope,
+              );
+            } else {
+              writeMessage(target.socket, deliveredEnvelope);
             }
-            messageFrame = encodeFrame({
-              type: "message",
-              from: fromSession.info,
-              message: deliveredMessage,
-            });
           } catch (error) {
             if (error instanceof IntercomFrameTooLargeError) {
               writeMessage(socket, {
@@ -623,18 +624,10 @@ class IntercomBroker {
             }
             throw error;
           }
-          // Both frames are known legal, so the wire order (control before message) is preserved
-          // by handing them to one write call, without risking a half-applied supersede.
-          //
           // Delivery precedes recording the ask edge. Broker metadata (brokerReceivedAt /
           // brokerDeliveredAt) can push a borderline message past the frame cap, and an edge
           // recorded for a message that never left would strand the asker on a reply that can
           // never arrive.
-          if (supersedeFrame) {
-            writeEncodedFrames(target.socket, supersedeFrame, messageFrame);
-          } else {
-            writeEncodedFrames(target.socket, messageFrame);
-          }
           if (message.expectsReply) {
             this.askEdges.add(message.id, currentId, target.info.id);
           }

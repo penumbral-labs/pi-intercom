@@ -37,43 +37,9 @@ export function validateFrameBytes(bytes: Buffer): void {
   }
 }
 
-// One whole validated frame, ready to write.
-//
-// The bytes are private and the constructor is private, so encodeFrame is the only way to obtain
-// one. That is the point: the writer accepts this type and nothing else, which makes an oversize
-// or forged buffer unrepresentable at the module boundary instead of merely rejected inside it.
-export class EncodedFrame {
-  private constructor(private readonly bytes: Buffer) {}
-
-  // Mint a frame, validating before the value exists at all. The buffer is retained by reference
-  // rather than copied, so encodeFrame does not pay a second allocation for a buffer it just made
-  // and exclusively owns. A caller that keeps its own reference can still mutate it afterwards,
-  // which is why toValidatedBytes re-checks at write time.
-  static from(bytes: Buffer): EncodedFrame {
-    validateFrameBytes(bytes);
-    return new EncodedFrame(bytes);
-  }
-
-  get byteLength(): number {
-    return this.bytes.length;
-  }
-
-  // Re-checked at write time so even a frame built inside this module cannot reach a socket
-  // malformed. Returns the bytes only after passing.
-  toValidatedBytes(): Buffer {
-    validateFrameBytes(this.bytes);
-    return this.bytes;
-  }
-}
-
-// Encode a message into a length-prefixed frame without touching a socket.
-// Format: 4-byte big-endian length + JSON payload
-//
-// Throws IntercomFrameTooLargeError when the payload exceeds MAX_FRAME_BYTES. Separated from the
-// write so a caller emitting several frames as one logical unit can validate all of them first
-// and write only if every one is legal — otherwise a mid-sequence throw leaves the peer holding a
-// partial sequence it cannot undo.
-export function encodeFrame(msg: unknown): EncodedFrame {
+// Encode one ordinary message into a complete length-prefixed frame without exposing the frame.
+// Format: 4-byte big-endian length + JSON payload.
+function encodeFrameBytes(msg: unknown): Buffer {
   const json = JSON.stringify(msg);
   const payloadLength = Buffer.byteLength(json, "utf-8");
   if (payloadLength > MAX_FRAME_BYTES) {
@@ -82,26 +48,26 @@ export function encodeFrame(msg: unknown): EncodedFrame {
   const frame = Buffer.allocUnsafe(4 + payloadLength);
   frame.writeUInt32BE(payloadLength, 0);
   frame.write(json, 4, payloadLength, "utf-8");
-  return EncodedFrame.from(frame);
+  validateFrameBytes(frame);
+  return frame;
 }
 
-// Write pre-encoded frames in order, as one unit.
-//
-// Every frame is validated before the first byte is written, so a malformed frame anywhere in the
-// sequence means zero writes rather than a peer left holding a partial sequence.
-export function writeEncodedFrames(socket: Socket, ...frames: EncodedFrame[]): void {
-  const validated = frames.map((frame) => frame.toValidatedBytes());
-  for (const bytes of validated) {
-    socket.write(bytes);
+// Encode and validate every ordinary message before writing the first frame. Keeping encoded
+// buffers private means callers cannot supply raw or structurally forged frames, and a bad later
+// message leaves the socket untouched rather than emitting a partial sequence.
+export function writeMessages(socket: Socket, ...messages: unknown[]): void {
+  const frames = messages.map(encodeFrameBytes);
+  for (const frame of frames) {
+    socket.write(frame);
   }
 }
 
-// Write a length-prefixed message to a socket.
+// Write one length-prefixed message to a socket.
 //
 // Throws IntercomFrameTooLargeError before writing any bytes when the payload exceeds
 // MAX_FRAME_BYTES, so a partial frame is never emitted.
 export function writeMessage(socket: Socket, msg: unknown): void {
-  writeEncodedFrames(socket, encodeFrame(msg));
+  writeMessages(socket, msg);
 }
 
 /**
