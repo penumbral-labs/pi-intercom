@@ -236,12 +236,10 @@ export class OpaqueDispatchManager {
       if (!reservation || reservation.targetSessionId !== sessionId) continue;
       clearTimeout(reservation.timer);
       record.reservation = undefined;
-      if (record.status === "offered" && record.waiters.length > 0) {
-        this.ackWaiters(record, "mailbox_queued");
-      }
       if (record.status === "offered" || record.status === "reserved") {
         if (record.attempt >= MAX_OPAQUE_ATTEMPTS) this.terminalize(record, "failed_closed", "attempt_limit");
         else {
+          if (record.status === "offered" && record.waiters.length > 0) this.ackWaiters(record, "mailbox_queued");
           record.status = "queued";
           this.receipt(record, "queued", "receiver_disconnected");
         }
