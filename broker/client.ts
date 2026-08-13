@@ -26,6 +26,8 @@ import type {
   MessageReceipt,
   ExtensionStateSnapshot,
   OpaqueDispatchBrokerFrame,
+  OpaqueDispatchClientFrame,
+  OpaqueDispatchReason,
   SessionInfo,
   SessionRegistration,
 } from "../types.ts";
@@ -99,6 +101,7 @@ export class IntercomClient extends EventEmitter {
   private pendingLists = new Map<string, PendingRequest<SessionInfo[]>>();
   private pendingStateRefreshes = new Map<string, PendingRequest<ExtensionStateSnapshot>>();
   private pendingPeerQueries = new Map<string, PendingRequest<Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_peer_capability_result" }>>>();
+  private pendingOpaque = new Map<string, PendingRequest<OpaqueDispatchBrokerFrame>>();
   private nextSenderSequence = 1;
   private disconnecting = false;
   private disconnectError: Error | null = null;
@@ -120,6 +123,8 @@ export class IntercomClient extends EventEmitter {
     this.pendingStateRefreshes.clear();
     for (const pending of this.pendingPeerQueries.values()) pending.reject(error);
     this.pendingPeerQueries.clear();
+    for (const pending of this.pendingOpaque.values()) pending.reject(error);
+    this.pendingOpaque.clear();
   }
 
   get sessionId(): string | null {
@@ -573,14 +578,24 @@ export class IntercomClient extends EventEmitter {
 
       case "opaque_dispatch_v1_ack":
       case "opaque_dispatch_v1_rejected":
-      case "opaque_dispatch_v1_offer":
-      case "opaque_dispatch_v1_reservation_ended":
-      case "opaque_dispatch_v1_receipt":
       case "opaque_dispatch_v1_claim_result":
       case "opaque_dispatch_v1_fail_result":
       case "opaque_dispatch_v1_claim_status_result":
       case "opaque_dispatch_v1_cancel_result": {
-        if (!isOpaqueDispatchBrokerFrame(brokerMessage)) throw new Error("Invalid opaque dispatch message");
+        if (!isOpaqueDispatchBrokerFrame(brokerMessage) || !("operationId" in brokerMessage)) {
+          throw new Error("Invalid opaque dispatch result");
+        }
+        const pending = this.pendingOpaque.get(brokerMessage.operationId);
+        if (!pending) break;
+        this.pendingOpaque.delete(brokerMessage.operationId);
+        pending.resolve(brokerMessage);
+        break;
+      }
+
+      case "opaque_dispatch_v1_offer":
+      case "opaque_dispatch_v1_reservation_ended":
+      case "opaque_dispatch_v1_receipt": {
+        if (!isOpaqueDispatchBrokerFrame(brokerMessage)) throw new Error("Invalid opaque dispatch event");
         this.emit("opaque_dispatch", brokerMessage);
         break;
       }
@@ -899,6 +914,78 @@ export class IntercomClient extends EventEmitter {
       try { writeMessage(socket, { type: "opaque_dispatch_v1_peer_capability_get", operationId, toSessionId, recipientNamespace }); }
       catch (error) { this.pendingPeerQueries.delete(operationId); fail(toError(error)); }
     });
+  }
+
+  private writeOpaque(frame: OpaqueDispatchClientFrame): void {
+    if (!this.supportsFeature(OPAQUE_DISPATCH_FEATURE)) throw new Error("unsupported_broker");
+    writeMessage(this.requireActiveSocket(), frame);
+  }
+
+  private runOpaqueOperation(
+    build: (operationId: string) => OpaqueDispatchClientFrame,
+    options: { timeoutMs?: number } = {},
+  ): Promise<OpaqueDispatchBrokerFrame> {
+    if (!this.supportsFeature(OPAQUE_DISPATCH_FEATURE)) return Promise.reject(new Error("unsupported_broker"));
+    if (this.pendingOpaque.size >= MAX_PENDING_OPERATIONS) return Promise.reject(new Error("limit_exceeded"));
+    const operationId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this.pendingOpaque.delete(operationId)) reject(new Error("connection_lost"));
+      }, options.timeoutMs ?? 10_000);
+      const settle = (result: OpaqueDispatchBrokerFrame) => { clearTimeout(timeout); resolve(result); };
+      const fail = (error: Error) => { clearTimeout(timeout); reject(error); };
+      this.pendingOpaque.set(operationId, { resolve: settle, reject: fail });
+      try { this.writeOpaque(build(operationId)); }
+      catch (error) { this.pendingOpaque.delete(operationId); fail(toError(error)); }
+    });
+  }
+
+  async sendOpaqueDispatch(senderNamespace: string, input: { requestId: string; toSessionId: string; recipientNamespace: string; payload: unknown; supersedesMessageId?: string }) {
+    const result = await this.runOpaqueOperation((operationId) => ({ type: "opaque_dispatch_v1_send", operationId, senderNamespace, ...input }));
+    if (result.type === "opaque_dispatch_v1_ack") return { accepted: true as const, requestId: result.requestId, messageId: result.messageId, brokerEpoch: result.brokerEpoch, deliveryState: result.deliveryState };
+    if (result.type === "opaque_dispatch_v1_rejected") return { accepted: false as const, requestId: result.requestId ?? input.requestId, ...(result.messageId ? { messageId: result.messageId } : {}), code: result.code, ...(result.terminal ? { terminal: result.terminal } : {}) };
+    return { accepted: false as const, requestId: input.requestId, code: "invalid_frame" as OpaqueDispatchReason };
+  }
+
+  async cancelOpaqueDispatch(senderNamespace: string, messageId: string) {
+    const result = await this.runOpaqueOperation((operationId) => ({ type: "opaque_dispatch_v1_cancel", operationId, senderNamespace, messageId }));
+    return result.type === "opaque_dispatch_v1_cancel_result" && result.cancelled
+      ? { cancelled: true as const }
+      : { cancelled: false as const, code: result.type === "opaque_dispatch_v1_cancel_result" ? result.code ?? "invalid_frame" as const : "invalid_frame" as const };
+  }
+
+  sendOpaqueReservationResult(messageId: string, reservationId: string, decision: "reserved" | "refused" | "failed_closed", reason?: OpaqueDispatchReason): void {
+    this.writeOpaque({ type: "opaque_dispatch_v1_reservation_result", messageId, reservationId, decision, ...(reason ? { reason } : {}) });
+  }
+
+  async claimOpaqueDispatch(messageId: string, reservationId: string) {
+    const result = await this.runOpaqueOperation((operationId) => ({ type: "opaque_dispatch_v1_claim", operationId, messageId, reservationId }));
+    return result.type === "opaque_dispatch_v1_claim_result" && result.claimed
+      ? { claimed: true as const }
+      : { claimed: false as const, code: result.type === "opaque_dispatch_v1_claim_result" ? result.code ?? "invalid_frame" as const : "invalid_frame" as const };
+  }
+
+  async failOpaqueDispatch(messageId: string, reservationId: string) {
+    const result = await this.runOpaqueOperation((operationId) => ({ type: "opaque_dispatch_v1_fail", operationId, messageId, reservationId, reason: "consumer_failed" }));
+    return result.type === "opaque_dispatch_v1_fail_result" && result.failedClosed
+      ? { failedClosed: true as const }
+      : { failedClosed: false as const, code: result.type === "opaque_dispatch_v1_fail_result" ? result.code ?? "invalid_frame" as const : "invalid_frame" as const };
+  }
+
+  async reconcileOpaqueClaim(recipientNamespace: string, input: { brokerEpoch: string; messageId: string; reservationId: string }) {
+    const result = await this.runOpaqueOperation((operationId) => ({ type: "opaque_dispatch_v1_claim_status", operationId, recipientNamespace, ...input }));
+    return result.type === "opaque_dispatch_v1_claim_status_result"
+      ? result.result
+      : { state: "indeterminate" as const, code: "claim_history_unavailable" as const };
+  }
+
+  ackOpaqueReceipt(senderNamespace: string, messageId: string, sequence: number): void {
+    this.writeOpaque({ type: "opaque_dispatch_v1_receipt_ack", senderNamespace, messageId, sequence });
+  }
+
+  onOpaqueDispatch(handler: (frame: Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_offer" | "opaque_dispatch_v1_reservation_ended" | "opaque_dispatch_v1_receipt" }>) => void): () => void {
+    this.on("opaque_dispatch", handler);
+    return () => this.off("opaque_dispatch", handler);
   }
 
   sendExtensionMessage(message: Extract<ClientMessage, { type: "extension_publish" | "extension_state_commit" }>): void {

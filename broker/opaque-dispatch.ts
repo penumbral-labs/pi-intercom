@@ -65,6 +65,7 @@ interface RecordState {
   ackedThrough: number;
   activeTimer?: NodeJS.Timeout;
   tombstoneTimer?: NodeJS.Timeout;
+  lastReservationId?: string;
 }
 
 export type CanonicalPayloadResult =
@@ -368,6 +369,7 @@ export class OpaqueDispatchManager {
     const record = this.authorizedReservation(endpoint, frame.messageId, frame.reservationId);
     if (!record || record.status !== "reserved") return endpoint.write?.({ type: "opaque_dispatch_v1_claim_result", operationId: frame.operationId, reservationId: frame.reservationId, messageId: frame.messageId, claimed: false, code: "stale_reservation" });
     clearTimeout(record.reservation!.timer);
+    record.lastReservationId = frame.reservationId;
     record.reservation = undefined;
     record.status = "claimed";
     this.clearPayload(record);
@@ -401,7 +403,7 @@ export class OpaqueDispatchManager {
     if (frame.brokerEpoch !== this.hooks.brokerEpoch) result = { state: "indeterminate", code: "broker_epoch_changed" };
     else if (!record) result = { state: "indeterminate", code: "claim_history_unavailable" };
     else if (record.targetSessionId !== endpoint.sessionId || record.recipientNamespace !== frame.recipientNamespace || !hasRole(endpoint, frame.recipientNamespace, "receive")) result = { state: "stale", code: "stale_reservation" };
-    else if (record.status === "claimed" && record.reservation?.id === frame.reservationId) result = { state: "claimed" };
+    else if (record.status === "claimed" && record.lastReservationId === frame.reservationId) result = { state: "claimed" };
     else if (record.status === "reserved" && record.reservation?.id === frame.reservationId) result = { state: "reserved" };
     else result = { state: "stale", code: "stale_reservation" };
     endpoint.write?.({ type: "opaque_dispatch_v1_claim_status_result", operationId: frame.operationId, brokerEpoch: this.hooks.brokerEpoch, reservationId: frame.reservationId, messageId: frame.messageId, result });

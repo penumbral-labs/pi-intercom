@@ -51,6 +51,22 @@ test("live dispatch offers once, reserves, then claims with ordered receipts", (
   assert.deepEqual(senderFrames.filter((frame) => frame.type === "opaque_dispatch_v1_ack").map((frame) => frame.operationId), ["send-op", "replay-op"]);
   manager.handle(endpoints.get("receiver")!, { type: "opaque_dispatch_v1_claim", operationId: "claim-op", reservationId: offered.reservationId, messageId: offered.messageId });
   assert.equal(receiverFrames.at(-1)?.type, "opaque_dispatch_v1_claim_result");
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_claim_status",
+    operationId: "reconcile-op",
+    recipientNamespace: "receiver/v1",
+    brokerEpoch: "33333333-3333-4333-8333-333333333333",
+    reservationId: offered.reservationId,
+    messageId: offered.messageId,
+  });
+  assert.deepEqual(receiverFrames.at(-1), {
+    type: "opaque_dispatch_v1_claim_status_result",
+    operationId: "reconcile-op",
+    brokerEpoch: "33333333-3333-4333-8333-333333333333",
+    reservationId: offered.reservationId,
+    messageId: offered.messageId,
+    result: { state: "claimed" },
+  });
   assert.deepEqual(senderFrames.filter((frame) => frame.type === "opaque_dispatch_v1_receipt").map((frame) => frame.receipt.status), ["reserved", "claimed"]);
   manager.shutdown();
 });
