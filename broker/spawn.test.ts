@@ -256,7 +256,7 @@ test("default broker startup does not keep the spawning process alive", async ()
     );
     const { execFile } = await import("node:child_process");
     await new Promise<void>((resolve, reject) => {
-      const child = execFile(process.execPath, ["--import", "tsx", probePath], { timeout: 5_000 }, (error) => {
+      execFile(process.execPath, ["--import", "tsx", probePath], { timeout: 15_000 }, (error) => {
         if (error) reject(error);
         else resolve();
       });

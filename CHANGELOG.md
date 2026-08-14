@@ -20,6 +20,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Emit ordinary mailbox `queued`, `expired`, and `cancelled` receipts under a reserved broker identity.
 - Report dead subagent relay dispatches accurately and send busy non-interactive notices only for asks.
 - Classify abandoned asks so explicit cancel/supersede replies are dropped while plain-timeout replies remain visible with an annotation.
+- Keep the broker startup stderr pipe unreferenced and tolerate stderr `EPIPE`, so the spawning session can exit without ending a shared broker.
 
 ### Removed
 - Retired the unused message-control detail field. Pi-intercom still has no detach mechanism.
