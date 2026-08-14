@@ -24,6 +24,12 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ### Removed
 - Retired the unused message-control detail field. Pi-intercom still has no detach mechanism.
 
+## [0.10.1] - 2026-08-12
+
+### Fixed
+- Resolve the default broker `tsx` launcher from flat plugin-store installs when package resolution fails, and include broker stderr when startup exits early. Thanks to Eduardo Marquez (`DocksDocks`) for issue #97.
+- Preserve attachments when replying through `intercom({ action: "reply" })`. Thanks to Ruoshan Huang (`ruoshan`) for issue #99.
+
 ## [0.10.0] - 2026-08-09
 
 ### Added
