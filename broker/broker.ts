@@ -184,6 +184,9 @@ class IntercomBroker {
     } else {
       this.server.listen({ host: LISTEN_TARGET.host, port: LISTEN_TARGET.port }, onListening);
     }
+    process.stderr.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE") throw error;
+    });
     process.on("SIGTERM", () => this.shutdown());
     process.on("SIGINT", () => this.shutdown());
   }

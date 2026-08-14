@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -238,6 +238,39 @@ test("spawnBrokerIfNeeded includes stderr from default broker startup failures",
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("default broker startup does not keep the spawning process alive", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-intercom-spawn-exit-"));
+  const agentDir = path.join(tmpdir(), `pic-${process.pid}-${Date.now()}`);
+  const probePath = path.join(root, "probe.mjs");
+  const spawnModuleUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "spawn.ts")).href;
+
+  try {
+    writeFileSync(
+      probePath,
+      `process.env.PI_CODING_AGENT_DIR = ${JSON.stringify(agentDir)};\n` +
+        `const { spawnBrokerIfNeeded } = await import(${JSON.stringify(spawnModuleUrl)});\n` +
+        `await spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]);\n`,
+    );
+    const { execFile } = await import("node:child_process");
+    await new Promise<void>((resolve, reject) => {
+      const child = execFile(process.execPath, ["--import", "tsx", probePath], { timeout: 5_000 }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  } finally {
+    const pidPath = path.join(agentDir, "intercom", "broker.pid");
+    if (existsSync(pidPath)) {
+      const pid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+      if (Number.isFinite(pid)) {
+        try { process.kill(pid, "SIGTERM"); } catch { /* broker already exited */ }
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
   }
 });
 

@@ -9,7 +9,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Added a scratch dogfood consumer that fsyncs its record before claim without replacing the loaded runtime.
 
 ### Changed
-- Added a pinned strict TypeScript verification gate for the reconciled v0.10 baseline.
+- Added a pinned strict TypeScript verification gate for the reconciled v0.10.1 baseline.
 - Kept the broker protocol at version 1 while negotiating correlated ordinary send/cancel operations additively.
 - Hardened broker framing with capped outbound writes, single-allocation encoding, contained oversized deliveries, and atomic supersede/replacement validation; pending ask indexes now enforce global and per-session bounds during reply retargeting.
 
