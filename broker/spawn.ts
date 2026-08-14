@@ -229,7 +229,6 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
       return cause === undefined ? new Error(errorMessage) : new Error(errorMessage, { cause });
     };
     child.stderr?.on("data", rememberBrokerStderr);
-    child.stderr?.unref();
     child.unref();
 
     await new Promise<void>((resolve, reject) => {
