@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { chmodSync, mkdirSync, readFileSync } from "fs";
 import { isAbsolute, join, resolve } from "path";
 import { homedir } from "os";
@@ -16,6 +17,20 @@ export interface BrokerTcpEndpoint {
 }
 
 export type BrokerConnectTarget = string | BrokerTcpEndpoint;
+
+/**
+ * Disambiguating suffix for the Windows named pipe.
+ *
+ * sanitizePipeSegment collapses every run of non-alphanumerics to a single dash, so distinct
+ * agent directories can sanitize to the same segment ("C:/a/b" and "C:/a-b" both yield "c-a-b")
+ * and would otherwise share one pipe. The hash is taken over the normalized *input string* —
+ * lowercased, separators unified — deliberately not path.resolve(), which would make the result
+ * depend on process.cwd() and break the cross-platform unit tests.
+ */
+function pipeAgentDirHash(agentDir: string): string {
+  const normalized = agentDir.replace(/\\/g, "/").toLowerCase();
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
 
 function sanitizePipeSegment(value: string): string {
   return value
@@ -67,7 +82,7 @@ export function getBrokerSocketPath(
   agentDir: string = getAgentDirPath(),
 ): string {
   if (platform === "win32") {
-    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(agentDir)}`;
+    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(agentDir)}-${pipeAgentDirHash(agentDir)}`;
   }
 
   return join(getIntercomDirPath(agentDir), "broker.sock");

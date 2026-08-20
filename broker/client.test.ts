@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { IntercomClient } from "./client.ts";
+import { IntercomClient, MAX_POISONED_LEGACY_MESSAGE_IDS } from "./client.ts";
 
 test("validated session lifecycle messages reach broker-message subscribers", () => {
   const client = new IntercomClient();
@@ -65,6 +65,62 @@ test("malformed extension broker messages are rejected", () => {
     fromSessionId: "session-2",
     payload: { peerOnly: true },
   }));
+});
+
+test("correlated operation results settle only their exact waiter", () => {
+  const client = new IntercomClient();
+  (client as any)._sessionId = "session-1";
+  const resolved: string[] = [];
+  (client as any).pendingOperations.set("send-operation", {
+    messageId: "shared-message",
+    resolve: () => resolved.push("send"),
+    reject: () => undefined,
+  });
+  (client as any).pendingOperations.set("cancel-operation", {
+    messageId: "shared-message",
+    resolve: () => resolved.push("cancel"),
+    reject: () => undefined,
+  });
+
+  (client as any).handleBrokerMessage({
+    type: "delivered",
+    messageId: "shared-message",
+    operationId: "cancel-operation",
+  });
+
+  assert.deepEqual(resolved, ["cancel"]);
+  assert.equal((client as any).pendingOperations.has("send-operation"), true);
+});
+
+test("late legacy results consume poison instead of settling a later operation", () => {
+  const client = new IntercomClient();
+  (client as any)._sessionId = "session-1";
+  const resolved: string[] = [];
+  (client as any).poisonedLegacyMessageIds.add("shared-message");
+  (client as any).pendingOperations.set("shared-message", {
+    messageId: "shared-message",
+    resolve: () => resolved.push("later"),
+    reject: () => undefined,
+  });
+  (client as any).legacyOperations.set("shared-message", "shared-message");
+
+  (client as any).handleBrokerMessage({ type: "delivered", messageId: "shared-message" });
+
+  assert.deepEqual(resolved, []);
+  assert.equal((client as any).poisonedLegacyMessageIds.has("shared-message"), false);
+  assert.equal((client as any).pendingOperations.has("shared-message"), true);
+});
+
+test("legacy timeout poison is bounded to the newest message IDs", () => {
+  const client = new IntercomClient();
+
+  for (let index = 0; index <= MAX_POISONED_LEGACY_MESSAGE_IDS; index += 1) {
+    (client as any).poisonLegacyMessageId(`message-${index}`);
+  }
+
+  assert.equal((client as any).poisonedLegacyMessageIds.size, MAX_POISONED_LEGACY_MESSAGE_IDS);
+  assert.equal((client as any).poisonedLegacyMessageIds.has("message-0"), false);
+  assert.equal((client as any).poisonedLegacyMessageIds.has(`message-${MAX_POISONED_LEGACY_MESSAGE_IDS}`), true);
 });
 
 test("cancelAsk ignores synchronous socket write failures", () => {

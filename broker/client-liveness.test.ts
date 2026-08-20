@@ -74,6 +74,9 @@ async function registeredClientAgainstFakeSocket(): Promise<{
   const server = net.createServer((serverSide) => {
     serverSide.on("data", (data) => {
       if (!responding) return; // simulate a dead/unresponsive broker: drop everything
+      // This fixture never calls setEncoding, so the socket always emits Buffer chunks.
+      // Narrow explicitly rather than assert: a string chunk would mean the fixture changed.
+      if (!Buffer.isBuffer(data)) return;
       try {
         const len = data.readUInt32BE(0);
         const json = JSON.parse(data.subarray(4, 4 + len).toString("utf-8"));

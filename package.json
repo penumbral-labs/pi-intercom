@@ -13,12 +13,14 @@
     "format-context.ts",
     "project-agent.ts",
     "reply-tracker.ts",
+    "stale-asks.ts",
     "broker/**/*.ts",
     "ui/**/*.ts",
     "skills/**/*"
   ],
   "scripts": {
-    "test": "tsx --test broker/client.test.ts broker/client-liveness.test.ts broker/extension.test.ts broker/framing.test.ts broker/paths.test.ts broker/runtime-claim.test.ts broker/spawn.test.ts config.test.ts cwd.test.ts format-context.test.ts project-agent.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts test/overlay-width.test.ts"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-concurrency=1 broker/ask-edges.test.ts broker/client.test.ts broker/client-liveness.test.ts broker/extension.test.ts broker/opaque-schema.test.ts broker/opaque-client.test.ts broker/opaque-dispatch.test.ts broker/opaque-wire.test.ts broker/framing.test.ts broker/mailbox-observability.test.ts broker/paths.test.ts broker/runtime-claim.test.ts broker/spawn.test.ts config.test.ts cwd.test.ts format-context.test.ts project-agent.test.ts reply-tracker.test.ts stale-asks.test.ts intercom.integration.test.ts test/inline-message.test.ts test/overlay-width.test.ts"
   },
   "keywords": [
     "pi-package"
@@ -44,6 +46,8 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@types/node": "25.6.0",
+    "typebox": "*",
+    "typescript": "5.9.3"
   }
 }

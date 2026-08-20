@@ -150,3 +150,22 @@ test("runtime permission helpers skip chmod on Windows paths", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("getBrokerSocketPath suffixes the Windows pipe with a 16-hex normalized-input hash", () => {
+  const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh/.pi/agent");
+  assert.match(pipePath, /^\\\\\.\\pipe\\pi-intercom-.*-[0-9a-f]{16}$/);
+});
+
+test("getBrokerSocketPath distinguishes agent dirs that sanitize to the same segment", () => {
+  // Both inputs sanitize to "c-a-b", so only the hash separates them.
+  const first = getBrokerSocketPath("win32", "C:/a/b");
+  const second = getBrokerSocketPath("win32", "C:/a-b");
+  assert.match(first, /pi-intercom-c-a-b-[0-9a-f]{16}$/);
+  assert.match(second, /pi-intercom-c-a-b-[0-9a-f]{16}$/);
+  assert.notEqual(first, second);
+});
+
+test("getBrokerSocketPath is deterministic and separator/case insensitive", () => {
+  assert.equal(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:/a/b"));
+  assert.equal(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:\\A\\B"));
+});
