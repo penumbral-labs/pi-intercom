@@ -13,19 +13,19 @@ const senderExtensions: ExtensionCapability[] = [{ namespace: "sender/v1", owner
 const receiverExtensions: ExtensionCapability[] = [{ namespace: "receiver/v1", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }];
 
 function info(id: string): SessionInfo {
-  return { id, cwd: "/test", model: "test", pid: 1, startedAt: 1, lastActivity: 1, trustedLocal: true };
+  return { id, endpointEpoch: `${id}-epoch`, cwd: "/test", model: "test", pid: 1, startedAt: 1, lastActivity: 1, trustedLocal: true };
 }
 
 function harness(receiverConnected = true, timeouts: { activeTtlMs?: number; tombstoneTtlMs?: number; reservationTimeoutMs?: number; claimTimeoutMs?: number } = {}) {
   const senderFrames: OpaqueDispatchBrokerFrame[] = [];
   const receiverFrames: OpaqueDispatchBrokerFrame[] = [];
   const endpoints = new Map<string, OpaqueEndpoint>([
-    ["sender", { sessionId: "sender", info: info("sender"), extensions: senderExtensions, connected: true, write: (frame) => senderFrames.push(frame) }],
-    ["receiver", { sessionId: "receiver", info: info("receiver"), extensions: receiverExtensions, connected: receiverConnected, ...(receiverConnected ? { write: (frame: OpaqueDispatchBrokerFrame) => receiverFrames.push(frame) } : {}) }],
+    ["sender", { sessionId: "sender", endpointEpoch: "sender-epoch", info: info("sender"), extensions: senderExtensions, connected: true, write: (frame) => senderFrames.push(frame) }],
+    ["receiver", { sessionId: "receiver", endpointEpoch: "receiver-epoch", info: info("receiver"), extensions: receiverExtensions, connected: receiverConnected, ...(receiverConnected ? { write: (frame: OpaqueDispatchBrokerFrame) => receiverFrames.push(frame) } : {}) }],
   ]);
   const manager = new OpaqueDispatchManager({ brokerEpoch: "33333333-3333-4333-8333-333333333333", endpoint: (id) => endpoints.get(id), owner: () => undefined, ...timeouts });
   const send = (requestId = "request", operationId = "send-op", payload: unknown = { z: 1, a: true }) => manager.handle(endpoints.get("sender")!, {
-    type: "opaque_dispatch_v1_send", operationId, requestId, senderNamespace: "sender/v1", toSessionId: "receiver", recipientNamespace: "receiver/v1", payload,
+    type: "opaque_dispatch_v1_send", operationId, requestId, senderNamespace: "sender/v1", toSessionId: "receiver", targetEpoch: "receiver-epoch", recipientNamespace: "receiver/v1", payload,
   });
   return { manager, endpoints, senderFrames, receiverFrames, send };
 }
@@ -103,6 +103,25 @@ test("offline exact target queues then redelivers same message id after reconnec
   manager.shutdown();
 });
 
+test("stale endpoint epochs reject opaque dispatch before payload custody", () => {
+  const { manager, endpoints, senderFrames, receiverFrames } = harness();
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_send",
+    operationId: "stale-operation",
+    requestId: "stale-request",
+    senderNamespace: "sender/v1",
+    toSessionId: "receiver",
+    targetEpoch: "superseded-epoch",
+    recipientNamespace: "receiver/v1",
+    payload: { secret: "must-not-be-offered" },
+  });
+  const rejection = senderFrames.find((frame) => frame.type === "opaque_dispatch_v1_rejected");
+  assert.equal(rejection?.type === "opaque_dispatch_v1_rejected" ? rejection.code : undefined, "unknown_exact_target");
+  assert.equal(receiverFrames.length, 0);
+  assert.equal(manager.activeCount, 0);
+  manager.shutdown();
+});
+
 test("reserved supersede ends the old reservation before offering replacement", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send("original", "original-op");
@@ -114,6 +133,7 @@ test("reserved supersede ends the old reservation before offering replacement", 
     requestId: "replacement",
     senderNamespace: "sender/v1",
     toSessionId: "receiver",
+    targetEpoch: "receiver-epoch",
     recipientNamespace: "receiver/v1",
     payload: { replacement: true },
     supersedesMessageId: original.messageId,
@@ -137,6 +157,7 @@ test("claim-first supersede race rejects the replacement", () => {
     requestId: "replacement",
     senderNamespace: "sender/v1",
     toSessionId: "receiver",
+    targetEpoch: "receiver-epoch",
     recipientNamespace: "receiver/v1",
     payload: { replacement: true },
     supersedesMessageId: original.messageId,
@@ -218,7 +239,7 @@ test("foreign reservation mutation is ignored and request conflicts are typed", 
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send();
   const offered = offer(receiverFrames);
-  const foreign: OpaqueEndpoint = { sessionId: "foreign", info: info("foreign"), extensions: receiverExtensions, connected: true, write: () => {} };
+  const foreign: OpaqueEndpoint = { sessionId: "foreign", endpointEpoch: "foreign-epoch", info: info("foreign"), extensions: receiverExtensions, connected: true, write: () => {} };
   manager.handle(foreign, { type: "opaque_dispatch_v1_reservation_result", reservationId: offered.reservationId, messageId: offered.messageId, decision: "reserved" });
   assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_ack"), false);
   send("request", "conflict-op", { changed: true });
@@ -240,6 +261,7 @@ test("repeated accepted claim is idempotent and foreign reconcile reveals no his
   const foreignFrames: OpaqueDispatchBrokerFrame[] = [];
   const foreign: OpaqueEndpoint = {
     sessionId: "foreign",
+    endpointEpoch: "foreign-epoch",
     info: info("foreign"),
     extensions: [{ namespace: "foreign/v1", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }],
     connected: true,
@@ -329,6 +351,7 @@ test("global capacity evicts an old queued record without a stale per-principal 
     const id = `sender-${index}`;
     endpoints.set(id, {
       sessionId: id,
+      endpointEpoch: `${id}-epoch`,
       info: info(id),
       extensions: senderExtensions,
       connected: true,
@@ -337,18 +360,18 @@ test("global capacity evicts an old queued record without a stale per-principal 
   }
   for (let index = 0; index < 9; index += 1) {
     const id = `receiver-${index}`;
-    endpoints.set(id, { sessionId: id, info: info(id), extensions: receiverExtensions, connected: false });
+    endpoints.set(id, { sessionId: id, endpointEpoch: `${id}-epoch`, info: info(id), extensions: receiverExtensions, connected: false });
   }
   const manager = new OpaqueDispatchManager({ brokerEpoch: "33333333-3333-4333-8333-333333333333", endpoint: (id) => endpoints.get(id), owner: () => undefined });
   for (let senderIndex = 0; senderIndex < 8; senderIndex += 1) {
     const origin = endpoints.get(`sender-${senderIndex}`)!;
     for (let recordIndex = 0; recordIndex < 32; recordIndex += 1) {
-      manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: `op-${senderIndex}-${recordIndex}`, requestId: `request-${senderIndex}-${recordIndex}`, senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, recipientNamespace: "receiver/v1", payload: null });
+      manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: `op-${senderIndex}-${recordIndex}`, requestId: `request-${senderIndex}-${recordIndex}`, senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, targetEpoch: `receiver-${senderIndex}-epoch`, recipientNamespace: "receiver/v1", payload: null });
     }
   }
   assert.equal(manager.activeCount, 256);
   const origin = endpoints.get("sender-8")!;
-  manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: "boundary-op", requestId: "boundary-request", senderNamespace: "sender/v1", toSessionId: "receiver-8", recipientNamespace: "receiver/v1", payload: null });
+  manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: "boundary-op", requestId: "boundary-request", senderNamespace: "sender/v1", toSessionId: "receiver-8", targetEpoch: "receiver-8-epoch", recipientNamespace: "receiver/v1", payload: null });
   assert.equal(manager.activeCount, 256);
   assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_ack" && frame.operationId === "boundary-op"), true);
   manager.shutdown();
@@ -361,22 +384,22 @@ test("capped principal cannot evict another principal at global capacity", () =>
     const id = `sender-${index}`;
     const frames: OpaqueDispatchBrokerFrame[] = [];
     senderFrames.set(id, frames);
-    endpoints.set(id, { sessionId: id, info: info(id), extensions: senderExtensions, connected: true, write: (frame) => frames.push(frame) });
-    endpoints.set(`receiver-${index}`, { sessionId: `receiver-${index}`, info: info(`receiver-${index}`), extensions: receiverExtensions, connected: false });
+    endpoints.set(id, { sessionId: id, endpointEpoch: `${id}-epoch`, info: info(id), extensions: senderExtensions, connected: true, write: (frame) => frames.push(frame) });
+    endpoints.set(`receiver-${index}`, { sessionId: `receiver-${index}`, endpointEpoch: `receiver-${index}-epoch`, info: info(`receiver-${index}`), extensions: receiverExtensions, connected: false });
   }
   const manager = new OpaqueDispatchManager({ brokerEpoch: "33333333-3333-4333-8333-333333333333", endpoint: (id) => endpoints.get(id), owner: () => undefined });
   for (let senderIndex = 0; senderIndex < 8; senderIndex += 1) {
     for (let recordIndex = 0; recordIndex < 32; recordIndex += 1) {
       manager.handle(endpoints.get(`sender-${senderIndex}`)!, {
         type: "opaque_dispatch_v1_send", operationId: `op-${senderIndex}-${recordIndex}`, requestId: `request-${senderIndex}-${recordIndex}`,
-        senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, recipientNamespace: "receiver/v1", payload: null,
+        senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, targetEpoch: `receiver-${senderIndex}-epoch`, recipientNamespace: "receiver/v1", payload: null,
       });
     }
   }
   const foreignBefore = senderFrames.get("sender-1")!.length;
   manager.handle(endpoints.get("sender-0")!, {
     type: "opaque_dispatch_v1_send", operationId: "capped-op", requestId: "capped-request", senderNamespace: "sender/v1",
-    toSessionId: "receiver-8", recipientNamespace: "receiver/v1", payload: null,
+    toSessionId: "receiver-8", targetEpoch: "receiver-8-epoch", recipientNamespace: "receiver/v1", payload: null,
   });
   assert.equal(manager.activeCount, 256);
   const rejection = senderFrames.get("sender-0")!.at(-1);

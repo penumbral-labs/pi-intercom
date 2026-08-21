@@ -13,6 +13,7 @@ import {
 } from "./protocol.ts";
 import {
   CORRELATED_OPERATIONS_FEATURE,
+  EXACT_SEND_FEATURE,
   EXTENSION_BUS_FEATURE,
   EXTENSION_STATE_REFRESH_FEATURE,
   OPAQUE_DISPATCH_FEATURE,
@@ -28,6 +29,7 @@ import type {
   OpaqueDispatchBrokerFrame,
   OpaqueDispatchClientFrame,
   OpaqueDispatchReason,
+  DeliveryDetails,
   SessionInfo,
   SessionRegistration,
 } from "../types.ts";
@@ -42,7 +44,7 @@ interface SendOptions {
   retryOf?: string;
 }
 
-interface SendResult {
+export interface SendResult extends DeliveryDetails {
   id: string;
   delivered: boolean;
   reason?: string;
@@ -432,24 +434,45 @@ export class IntercomClient extends EventEmitter {
       }
 
       case "delivered": {
-        const { messageId, operationId } = brokerMessage;
-        if (typeof messageId !== "string" || (operationId !== undefined && typeof operationId !== "string")) {
+        const { messageId, operationId, delivery, retryable, outcomeKnown } = brokerMessage;
+        if (typeof messageId !== "string" || (operationId !== undefined && typeof operationId !== "string")
+          || (delivery !== undefined && delivery !== "socket_delivered" && delivery !== "queued")
+          || (retryable !== undefined && typeof retryable !== "boolean")
+          || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean")) {
           throw new Error("Invalid delivered message");
         }
-        this.settleOperation(messageId, operationId, { id: messageId, delivered: true });
+        this.settleOperation(messageId, operationId, {
+          id: messageId,
+          delivered: true,
+          delivery: (delivery as "socket_delivered" | "queued" | undefined) ?? "socket_delivered",
+          retryable: (retryable as boolean | undefined) ?? false,
+          outcomeKnown: (outcomeKnown as boolean | undefined) ?? true,
+          ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}),
+        });
         break;
       }
 
       case "delivery_failed": {
-        const { messageId, operationId, reason } = brokerMessage;
+        const { messageId, operationId, reason, delivery, retryable, outcomeKnown } = brokerMessage;
         if (
           typeof messageId !== "string"
           || (operationId !== undefined && typeof operationId !== "string")
           || typeof reason !== "string"
+          || (delivery !== undefined && delivery !== "failed" && delivery !== "unknown")
+          || (retryable !== undefined && typeof retryable !== "boolean")
+          || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean")
         ) {
           throw new Error("Invalid delivery_failed message");
         }
-        this.settleOperation(messageId, operationId, { id: messageId, delivered: false, reason });
+        this.settleOperation(messageId, operationId, {
+          id: messageId,
+          delivered: false,
+          reason,
+          delivery: (delivery as "failed" | "unknown" | undefined) ?? "failed",
+          retryable: (retryable as boolean | undefined) ?? false,
+          outcomeKnown: (outcomeKnown as boolean | undefined) ?? true,
+          ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}),
+        });
         break;
       }
 
@@ -798,14 +821,8 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
-  send(to: string, options: SendOptions): Promise<SendResult> {
-    let socket: net.Socket;
-    try {
-      socket = this.requireActiveSocket();
-    } catch (error) {
-      return Promise.reject(toError(error));
-    }
-    
+  async send(to: string, options: SendOptions): Promise<SendResult> {
+    const socket = this.requireActiveSocket();
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
@@ -821,9 +838,38 @@ export class IntercomClient extends EventEmitter {
       },
     };
 
-    return this.runMessageOperation(messageId, "Send", (operationId) => {
-      writeMessage(socket, { type: "send", to, message, ...(operationId ? { operationId } : {}) });
-    });
+    const sendOnce = (target?: { id: string; epoch: string }): Promise<SendResult> => this.runMessageOperation(
+      messageId,
+      "Send",
+      (operationId) => {
+        writeMessage(socket, {
+          type: "send",
+          to,
+          message,
+          ...(operationId ? { operationId } : {}),
+          ...(target ? { targetId: target.id, targetEpoch: target.epoch } : {}),
+        });
+      },
+    );
+
+    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) return sendOnce();
+
+    const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
+      const sessions = await this.listSessions();
+      const byId = sessions.find((session) => session.id === to);
+      const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === to.toLowerCase());
+      const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));
+      const matches = byId ? [byId] : byName.length > 0 ? byName : byPrefix;
+      const target = matches.length === 1 ? matches[0]! : null;
+      return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch } : null;
+    };
+
+    const target = await resolveTarget();
+    if (!target) return sendOnce();
+    const result = await sendOnce(target);
+    if (result.code !== "E_TARGET_REBOUND") return result;
+    const reboundTarget = await resolveTarget();
+    return reboundTarget ? sendOnce(reboundTarget) : result;
   }
 
   cancelMessage(messageId: string): Promise<SendResult> {
@@ -953,7 +999,20 @@ export class IntercomClient extends EventEmitter {
   }
 
   async sendOpaqueDispatch(senderNamespace: string, input: { requestId: string; toSessionId: string; recipientNamespace: string; payload: unknown; supersedesMessageId?: string }) {
-    const result = await this.runOpaqueOperation(senderNamespace, (operationId) => ({ type: "opaque_dispatch_v1_send", operationId, senderNamespace, ...input }));
+    if (!this.supportsFeature(OPAQUE_DISPATCH_FEATURE)) throw new Error("unsupported_broker");
+    const targetEpoch = this.supportsFeature(EXACT_SEND_FEATURE)
+      ? (await this.listSessions()).find((session) => session.id === input.toSessionId)?.endpointEpoch
+      : undefined;
+    if (this.supportsFeature(EXACT_SEND_FEATURE) && !targetEpoch) {
+      return { accepted: false as const, requestId: input.requestId, code: "unknown_exact_target" as const };
+    }
+    const result = await this.runOpaqueOperation(senderNamespace, (operationId) => ({
+      type: "opaque_dispatch_v1_send",
+      operationId,
+      senderNamespace,
+      ...input,
+      ...(targetEpoch ? { targetEpoch } : {}),
+    }));
     if (result.type === "opaque_dispatch_v1_ack") return { accepted: true as const, requestId: result.requestId, messageId: result.messageId, brokerEpoch: result.brokerEpoch, deliveryState: result.deliveryState };
     if (result.type === "opaque_dispatch_v1_rejected") return { accepted: false as const, requestId: result.requestId ?? input.requestId, ...(result.messageId ? { messageId: result.messageId } : {}), code: result.code, ...(result.terminal ? { terminal: result.terminal } : {}) };
     return { accepted: false as const, requestId: input.requestId, code: "invalid_frame" as OpaqueDispatchReason };

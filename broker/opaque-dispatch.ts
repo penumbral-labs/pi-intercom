@@ -22,6 +22,7 @@ const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
 
 export interface OpaqueEndpoint {
   sessionId: string;
+  endpointEpoch?: string;
   info: SessionInfo;
   extensions?: ExtensionCapability[];
   connected: boolean;
@@ -156,8 +157,8 @@ export function canonicalizeOpaquePayload(value: unknown): CanonicalPayloadResul
   }
 }
 
-function fingerprint(payloadJson: string, targetSessionId: string, recipientNamespace: string, supersedesMessageId?: string): string {
-  const envelope = `{"payload":${payloadJson},"recipientNamespace":${JSON.stringify(recipientNamespace)},"supersedesMessageId":${JSON.stringify(supersedesMessageId ?? null)},"toSessionId":${JSON.stringify(targetSessionId)}}`;
+function fingerprint(payloadJson: string, targetSessionId: string, targetEpoch: string, recipientNamespace: string, supersedesMessageId?: string): string {
+  const envelope = `{"payload":${payloadJson},"recipientNamespace":${JSON.stringify(recipientNamespace)},"supersedesMessageId":${JSON.stringify(supersedesMessageId ?? null)},"targetEpoch":${JSON.stringify(targetEpoch)},"toSessionId":${JSON.stringify(targetSessionId)}}`;
   return createHash("sha256").update(envelope).digest("hex");
 }
 
@@ -297,7 +298,7 @@ export class OpaqueDispatchManager {
     const canonical = canonicalizeOpaquePayload(frame.payload);
     if (!canonical.ok) return void reject(canonical.code);
     const key = `${origin.sessionId}\0${frame.senderNamespace}\0${frame.requestId}`;
-    const digest = fingerprint(canonical.json, frame.toSessionId, frame.recipientNamespace, frame.supersedesMessageId);
+    const digest = fingerprint(canonical.json, frame.toSessionId, frame.targetEpoch ?? "", frame.recipientNamespace, frame.supersedesMessageId);
     const existing = this.records.get(key);
     if (existing) {
       if (existing.digest !== digest) return void reject("request_conflict", existing.messageId);
@@ -309,7 +310,7 @@ export class OpaqueDispatchManager {
       return this.replayResult(existing, frame.operationId);
     }
     const target = this.hooks.endpoint(frame.toSessionId);
-    if (!target) return void reject("unknown_exact_target");
+    if (!target || (target.endpointEpoch !== undefined && target.endpointEpoch !== frame.targetEpoch)) return void reject("unknown_exact_target");
     if (!hasRole(target, frame.recipientNamespace, "receive")) return void reject("unsupported_target");
     if (!this.hasCapacity(origin.sessionId, frame.senderNamespace, frame.toSessionId, frame.recipientNamespace)) return void reject("limit_exceeded");
     if (frame.supersedesMessageId) {

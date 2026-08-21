@@ -38,7 +38,7 @@ test("extension state snapshots are discriminated and exact", () => {
 
 test("every opaque client frame validates exact fields and bounds", () => {
   const frames = [
-    { type: "opaque_dispatch_v1_send", operationId: "op", requestId: "request", senderNamespace: "sender/v1", toSessionId: "target", recipientNamespace: "receiver/v1", payload: { hidden: true } },
+    { type: "opaque_dispatch_v1_send", operationId: "op", requestId: "request", senderNamespace: "sender/v1", toSessionId: "target", targetEpoch: "target-epoch", recipientNamespace: "receiver/v1", payload: { hidden: true } },
     { type: "opaque_dispatch_v1_cancel", operationId: "op", senderNamespace: "sender/v1", messageId },
     { type: "opaque_dispatch_v1_reservation_result", reservationId, messageId, decision: "reserved" },
     { type: "opaque_dispatch_v1_claim", operationId: "op", reservationId, messageId },

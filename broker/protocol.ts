@@ -121,6 +121,7 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   if (!isRecord(value)) return false;
   if (typeof value.id !== "string" || typeof value.cwd !== "string" || typeof value.model !== "string"
     || typeof value.pid !== "number" || typeof value.startedAt !== "number" || typeof value.lastActivity !== "number") return false;
+  if (value.endpointEpoch !== undefined && !isBoundedId(value.endpointEpoch)) return false;
   if (value.name !== undefined && typeof value.name !== "string") return false;
   if (value.runtimeFallbackAlias !== undefined && typeof value.runtimeFallbackAlias !== "boolean") return false;
   if (value.status !== undefined && typeof value.status !== "string") return false;
@@ -128,6 +129,7 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   for (const key of ["contextPct", "contextTokens", "contextWindow"] as const) {
     if (value[key] !== undefined && typeof value[key] !== "number") return false;
   }
+  if (value.tmuxPane !== undefined && typeof value.tmuxPane !== "string") return false;
   if (value.opaqueDispatch !== undefined && !isSessionOpaqueCapability(value.opaqueDispatch)) return false;
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
 }
@@ -142,6 +144,7 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     || typeof value.startedAt !== "number" || typeof value.lastActivity !== "number") return false;
   if (value.name !== undefined && typeof value.name !== "string") return false;
   if (value.runtimeFallbackAlias !== undefined && typeof value.runtimeFallbackAlias !== "boolean") return false;
+  if (value.tmuxPane !== undefined && typeof value.tmuxPane !== "string") return false;
   if (value.extensions !== undefined && (!Array.isArray(value.extensions) || !value.extensions.every(isExtensionCapability))) return false;
   return value.status === undefined || typeof value.status === "string";
 }
@@ -199,9 +202,9 @@ export function isOpaqueDispatchClientFrame(value: unknown): value is OpaqueDisp
   if (!isRecord(value) || typeof value.type !== "string") return false;
   switch (value.type) {
     case "opaque_dispatch_v1_send":
-      return hasExactKeys(value, ["type", "operationId", "requestId", "senderNamespace", "toSessionId", "recipientNamespace", "payload"], ["supersedesMessageId"])
+      return hasExactKeys(value, ["type", "operationId", "requestId", "senderNamespace", "toSessionId", "recipientNamespace", "payload"], ["targetEpoch", "supersedesMessageId"])
         && isBoundedId(value.operationId) && isBoundedId(value.requestId) && isNamespace(value.senderNamespace)
-        && isSessionId(value.toSessionId) && isNamespace(value.recipientNamespace)
+        && isSessionId(value.toSessionId) && (value.targetEpoch === undefined || isBoundedId(value.targetEpoch)) && isNamespace(value.recipientNamespace)
         && (value.supersedesMessageId === undefined || isUuid(value.supersedesMessageId));
     case "opaque_dispatch_v1_cancel":
       return hasExactKeys(value, ["type", "operationId", "senderNamespace", "messageId"])

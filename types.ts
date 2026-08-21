@@ -1,11 +1,23 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
+export const EXACT_SEND_FEATURE = "exact-send-v1";
 export const CORRELATED_OPERATIONS_FEATURE = "correlated-operations-v1";
 export const EXTENSION_STATE_REFRESH_FEATURE = "extension-state-refresh-v1";
 export const OPAQUE_DISPATCH_FEATURE = "opaque-dispatch-v1";
 export const BROKER_SESSION_ID = "__pi_intercom_broker__";
 
+export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
+
+export interface DeliveryDetails {
+  delivery: DeliveryState;
+  code?: string;
+  retryable: boolean;
+  outcomeKnown: boolean;
+}
+
 export interface SessionInfo {
   id: string;
+  /** Broker-owned lifetime of this live endpoint. */
+  endpointEpoch?: string;
   name?: string;
   /** True only when the extension synthesized name for an unnamed runtime. */
   runtimeFallbackAlias?: boolean;
@@ -25,6 +37,8 @@ export interface SessionInfo {
   contextPct?: number;
   contextTokens?: number;
   contextWindow?: number;
+  /** tmux pane id (e.g. "%212") of the session's terminal. */
+  tmuxPane?: string;
   opaqueDispatch?: SessionOpaqueCapability;
 }
 
@@ -93,7 +107,7 @@ export type ExtensionStateSnapshot =
   | { namespace: string; revision: 0; present: false }
   | { namespace: string; revision: number; present: true; payload: unknown };
 
-export type SessionRegistration = Omit<SessionInfo, "id" | "peerUid" | "trustedLocal"> & {
+export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal"> & {
   extensions?: ExtensionCapability[];
 };
 
@@ -102,7 +116,7 @@ export type ClientMessage =
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
-  | { type: "send"; to: string; message: Message; operationId?: string }
+  | { type: "send"; to: string; message: Message; operationId?: string; targetId?: string; targetEpoch?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string; operationId?: string }
   | { type: "cancel_ask"; messageId: string }
@@ -133,8 +147,8 @@ export type BrokerMessage =
   | { type: "session_joined"; session: SessionInfo }
   | { type: "session_left"; sessionId: string }
   | { type: "error"; error: string }
-  | { type: "delivered"; messageId: string; operationId?: string }
-  | { type: "delivery_failed"; messageId: string; operationId?: string; reason: string }
+  | ({ type: "delivered"; messageId: string; operationId?: string } & Partial<DeliveryDetails>)
+  | ({ type: "delivery_failed"; messageId: string; operationId?: string; reason: string } & Partial<DeliveryDetails>)
   | { type: "message_receipt"; from: SessionInfo; receipt: MessageReceipt }
   | { type: "message_control"; from: SessionInfo; control: MessageControl }
   | { type: "extension_owner"; namespace: string; ownerId?: string; ownerEpoch?: string }
@@ -197,7 +211,7 @@ export interface OpaqueDispatchReceipt {
 }
 
 export type OpaqueDispatchClientFrame =
-  | { type: "opaque_dispatch_v1_send"; operationId: string; requestId: string; senderNamespace: string; toSessionId: string; recipientNamespace: string; payload: unknown; supersedesMessageId?: string }
+  | { type: "opaque_dispatch_v1_send"; operationId: string; requestId: string; senderNamespace: string; toSessionId: string; targetEpoch?: string; recipientNamespace: string; payload: unknown; supersedesMessageId?: string }
   | { type: "opaque_dispatch_v1_cancel"; operationId: string; senderNamespace: string; messageId: string }
   | { type: "opaque_dispatch_v1_reservation_result"; reservationId: string; messageId: string; decision: "reserved" | "refused" | "failed_closed"; reason?: OpaqueDispatchReason }
   | { type: "opaque_dispatch_v1_claim"; operationId: string; reservationId: string; messageId: string }

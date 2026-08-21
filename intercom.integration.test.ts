@@ -369,6 +369,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
       features: [
         "extension-bus-v1",
         "correlated-operations-v1",
+        "exact-send-v1",
         "extension-state-refresh-v1",
         "opaque-dispatch-v1",
       ],
@@ -624,6 +625,179 @@ test("broker rejects unknown replyTo values instead of delivering forged replies
   }
 });
 
+test("broker rotates endpoint epochs and replays same message ids without duplicate delivery", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const replacement = new IntercomClient();
+  const received: Message[] = [];
+  orchestrator.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+
+  try {
+    const firstEndpoint = await waitForSessionByName(planner, "orchestrator");
+    assert.equal(typeof firstEndpoint.endpointEpoch, "string");
+
+    const messageId = "endpoint-epoch-replay";
+    const first = await planner.send(orchestrator.sessionId!, { text: "deliver once", messageId });
+    const replay = await planner.send(orchestrator.sessionId!, { text: "deliver once", messageId });
+    assert.deepEqual([first.delivery, replay.delivery], ["socket_delivered", "socket_delivered"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(received.filter((message) => message.id === messageId).length, 1);
+
+    await replacement.connect({
+      name: "orchestrator-replacement",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, orchestrator.sessionId!);
+    const replacedEndpoint = await waitForSessionId(planner, orchestrator.sessionId!);
+    assert.notEqual(replacedEndpoint.endpointEpoch, firstEndpoint.endpointEpoch);
+  } finally {
+    await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("delivery records keep colon-containing sender and message IDs distinct", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const first = new IntercomClient();
+  const second = new IntercomClient();
+  const received: Message[] = [];
+  orchestrator.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+
+  try {
+    await first.connect({ name: "record-key-first", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "a:b");
+    await second.connect({ name: "record-key-second", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "a");
+
+    assert.equal((await first.send(orchestrator.sessionId!, { messageId: "c", text: "same fingerprint" })).delivered, true);
+    assert.equal((await second.send(orchestrator.sessionId!, { messageId: "b:c", text: "same fingerprint" })).delivered, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(received.map((message) => message.id).sort(), ["b:c", "c"]);
+  } finally {
+    await first.disconnect().catch(() => undefined);
+    await second.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("client re-resolves a rebound exact target once with the same message id", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const replacement = new IntercomClient();
+  const replacementReceived = once(replacement, "message") as Promise<[SessionInfo, Message]>;
+  const listSessions = planner.listSessions.bind(planner);
+  let listCalls = 0;
+
+  try {
+    (planner as unknown as { listSessions: () => Promise<SessionInfo[]> }).listSessions = async () => {
+      const sessions = await listSessions();
+      listCalls += 1;
+      if (listCalls === 1) {
+        await replacement.connect({
+          name: "orchestrator-replacement",
+          cwd: repoDir,
+          model: "test-model",
+          pid: process.pid,
+          startedAt: Date.now(),
+          lastActivity: Date.now(),
+        }, orchestrator.sessionId!);
+      }
+      return sessions;
+    };
+
+    const result = await planner.send(orchestrator.sessionId!, { text: "retry after rebound", messageId: "endpoint-rebound-retry" });
+    assert.equal(result.delivered, true);
+    assert.equal(result.delivery, "socket_delivered");
+    const [, message] = await replacementReceived;
+    assert.equal(message.id, "endpoint-rebound-retry");
+    assert.equal(listCalls, 2);
+  } finally {
+    await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broker rejects malformed exact target fields instead of falling back to name routing", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("malformed-exact-sender", "malformed-exact-sender");
+  const { createMessageReader } = await import("./broker/framing.ts");
+
+  try {
+    const delivery = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const reader = createMessageReader((received) => {
+        if (typeof received === "object" && received !== null && "type" in received && received.type === "delivery_failed") {
+          raw.socket.off("data", reader);
+          resolve(received as Record<string, unknown>);
+        }
+      }, reject);
+      raw.socket.on("data", reader);
+    });
+    raw.writeMessage(raw.socket, {
+      type: "send",
+      to: orchestrator.sessionId,
+      targetId: "",
+      targetEpoch: "",
+      message: {
+        id: "malformed-exact-target",
+        timestamp: Date.now(),
+        content: { text: "must not reach orchestrator" },
+      },
+    });
+    const result = await delivery;
+    assert.equal(result.code, "E_INVALID_TARGET");
+  } finally {
+    raw.socket.destroy();
+    await cleanup();
+  }
+});
+
+test("broker rejects changed message content after a rebound exact-target failure", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("rebound-reuse-sender", "rebound-reuse-sender");
+  const replacement = new IntercomClient();
+  const { createMessageReader } = await import("./broker/framing.ts");
+
+  try {
+    const targetId = orchestrator.sessionId!;
+    const oldTarget = await waitForSessionId(planner, targetId);
+    await replacement.connect({
+      name: "rebound-reuse-replacement",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, targetId);
+    const receiveDelivery = () => new Promise<Record<string, unknown>>((resolve, reject) => {
+      const reader = createMessageReader((received) => {
+        if (typeof received === "object" && received !== null && "type" in received && (received.type === "delivered" || received.type === "delivery_failed")) {
+          raw.socket.off("data", reader);
+          resolve(received as Record<string, unknown>);
+        }
+      }, reject);
+      raw.socket.on("data", reader);
+    });
+    const send = (text: string) => raw.writeMessage(raw.socket, {
+      type: "send",
+      to: targetId,
+      targetId,
+      targetEpoch: oldTarget.endpointEpoch,
+      message: { id: "rebound-id-reuse", timestamp: Date.now(), content: { text } },
+    });
+
+    const firstDelivery = receiveDelivery();
+    send("first content");
+    assert.equal((await firstDelivery).code, "E_TARGET_REBOUND");
+    const secondDelivery = receiveDelivery();
+    send("changed content");
+    assert.equal((await secondDelivery).code, "E_MESSAGE_ID_REUSE");
+  } finally {
+    raw.socket.destroy();
+    await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+
 test("broker disconnects a connection that exceeds the local rate limit", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const raw = await connectRawRegistered("rate-limit-worker-id", "rate-limit-worker");
@@ -631,7 +805,7 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
   try {
     raw.socket.on("error", () => undefined);
     const closed = once(raw.socket, "close");
-    for (let i = 0; i < 300; i += 1) {
+    for (let i = 0; i < 600; i += 1) {
       raw.writeMessage(raw.socket, { type: "list", requestId: `flood-${i}` });
     }
     await closed;
@@ -1549,7 +1723,7 @@ test("duplicate inbound message IDs inject once with visible delivery metadata",
 
     try {
       assert.equal((await planner.send(worker.id, { messageId: "duplicate-inbound", text: "First copy" })).delivered, true);
-      assert.equal((await planner.send(worker.id, { messageId: "duplicate-inbound", text: "Second copy" })).delivered, true);
+      assert.equal((await planner.send(worker.id, { messageId: "duplicate-inbound", text: "First copy" })).delivered, true);
       await new Promise((resolve) => setTimeout(resolve, 100));
     } finally {
       unsubscribeReceipts();
@@ -1559,7 +1733,7 @@ test("duplicate inbound message IDs inject once with visible delivery metadata",
     assert.ok(receipts.includes("receiver_received"));
     assert.ok(receipts.includes("acknowledged:accepted by receiver"));
     assert.ok(receipts.includes("injected"));
-    assert.ok(receipts.includes("acknowledged:duplicate message id suppressed"));
+    assert.equal(receipts.includes("acknowledged:duplicate message id suppressed"), false);
     const sent = harness.sentMessages[0]!;
     assert.match(sent.message.content ?? "", /id duplicate-inbound/);
     assert.match(sent.message.content ?? "", /seq 1/);
