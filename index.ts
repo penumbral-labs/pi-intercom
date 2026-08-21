@@ -801,15 +801,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       async listSessions() {
         const activeClient = client;
         if (!current() || !activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        return activeClient.listSessions();
+        const sessions = await activeClient.listSessions();
+        if (!current()) throw new Error(`Extension channel ${namespace} is disposed`);
+        return sessions;
       },
       async peerCapability(sessionId, recipientNamespace) {
         const activeClient = client;
         if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
           return { state: "unknown" as const };
         }
-        try { return await activeClient.peerCapability(sessionId, recipientNamespace); }
-        catch { return { state: "unknown" as const }; }
+        try {
+          const result = await activeClient.peerCapability(sessionId, recipientNamespace);
+          return current() ? result : { state: "unknown" as const };
+        } catch { return { state: "unknown" as const }; }
       },
       async sendOpaqueDispatch(input) {
         const activeClient = client;
@@ -819,6 +823,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         try {
           const result = await activeClient.sendOpaqueDispatch(namespace, input);
           const extension = localExtensions.get(namespace);
+          if (!current()) {
+            return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+          }
           if (result.accepted && extension?.generation === generation) {
             extension.acceptedDispatches.set(result.messageId, {
               requestId: result.requestId,
@@ -836,16 +843,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
           return { cancelled: false as const, code: "unsupported_broker" as const };
         }
-        try { return await activeClient.cancelOpaqueDispatch(namespace, messageId); }
-        catch (error) { return { cancelled: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
+        try {
+          const result = await activeClient.cancelOpaqueDispatch(namespace, messageId);
+          return current() ? result : { cancelled: false as const, code: "connection_lost" as const };
+        } catch (error) { return { cancelled: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
       },
       async reconcileClaim(input) {
         const activeClient = client;
         if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
           return { state: "indeterminate" as const, code: "claim_history_unavailable" as const };
         }
-        try { return await activeClient.reconcileOpaqueClaim(namespace, input); }
-        catch { return { state: "indeterminate" as const, code: "claim_history_unavailable" as const }; }
+        try {
+          const result = await activeClient.reconcileOpaqueClaim(namespace, input);
+          return current() ? result : { state: "indeterminate" as const, code: "claim_history_unavailable" as const };
+        } catch { return { state: "indeterminate" as const, code: "claim_history_unavailable" as const }; }
       },
       dispose() {
         if (!current()) return;
