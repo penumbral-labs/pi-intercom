@@ -22,9 +22,12 @@ This skill covers how to handle those orchestrator-side escalations.
 Opaque consumers require registry-ready v2 and `opaque-dispatch-v1` version 1. Reserve synchronously, persist and fsync the
 broker epoch, endpoint epoch, message/reservation IDs, and payload, then claim. Reconcile only against the same broker and
 endpoint epochs. Inject only after accepted claim; never convert opaque work to an ordinary message or automatically resend
-an indeterminate outcome. Treat `mailbox_queued` as accepted transport custody: a same-epoch reconnect can resume delivery,
-but endpoint replacement fails closed with `endpoint_epoch_changed`. Senders may retry one `target_rebound` after resolving
-the new epoch with the same request ID. There is no confirmation or detach path.
+an indeterminate outcome. Treat `mailbox_queued` as temporary disconnected custody only: every reconnect rotates the
+endpoint epoch, produces a terminal `endpoint_epoch_changed` receipt, and never offers the queued payload. Senders may retry
+one admission-time `target_rebound` after resolving the new epoch with the same request ID. After a terminal endpoint
+rotation, use a new request ID for work intended for the replacement endpoint; the old ID replays its terminal result.
+Receipt acknowledgements are cumulative by sequence, and reconnect replay includes only unacknowledged receipts. There is no
+confirmation or detach path.
 
 ## When to Use
 

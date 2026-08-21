@@ -39,6 +39,33 @@ function legacyRegistration(name: string): SessionRegistration {
   };
 }
 
+async function connectRawOpaque(sessionId: string, namespace: string, role: "send" | "receive") {
+  const socket = net.connect({ path: getBrokerSocketPath(), allowHalfOpen: true });
+  const frames: Record<string, unknown>[] = [];
+  socket.on("error", () => undefined);
+  socket.on("data", createMessageReader((frame) => {
+    if (typeof frame === "object" && frame !== null) frames.push(frame as Record<string, unknown>);
+  }, (error) => socket.destroy(error)));
+  await once(socket, "connect");
+  writeMessage(socket, { type: "register", sessionId, session: registration(sessionId, namespace, role) });
+  const registered = await waitForRawFrame(frames, (frame) => frame.type === "registered");
+  return { socket, frames, endpointEpoch: registered.endpointEpoch as string };
+}
+
+async function waitForRawFrame(
+  frames: Record<string, unknown>[],
+  predicate: (frame: Record<string, unknown>) => boolean,
+  timeoutMs = 2_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const frame = frames.find(predicate);
+    if (frame) return frame;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`raw opaque frame timeout: ${JSON.stringify(frames)}`);
+}
+
 async function waitForBrokerReady(broker: ChildProcess): Promise<void> {
   const stdout = broker.stdout;
   if (!stdout) throw new Error("Broker stdout unavailable");
@@ -202,6 +229,85 @@ test("v0.10-style client remains ordinary-wire compatible with the new broker", 
     } finally {
       socket.destroy();
     }
+  });
+});
+
+test("retired origin socket cannot send as its replacement", { concurrency: false }, async () => {
+  await withWireClients(async (_sender, receiver) => {
+    const original = await connectRawOpaque("stale-send-origin", senderNamespace, "send");
+    const replacement = await connectRawOpaque("stale-send-origin", senderNamespace, "send");
+    let staleOffers = 0;
+    const stop = receiver.onOpaqueDispatch((frame) => { if (frame.type === "opaque_dispatch_v1_offer") staleOffers += 1; });
+    writeMessage(original.socket, {
+      type: "opaque_dispatch_v1_send", operationId: "stale-send", requestId: "stale-request",
+      senderNamespace, toSessionId: "wire-receiver", targetEpoch: receiver.endpointEpoch,
+      recipientNamespace: receiverNamespace, payload: { stale: true },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    stop();
+    assert.equal(replacement.frames.some((frame) => frame.operationId === "stale-send"), false);
+    assert.equal(staleOffers, 0);
+    original.socket.destroy();
+    replacement.socket.destroy();
+  });
+});
+
+test("retired origin socket cannot cancel its replacement's dispatch", { concurrency: false }, async () => {
+  await withWireClients(async (_sender, receiver) => {
+    const original = await connectRawOpaque("stale-cancel-origin", senderNamespace, "send");
+    const offered = nextOffer(receiver);
+    writeMessage(original.socket, {
+      type: "opaque_dispatch_v1_send", operationId: "original-send", requestId: "original-request",
+      senderNamespace, toSessionId: "wire-receiver", targetEpoch: receiver.endpointEpoch,
+      recipientNamespace: receiverNamespace, payload: { original: true },
+    });
+    const opaqueOffer = await offered;
+    receiver.sendOpaqueReservationResult(opaqueOffer.messageId, opaqueOffer.reservationId, "reserved");
+    await waitForRawFrame(original.frames, (frame) => frame.type === "opaque_dispatch_v1_ack");
+    const replacement = await connectRawOpaque("stale-cancel-origin", senderNamespace, "send");
+    writeMessage(original.socket, {
+      type: "opaque_dispatch_v1_cancel", operationId: "stale-cancel", senderNamespace, messageId: opaqueOffer.messageId,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    writeMessage(replacement.socket, {
+      type: "opaque_dispatch_v1_cancel", operationId: "live-cancel", senderNamespace, messageId: opaqueOffer.messageId,
+    });
+    const result = await waitForRawFrame(replacement.frames, (frame) => frame.operationId === "live-cancel");
+    assert.equal(result.cancelled, true);
+    original.socket.destroy();
+    replacement.socket.destroy();
+  });
+});
+
+test("rate-limited retired origin socket cannot acknowledge replacement receipts", { concurrency: false }, async () => {
+  await withWireClients(async (_sender, receiver) => {
+    const original = await connectRawOpaque("stale-ack-origin", senderNamespace, "send");
+    const offered = nextOffer(receiver);
+    writeMessage(original.socket, {
+      type: "opaque_dispatch_v1_send", operationId: "original-send", requestId: "original-request",
+      senderNamespace, toSessionId: "wire-receiver", targetEpoch: receiver.endpointEpoch,
+      recipientNamespace: receiverNamespace, payload: { original: true },
+    });
+    const opaqueOffer = await offered;
+    receiver.sendOpaqueReservationResult(opaqueOffer.messageId, opaqueOffer.reservationId, "reserved");
+    await waitForRawFrame(original.frames, (frame) => frame.type === "opaque_dispatch_v1_receipt");
+    for (let index = 0; index < 59; index += 1) writeMessage(original.socket, {
+      type: "opaque_dispatch_v1_receipt_ack", senderNamespace,
+      messageId: `00000000-0000-4000-8000-${index.toString().padStart(12, "0")}`, sequence: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const replacement = await connectRawOpaque("stale-ack-origin", senderNamespace, "send");
+    await waitForRawFrame(replacement.frames, (frame) => frame.type === "opaque_dispatch_v1_receipt");
+    writeMessage(original.socket, {
+      type: "opaque_dispatch_v1_receipt_ack", senderNamespace, messageId: opaqueOffer.messageId, sequence: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const nextReplacement = await connectRawOpaque("stale-ack-origin", senderNamespace, "send");
+    const replay = await waitForRawFrame(nextReplacement.frames, (frame) => frame.type === "opaque_dispatch_v1_receipt");
+    assert.equal((replay.receipt as { messageId: string }).messageId, opaqueOffer.messageId);
+    original.socket.destroy();
+    nextReplacement.socket.destroy();
+    replacement.socket.destroy();
   });
 });
 

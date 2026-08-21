@@ -228,9 +228,8 @@ export class OpaqueDispatchManager {
   endpointAvailable(sessionId: string): void {
     const endpoint = this.hooks.endpoint(sessionId);
     for (const record of this.records.values()) {
-      if (record.status === "queued" && record.targetSessionId === sessionId) {
-        if (endpoint?.endpointEpoch !== record.targetEpoch) this.terminalize(record, "failed_closed", "endpoint_epoch_changed");
-        else this.offer(record);
+      if (record.status === "queued" && record.targetSessionId === sessionId && endpoint?.connected) {
+        this.terminalize(record, "failed_closed", "endpoint_epoch_changed");
       }
       if (record.originSessionId === sessionId) this.replayReceipts(record);
     }
@@ -259,10 +258,7 @@ export class OpaqueDispatchManager {
       if (record.originSessionId === sessionId) this.replayReceipts(record);
       if (record.targetSessionId !== sessionId) continue;
       const endpoint = this.hooks.endpoint(sessionId);
-      if (hasRole(endpoint, record.recipientNamespace, "receive")) {
-        if (record.status === "queued") this.offer(record);
-        continue;
-      }
+      if (hasRole(endpoint, record.recipientNamespace, "receive")) continue;
       if (record.status === "offered" || record.status === "reserved") pendingInvalidation.push(record);
     }
     if (pendingInvalidation.length === 0) return;
@@ -318,14 +314,17 @@ export class OpaqueDispatchManager {
     if (!target) return void reject("unknown_exact_target");
     if (target.endpointEpoch !== frame.targetEpoch) return void reject("target_rebound");
     if (!hasRole(target, frame.recipientNamespace, "receive")) return void reject("unsupported_target");
-    if (!this.hasCapacity(origin.sessionId, frame.senderNamespace, frame.toSessionId, frame.recipientNamespace)) return void reject("limit_exceeded");
+    let prior: RecordState | undefined;
     if (frame.supersedesMessageId) {
-      const prior = this.byMessageId.get(frame.supersedesMessageId);
+      prior = this.byMessageId.get(frame.supersedesMessageId);
       if (!prior || prior.originSessionId !== origin.sessionId || prior.senderNamespace !== frame.senderNamespace
         || prior.targetSessionId !== frame.toSessionId || prior.recipientNamespace !== frame.recipientNamespace) return void reject("not_origin");
       if (prior.status === "queued") return void reject("queued_supersede_unsupported");
       if (prior.status === "claimed") return void reject("already_claimed");
       if (prior.status === "terminal") return void reject("already_terminal");
+    }
+    if (!this.hasCapacity(origin.sessionId, frame.senderNamespace, frame.toSessionId, frame.recipientNamespace, prior)) return void reject("limit_exceeded");
+    if (prior) {
       this.endReservation(prior, "superseded");
       this.terminalize(prior, "superseded");
     }
@@ -348,15 +347,15 @@ export class OpaqueDispatchManager {
     }
   }
 
-  private hasCapacity(originId: string, senderNamespace: string, targetId: string, recipientNamespace: string): boolean {
-    let active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed");
+  private hasCapacity(originId: string, senderNamespace: string, targetId: string, recipientNamespace: string, replacing?: RecordState): boolean {
+    let active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed" && record !== replacing);
     if (active.filter((record) => principalKey(record.originSessionId, record.senderNamespace) === principalKey(originId, senderNamespace)).length >= MAX_OPAQUE_PRINCIPAL_RECORDS) return false;
     if (active.filter((record) => targetKey(record.targetSessionId, record.recipientNamespace) === targetKey(targetId, recipientNamespace)).length >= MAX_OPAQUE_TARGET_RECORDS) return false;
     if (active.length >= MAX_OPAQUE_ACTIVE_RECORDS) {
       const oldestQueued = active.filter((record) => record.status === "queued").sort((a, b) => a.createdAt - b.createdAt)[0];
       if (!oldestQueued) return false;
       this.terminalize(oldestQueued, "expired", "limit_exceeded");
-      active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed");
+      active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed" && record !== replacing);
     }
     return active.length < MAX_OPAQUE_ACTIVE_RECORDS;
   }

@@ -1,4 +1,8 @@
-import type { SessionInfo } from "./types.ts";
+import type {
+  OpaqueDispatchReason as ProtocolOpaqueDispatchReason,
+  OpaqueDispatchStatus as ProtocolOpaqueDispatchStatus,
+  SessionInfo,
+} from "./types.ts";
 
 export const INTERCOM_EXTENSION_REGISTER_EVENT = "intercom:extension-register";
 export const INTERCOM_EXTENSION_REGISTRY_READY_EVENT = "intercom:extension-registry-ready";
@@ -22,21 +26,8 @@ export type ExtensionStateRefreshResult =
   | { ok: false; code: "unsupported_broker" | "connection_lost" };
 
 export type OpaqueDispatchRole = "send" | "receive";
-export type OpaqueDispatchStatus =
-  | "queued" | "reserved" | "claimed" | "refused"
-  | "expired" | "cancelled" | "superseded" | "failed_closed";
-export type OpaqueDispatchReason =
-  | "unsupported_host" | "unsupported_broker" | "unsupported_target"
-  | "unknown_exact_target" | "self_dispatch_unsupported" | "invalid_request"
-  | "invalid_frame" | "request_conflict" | "limit_exceeded" | "rate_limited"
-  | "broker_epoch_changed" | "target_rebound" | "endpoint_epoch_changed" | "claim_history_unavailable"
-  | "payload_too_large" | "consumer_missing" | "consumer_unloaded"
-  | "consumer_refused" | "consumer_threw" | "consumer_failed"
-  | "reservation_timeout" | "claim_timeout" | "malformed_consumer_result"
-  | "stale_reservation" | "receiver_disconnected" | "capability_invalidated"
-  | "queued_supersede_unsupported" | "already_claimed" | "already_terminal"
-  | "not_origin" | "attempt_limit" | "history_limit" | "connection_lost"
-  | "uncorrelated_operation_pending";
+export type OpaqueDispatchStatus = ProtocolOpaqueDispatchStatus;
+export type OpaqueDispatchReason = ProtocolOpaqueDispatchReason;
 
 export interface OpaqueDispatchSender {
   sessionId: string;

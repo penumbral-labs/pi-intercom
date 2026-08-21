@@ -176,22 +176,21 @@ export type BrokerMessage =
   | { type: "extension_state_snapshot"; requestId: string; snapshot: ExtensionStateSnapshot }
   | OpaqueDispatchBrokerFrame;
 
-export type OpaqueDispatchStatus =
-  | "queued" | "reserved" | "claimed" | "refused"
-  | "expired" | "cancelled" | "superseded" | "failed_closed";
+export const OPAQUE_DISPATCH_STATUSES = [
+  "queued", "reserved", "claimed", "refused", "expired", "cancelled", "superseded", "failed_closed",
+] as const;
+export type OpaqueDispatchStatus = typeof OPAQUE_DISPATCH_STATUSES[number];
 
-export type OpaqueDispatchReason =
-  | "unsupported_host" | "unsupported_broker" | "unsupported_target"
-  | "unknown_exact_target" | "self_dispatch_unsupported" | "invalid_request"
-  | "invalid_frame" | "request_conflict" | "limit_exceeded" | "rate_limited"
-  | "broker_epoch_changed" | "target_rebound" | "endpoint_epoch_changed" | "claim_history_unavailable"
-  | "payload_too_large" | "consumer_missing" | "consumer_unloaded"
-  | "consumer_refused" | "consumer_threw" | "consumer_failed"
-  | "reservation_timeout" | "claim_timeout" | "malformed_consumer_result"
-  | "stale_reservation" | "receiver_disconnected" | "capability_invalidated"
-  | "queued_supersede_unsupported" | "already_claimed" | "already_terminal"
-  | "not_origin" | "attempt_limit" | "history_limit" | "connection_lost"
-  | "uncorrelated_operation_pending";
+export const OPAQUE_DISPATCH_REASONS = [
+  "unsupported_host", "unsupported_broker", "unsupported_target", "unknown_exact_target", "self_dispatch_unsupported",
+  "invalid_request", "invalid_frame", "request_conflict", "limit_exceeded", "rate_limited", "broker_epoch_changed",
+  "target_rebound", "endpoint_epoch_changed", "claim_history_unavailable", "payload_too_large", "consumer_missing",
+  "consumer_unloaded", "consumer_refused", "consumer_threw", "consumer_failed", "reservation_timeout", "claim_timeout",
+  "malformed_consumer_result", "stale_reservation", "receiver_disconnected", "capability_invalidated",
+  "queued_supersede_unsupported", "already_claimed", "already_terminal", "not_origin", "attempt_limit", "history_limit",
+  "connection_lost", "uncorrelated_operation_pending",
+] as const;
+export type OpaqueDispatchReason = typeof OPAQUE_DISPATCH_REASONS[number];
 
 export interface OpaqueDispatchSender {
   sessionId: string;

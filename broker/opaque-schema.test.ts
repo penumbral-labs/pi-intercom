@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { OPAQUE_DISPATCH_REASONS, OPAQUE_DISPATCH_STATUSES } from "../types.ts";
 import {
   isExtensionCapability,
   isExtensionStateSnapshot,
   isOpaqueDispatchBrokerFrame,
   isOpaqueDispatchClientFrame,
+  isOpaqueDispatchReason,
 } from "./protocol.ts";
 
 const messageId = "11111111-1111-4111-8111-111111111111";
@@ -56,6 +58,12 @@ test("every opaque client frame validates exact fields and bounds", () => {
   assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "failed_closed", reason: "consumer_unloaded" }), true);
   assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "reserved", reason: "consumer_failed" }), false);
   assert.equal(isOpaqueDispatchClientFrame({ ...frames[2], decision: "refused", reason: "broker_epoch_changed" }), false);
+});
+
+test("runtime opaque reason vocabulary accepts every declared reason", () => {
+  for (const reason of OPAQUE_DISPATCH_REASONS) assert.equal(isOpaqueDispatchReason(reason), true, reason);
+  assert.equal(new Set(OPAQUE_DISPATCH_REASONS).size, OPAQUE_DISPATCH_REASONS.length);
+  assert.equal(new Set(OPAQUE_DISPATCH_STATUSES).size, OPAQUE_DISPATCH_STATUSES.length);
 });
 
 test("every opaque broker frame validates exact fields and bounds", () => {

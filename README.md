@@ -483,18 +483,24 @@ Registry-ready v2 advertises `opaque-dispatch-v1` and `extension-state-refresh-v
 no ordinary name/prefix/cwd/mailbox fallback and no confirmation dialog.
 
 Each accepted record, offer, reservation, and claim is bound to the broker-owned endpoint epoch returned by peer capability
-lookup. Senders re-resolve one admission-time `target_rebound` using the same request ID; the idempotency digest excludes the
-epoch, so retries cannot be trapped as request conflicts. Offline peers retain their last endpoint epoch, allowing temporary
-disconnect queueing; reconnecting with that epoch can receive queued work, while replacement with a new epoch fails closed
-with `endpoint_epoch_changed` and never re-offers custody.
+lookup. Senders re-resolve one admission-time `target_rebound` using the same request ID. A request ID identifies one logical
+send: identical retries replay its original acknowledgement or terminal result, while changed content is a
+`request_conflict`. Every registration mints a new endpoint epoch. Disconnected-target custody therefore reports
+`mailbox_queued` and a `queued` receipt only until the target reconnects, then deterministically fails closed with an
+`endpoint_epoch_changed` receipt without offering the payload. After that terminal rotation result, the sender must use a
+new request ID to create work for the replacement endpoint; reusing the old ID replays the old terminal result for the
+one-hour tombstone lifetime.
 
 Consumers must persist and fsync the broker epoch, endpoint epoch, message ID, reservation ID, and payload before calling
 `claim()`. The registered and offer contracts expose the consumer's endpoint epoch. Only an accepted claim result authorizes
 consumer-owned model injection. Claim reconciliation is allowed only when the persisted broker and endpoint epochs match the
 retained reservation; epoch/history loss is indeterminate and never automatically injects or resends. Active records live 24
 hours; terminal replay lives one hour. Attempts are capped at 8, receipts at 20, active records at 256 globally and 32 per
-sender/target namespace, and tombstones at 512 globally and 64 per sender/target namespace. Pending operations are capped at
-256 globally and 32 per namespace. Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
+sender/target namespace, and tombstones at 512 globally and 64 per sender/target namespace. At the global active-record cap,
+a newly admitted principal may evict the oldest queued record, including one owned by another principal; that record receives
+an `expired` receipt with `limit_exceeded`. Pending operations are capped at 256 globally and 32 per namespace. Receipt
+acknowledgements are cumulative per message sequence, and only unacknowledged receipts replay when an origin reconnects.
+Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
 extension events, or model context. This local same-user transport is not remote authorization and provides no detach.
 
 `refreshState()` returns `ExtensionStateRefreshResult` rather than a bare snapshot: successful results carry

@@ -89,34 +89,48 @@ test("synchronous offer write failure terminalizes instead of stranding capacity
   manager.shutdown();
 });
 
-test("offline exact target queues then redelivers same message id after reconnect", () => {
+test("offline custody reports queued before failing closed on reconnect", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness(false);
   send();
   const ack = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_ack" }> => frame.type === "opaque_dispatch_v1_ack")!;
   assert.equal(ack.deliveryState, "mailbox_queued");
   assert.equal(senderFrames.find((frame) => frame.type === "opaque_dispatch_v1_receipt")?.receipt.status, "queued");
-  const receiver = endpoints.get("receiver")!;
-  receiver.connected = true;
-  receiver.write = (frame) => receiverFrames.push(frame);
-  manager.endpointAvailable("receiver");
-  assert.equal(offer(receiverFrames).messageId, ack.messageId);
-  assert.equal(offer(receiverFrames).attempt, 1);
-  manager.shutdown();
-});
-
-test("queued custody fails closed when the target reconnects at a new epoch", () => {
-  const { manager, endpoints, senderFrames, receiverFrames, send } = harness(false);
-  send();
-  const ack = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_ack" }> => frame.type === "opaque_dispatch_v1_ack")!;
   endpoints.set("receiver", {
     sessionId: "receiver", endpointEpoch: "receiver-epoch-2", info: { ...info("receiver"), endpointEpoch: "receiver-epoch-2" },
     extensions: receiverExtensions, connected: true, write: (frame) => receiverFrames.push(frame),
   });
   manager.endpointAvailable("receiver");
   assert.equal(receiverFrames.some((frame) => frame.type === "opaque_dispatch_v1_offer"), false);
-  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_receipt"
-    && frame.receipt.messageId === ack.messageId && frame.receipt.reason === "endpoint_epoch_changed"), true);
-  assert.equal(manager.activeCount, 0);
+  const receipts = senderFrames.filter((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt");
+  assert.deepEqual(receipts.map((frame) => [frame.receipt.status, frame.receipt.reason]), [
+    ["queued", undefined],
+    ["failed_closed", "endpoint_epoch_changed"],
+  ]);
+  manager.shutdown();
+});
+
+test("terminal endpoint rotation requires a new request id", () => {
+  const { manager, endpoints, senderFrames, receiverFrames, send } = harness(false);
+  send();
+  const originalAck = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_ack" }> => frame.type === "opaque_dispatch_v1_ack")!;
+  endpoints.set("receiver", {
+    sessionId: "receiver", endpointEpoch: "receiver-epoch-2", info: { ...info("receiver"), endpointEpoch: "receiver-epoch-2" },
+    extensions: receiverExtensions, connected: true, write: (frame) => receiverFrames.push(frame),
+  });
+  manager.endpointAvailable("receiver");
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_send", operationId: "same-request-op", requestId: "request", senderNamespace: "sender/v1",
+    toSessionId: "receiver", targetEpoch: "receiver-epoch-2", recipientNamespace: "receiver/v1", payload: { z: 1, a: true },
+  });
+  const replay = senderFrames.find((frame) => frame.type === "opaque_dispatch_v1_rejected" && frame.operationId === "same-request-op");
+  assert.equal(replay?.type === "opaque_dispatch_v1_rejected" ? replay.code : undefined, "endpoint_epoch_changed");
+  assert.equal(replay?.type === "opaque_dispatch_v1_rejected" ? replay.messageId : undefined, originalAck.messageId);
+
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_send", operationId: "new-request-op", requestId: "request-after-rotation", senderNamespace: "sender/v1",
+    toSessionId: "receiver", targetEpoch: "receiver-epoch-2", recipientNamespace: "receiver/v1", payload: { z: 1, a: true },
+  });
+  assert.equal(offer(receiverFrames).requestId, "request-after-rotation");
   manager.shutdown();
 });
 
@@ -217,6 +231,23 @@ test("reserved supersede ends the old reservation before offering replacement", 
   manager.shutdown();
 });
 
+test("self-supersede remains net-zero at principal capacity", () => {
+  const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
+  for (let index = 0; index < MAX_OPAQUE_PRINCIPAL_RECORDS; index += 1) send(`request-${index}`, `operation-${index}`);
+  const prior = offer(receiverFrames);
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_send", operationId: "replacement-op", requestId: "replacement", senderNamespace: "sender/v1",
+    toSessionId: "receiver", targetEpoch: "receiver-epoch", recipientNamespace: "receiver/v1", payload: { replacement: true },
+    supersedesMessageId: prior.messageId,
+  });
+  assert.equal(manager.activeCount, MAX_OPAQUE_PRINCIPAL_RECORDS);
+  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_rejected"
+    && frame.operationId === "replacement-op" && frame.code === "limit_exceeded"), false);
+  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_receipt"
+    && frame.receipt.messageId === prior.messageId && frame.receipt.status === "superseded"), true);
+  manager.shutdown();
+});
+
 test("claim-first supersede race rejects the replacement", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send("original", "original-op");
@@ -249,17 +280,19 @@ test("offered-window disconnect accepts the send as mailbox queued", () => {
   manager.shutdown();
 });
 
-test("receiver reconnect exhausts eight delivery attempts", () => {
+test("a disconnected offer is never attempted on its replacement endpoint", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send();
-  for (let attempt = 1; attempt <= 8; attempt += 1) {
-    const offered = receiverFrames.filter((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_offer" }> => frame.type === "opaque_dispatch_v1_offer").at(-1)!;
-    assert.equal(offered.attempt, attempt);
-    manager.endpointDisconnected("receiver");
-    if (attempt < 8) manager.endpointAvailable("receiver");
-  }
+  assert.equal(offer(receiverFrames).attempt, 1);
+  manager.endpointDisconnected("receiver");
+  endpoints.set("receiver", {
+    sessionId: "receiver", endpointEpoch: "receiver-epoch-2", info: { ...info("receiver"), endpointEpoch: "receiver-epoch-2" },
+    extensions: receiverExtensions, connected: true, write: (frame) => receiverFrames.push(frame),
+  });
+  manager.endpointAvailable("receiver");
+  assert.equal(receiverFrames.filter((frame) => frame.type === "opaque_dispatch_v1_offer").length, 1);
   const terminal = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
-  assert.equal(terminal?.receipt.reason, "attempt_limit");
+  assert.equal(terminal?.receipt.reason, "endpoint_epoch_changed");
   manager.shutdown();
 });
 
@@ -357,6 +390,51 @@ test("repeated accepted claim is idempotent and foreign reconcile reveals no his
     messageId: offered.messageId,
     result: { state: "indeterminate", code: "claim_history_unavailable" },
   });
+  manager.shutdown();
+});
+
+test("claim status reports a changed broker epoch before consulting local history", () => {
+  const { manager, endpoints, receiverFrames } = harness();
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_claim_status",
+    endpointEpoch: "receiver-epoch",
+    operationId: "changed-broker-status",
+    recipientNamespace: "receiver/v1",
+    brokerEpoch: "44444444-4444-4444-8444-444444444444",
+    reservationId: "22222222-2222-4222-8222-222222222222",
+    messageId: "11111111-1111-4111-8111-111111111111",
+  });
+  const result = receiverFrames.at(-1);
+  assert.deepEqual(result?.type === "opaque_dispatch_v1_claim_status_result" ? result.result : undefined,
+    { state: "indeterminate", code: "broker_epoch_changed" });
+  manager.shutdown();
+});
+
+test("receipt replay includes only unacknowledged sequences", () => {
+  const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
+  send();
+  const offered = offer(receiverFrames);
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_reservation_result", endpointEpoch: "receiver-epoch",
+    reservationId: offered.reservationId, messageId: offered.messageId, decision: "reserved",
+  });
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_claim", endpointEpoch: "receiver-epoch", operationId: "claim-op",
+    reservationId: offered.reservationId, messageId: offered.messageId,
+  });
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_receipt_ack", senderNamespace: "sender/v1", messageId: offered.messageId, sequence: 1,
+  });
+  senderFrames.length = 0;
+  manager.endpointAvailable("sender");
+  const replayed = senderFrames.filter((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt");
+  assert.deepEqual(replayed.map((frame) => frame.receipt.sequence), [2]);
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_receipt_ack", senderNamespace: "sender/v1", messageId: offered.messageId, sequence: 2,
+  });
+  senderFrames.length = 0;
+  manager.endpointAvailable("sender");
+  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_receipt"), false);
   manager.shutdown();
 });
 

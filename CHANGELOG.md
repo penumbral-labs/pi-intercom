@@ -9,8 +9,9 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Exposed broker-owned endpoint epochs to registered clients, opaque offers, and peer capability results.
 
 ### Changed
-- Opaque dispatch now keeps temporary offline queueing while binding queued, offered, reserved, and claimed state to one endpoint epoch; endpoint rotation fails closed instead of transferring custody.
-- Opaque sends resolve endpoint epochs through the opaque capability channel and retry one `target_rebound` with the same idempotent request ID.
+- Opaque dispatch now retains temporary disconnected custody only long enough to report `mailbox_queued` followed by a deterministic `endpoint_epoch_changed` receipt on reconnect; every reconnect rotates the endpoint epoch and never transfers queued custody.
+- Opaque sends resolve endpoint epochs through the opaque capability channel and retry one admission-time `target_rebound` with the same idempotent request ID. A terminal endpoint-rotation result remains bound to that request ID for the tombstone lifetime, so sending work to the replacement endpoint requires a new request ID.
+- Opaque receipt acknowledgements are cumulative by sequence; reconnect replay includes only unacknowledged receipts. At global capacity, admission may evict the oldest queued record across principals with an `expired` / `limit_exceeded` receipt.
 
 ## [0.11.0] - 2026-08-19
 

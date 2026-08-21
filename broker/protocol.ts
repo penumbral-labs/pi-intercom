@@ -1,3 +1,4 @@
+import { OPAQUE_DISPATCH_REASONS, OPAQUE_DISPATCH_STATUSES } from "../types.ts";
 import type {
   Attachment,
   ExtensionCapability,
@@ -155,19 +156,8 @@ export function isExtensionStateSnapshot(value: unknown): value is ExtensionStat
   return value.present === true && value.revision >= 1 && hasExactKeys(value, ["namespace", "revision", "present", "payload"]);
 }
 
-const OPAQUE_REASONS = new Set<OpaqueDispatchReason>([
-  "unsupported_host", "unsupported_broker", "unsupported_target", "unknown_exact_target", "self_dispatch_unsupported",
-  "invalid_request", "invalid_frame", "request_conflict", "limit_exceeded", "rate_limited", "broker_epoch_changed",
-  "target_rebound", "endpoint_epoch_changed",
-  "claim_history_unavailable", "payload_too_large", "consumer_missing", "consumer_unloaded", "consumer_refused",
-  "consumer_threw", "consumer_failed", "reservation_timeout", "claim_timeout", "malformed_consumer_result",
-  "stale_reservation", "receiver_disconnected", "capability_invalidated", "queued_supersede_unsupported",
-  "already_claimed", "already_terminal", "not_origin", "attempt_limit", "history_limit", "connection_lost",
-  "uncorrelated_operation_pending",
-]);
-const OPAQUE_STATUSES = new Set<OpaqueDispatchStatus>([
-  "queued", "reserved", "claimed", "refused", "expired", "cancelled", "superseded", "failed_closed",
-]);
+const OPAQUE_REASONS = new Set<OpaqueDispatchReason>(OPAQUE_DISPATCH_REASONS);
+const OPAQUE_STATUSES = new Set<OpaqueDispatchStatus>(OPAQUE_DISPATCH_STATUSES);
 const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
   "consumer_refused", "consumer_failed", "consumer_threw", "consumer_unloaded", "consumer_missing", "malformed_consumer_result",
 ]);

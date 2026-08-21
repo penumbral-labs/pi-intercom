@@ -253,6 +253,8 @@ class IntercomBroker {
             }
           }
           if (sessionId) {
+            const origin = this.sessions.get(sessionId);
+            if (!origin || origin.socket !== socket) throw new Error("Opaque dispatch origin not found");
             const endpoint = this.opaqueEndpoint(sessionId);
             if (endpoint) this.opaqueDispatch.rateLimited(endpoint, msg);
           }
@@ -390,7 +392,7 @@ class IntercomBroker {
         if (currentId) {
           throw new Error("Received duplicate register message");
         }
-        
+
         let id: string = randomUUID();
         if (clientMessage.sessionId !== undefined) {
           if (!isSessionId(clientMessage.sessionId)) {
@@ -455,7 +457,7 @@ class IntercomBroker {
         };
         this.sessions.set(id, connectedSession);
         this.disconnectedSessions.delete(id);
-        
+
         if (this.shutdownTimer) {
           clearTimeout(this.shutdownTimer);
           this.shutdownTimer = null;
@@ -1038,6 +1040,8 @@ class IntercomBroker {
       case "opaque_dispatch_v1_claim_status":
       case "opaque_dispatch_v1_receipt_ack": {
         if (!currentId || !isOpaqueDispatchClientFrame(clientMessage)) throw new Error("Invalid opaque dispatch frame");
+        const origin = this.sessions.get(currentId);
+        if (!origin || origin.socket !== socket) throw new Error("Opaque dispatch origin not found");
         const endpoint = this.opaqueEndpoint(currentId);
         if (!endpoint || endpoint.write === undefined) throw new Error("Opaque endpoint not found");
         this.opaqueDispatch.handle(endpoint, clientMessage);
