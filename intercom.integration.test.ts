@@ -748,6 +748,54 @@ test("broker rejects malformed exact target fields instead of falling back to na
   }
 });
 
+test("ordinary delivery failures preserve their specific codes", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("coded-failure-sender", "coded-failure-sender");
+  const twinA = new IntercomClient();
+  const twinB = new IntercomClient();
+  const { createMessageReader } = await import("./broker/framing.ts");
+
+  try {
+    await twinA.connect({
+      name: "coded-twin", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+    }, "coded-twin-a");
+    await twinB.connect({
+      name: "coded-twin", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+    }, "coded-twin-b");
+    await waitForSessionId(planner, "coded-twin-a");
+    await waitForSessionId(planner, "coded-twin-b");
+
+    const receiveFailure = () => new Promise<Record<string, unknown>>((resolve, reject) => {
+      const reader = createMessageReader((received) => {
+        if (typeof received !== "object" || received === null || !("type" in received) || received.type !== "delivery_failed") return;
+        raw.socket.off("data", reader);
+        resolve(received as Record<string, unknown>);
+      }, reject);
+      raw.socket.on("data", reader);
+    });
+    const send = async (to: unknown, message: unknown) => {
+      const failure = receiveFailure();
+      raw.writeMessage(raw.socket, { type: "send", to, message });
+      return failure;
+    };
+    const message = (id: string, extra: Record<string, unknown> = {}) => ({
+      id, timestamp: Date.now(), content: { text: id }, ...extra,
+    });
+
+    assert.equal((await send(42, message("invalid"))).code, "E_INVALID_MESSAGE");
+    assert.equal((await send("missing-session", message("missing"))).code, "E_TARGET_NOT_FOUND");
+    assert.equal((await send("coded-twin", message("ambiguous"))).code, "E_AMBIGUOUS_TARGET");
+    assert.equal((await send("coded-twin-a", message("reply", { replyTo: "missing-ask" }))).code, "E_REPLY_TARGET");
+  } finally {
+    raw.socket.destroy();
+    await twinA.disconnect().catch(() => undefined);
+    await twinB.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
 test("broker rejects changed message content after a rebound exact-target failure", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const raw = await connectRawRegistered("rebound-reuse-sender", "rebound-reuse-sender");
@@ -1224,6 +1272,89 @@ test("extension channels register locally without creating conversation messages
   assert.deepEqual(extensionEvents, []);
   assert.deepEqual(harness.sentMessages, []);
   assert.deepEqual(harness.entries, []);
+});
+
+test("disposed extension channels cannot act on a replacement registration", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness();
+  let staleChannel: IntercomExtensionChannel | undefined;
+  let replacementChannel: IntercomExtensionChannel | undefined;
+
+  piIntercomExtension(harness.pi as never);
+  const registration = (onReady: (channel: IntercomExtensionChannel) => void) => ({
+    namespace: "generation-fence/v1",
+    ownerEligible: true,
+    onReady,
+    onEvent: () => undefined,
+  });
+  harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, registration((channel) => { staleChannel = channel; }));
+  staleChannel?.dispose();
+  harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, registration((channel) => { replacementChannel = channel; }));
+
+  assert.ok(staleChannel);
+  assert.ok(replacementChannel);
+  assert.throws(() => staleChannel!.snapshot(), /disposed/);
+  assert.throws(() => staleChannel!.publish({ stale: true }), /disposed/);
+  assert.throws(() => staleChannel!.commitState({ stale: true }), /disposed/);
+  assert.deepEqual(replacementChannel.snapshot(), {
+    connected: false,
+    capabilities: { extensionBus: false },
+  });
+  replacementChannel.dispose();
+});
+
+test("refreshing absent extension state clears the cached snapshot", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const namespace = `refresh-absent/${Date.now()}`;
+  const owner = new IntercomClient();
+  const ownerFrames: BrokerMessage[] = [];
+  const harness = createExtensionHarness("refresh-absent-worker", { sessionId: "refresh-absent-worker" });
+  let channel: IntercomExtensionChannel | undefined;
+
+  try {
+    owner.onBrokerMessage((message) => ownerFrames.push(message));
+    await owner.connect({
+      name: "refresh-absent-owner", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace, ownerEligible: true }],
+    }, "refresh-absent-owner");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const ownerFrame = ownerFrames.find((message): message is Extract<BrokerMessage, { type: "extension_owner" }> =>
+      message.type === "extension_owner" && message.namespace === namespace);
+    const ownerEpoch = ownerFrame?.ownerEpoch;
+    assert.ok(ownerEpoch);
+    owner.sendExtensionMessage({
+      type: "extension_state_commit", namespace, ownerEpoch, expectedRevision: 0, payload: { cached: true },
+    });
+
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace,
+      ownerEligible: false,
+      onReady: (value: IntercomExtensionChannel) => { channel = value; },
+      onEvent: () => undefined,
+    });
+    await harness.emitLifecycle("session_start");
+    const deadline = Date.now() + 2_000;
+    while (!channel?.snapshot().state && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(channel?.snapshot().state, { revision: 1, payload: { cached: true } });
+
+    const activeClient = (channel as unknown as { refreshState(): Promise<unknown> });
+    const originalRefresh = IntercomClient.prototype.refreshExtensionState;
+    IntercomClient.prototype.refreshExtensionState = async () => ({ namespace, revision: 0, present: false });
+    try {
+      assert.deepEqual(await activeClient.refreshState(), { ok: true, state: { namespace, revision: 0, present: false } });
+    } finally {
+      IntercomClient.prototype.refreshExtensionState = originalRefresh;
+    }
+    assert.equal(channel?.snapshot().state, undefined);
+  } finally {
+    channel?.dispose();
+    await owner.disconnect().catch(() => undefined);
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
 });
 
 test("opaque claim releases receiver reservation before dispose", { concurrency: false }, async () => {
@@ -3095,6 +3226,13 @@ test("broker reports queued and cancelled mailbox receipts without closing the s
       { from: "pi-intercom-broker", status: "queued" },
       { from: "pi-intercom-broker", status: "cancelled" },
     ]);
+    const replay = await orchestrator.send(disconnectedId, {
+      messageId: "queued-then-cancelled",
+      text: "Cancel this while it is still queued.",
+    });
+    assert.equal(replay.delivered, false);
+    assert.equal(replay.delivery, "failed");
+    assert.equal(replay.code, "E_DELIVERY_CANCELLED");
 
     const sessions = await orchestrator.listSessions();
     assert.ok(sessions.some((session) => session.id === orchestrator.sessionId));
@@ -3152,6 +3290,13 @@ test("broker wire-observes an expired receipt when mailbox capacity evicts a mes
     assert.equal(expired.from.status, "broker");
     assert.equal(expired.from.lastActivity, expired.timestamp);
     assert.equal(expired.from.trustedLocal, process.platform !== "win32");
+    const replay = await orchestrator.send(disconnectedId, {
+      messageId: "mailbox-capacity-0",
+      text: "Queued mailbox message 0",
+    });
+    assert.equal(replay.delivered, false);
+    assert.equal(replay.delivery, "failed");
+    assert.equal(replay.code, "E_DELIVERY_EVICTED");
     assert.equal(orchestrator.isConnected(), true);
     unsubscribeReceipts();
   } finally {

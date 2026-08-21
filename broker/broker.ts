@@ -607,7 +607,7 @@ class IntercomBroker {
         const messageId = isMessage(message) ? message.id : "unknown";
 
         if (typeof clientMessage.to !== "string" || !isMessage(message)) {
-          writeMessage(socket, deliveryFailed(messageId, "Invalid message format"));
+          writeMessage(socket, deliveryFailed(messageId, "Invalid message format", "E_INVALID_MESSAGE"));
           break;
         }
 
@@ -642,12 +642,12 @@ class IntercomBroker {
         const targets = this.findSessions(clientMessage.to as string);
         if (targets.length === 1) {
           if (message.replyTo && !replyEdge) {
-            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match a pending ask"));
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET"));
             break;
           }
           const fromSession = this.sessions.get(currentId);
           if (!fromSession || fromSession.socket !== socket) {
-            writeMessage(socket, deliveryFailed(message.id, "Sender session not found"));
+            writeMessage(socket, deliveryFailed(message.id, "Sender session not found", "E_SENDER_NOT_FOUND"));
             break;
           }
           const target = targets[0];
@@ -660,17 +660,17 @@ class IntercomBroker {
           if (message.supersedes) {
             const supersededRoute = this.messageReceiptRoutes.get(message.supersedes);
             if (!supersededRoute || supersededRoute.from !== currentId || supersededRoute.to !== target.info.id) {
-              writeMessage(socket, deliveryFailed(message.id, "Supersede target does not match a previous message from this sender to this receiver"));
+              writeMessage(socket, deliveryFailed(message.id, "Supersede target does not match a previous message from this sender to this receiver", "E_SUPERSEDE_TARGET"));
               break;
             }
           }
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.info.id)) {
-            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask"));
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET"));
             break;
           }
           if (message.expectsReply) {
             if (this.askEdges.hasReverse(currentId, target.info.id, message.replyTo)) {
-              writeMessage(socket, deliveryFailed(message.id, "Mutual ask refused: target session is already waiting for a reply from this session."));
+              writeMessage(socket, deliveryFailed(message.id, "Mutual ask refused: target session is already waiting for a reply from this session.", "E_MUTUAL_ASK"));
               break;
             }
             const capacity = this.askEdges.canAdd(currentId, message.replyTo);
@@ -737,34 +737,34 @@ class IntercomBroker {
         }
 
         if (targets.length > 1) {
-          writeMessage(socket, deliveryFailed(message.id, `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`));
+          writeMessage(socket, deliveryFailed(message.id, `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`, "E_AMBIGUOUS_TARGET"));
           break;
         }
 
         const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to as string);
         if (disconnectedTargets.length === 1) {
           if (message.replyTo && !replyEdge) {
-            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match a pending ask"));
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET"));
             break;
           }
           const fromSession = this.sessions.get(currentId);
           if (!fromSession || fromSession.socket !== socket) {
-            writeMessage(socket, deliveryFailed(message.id, "Sender session not found"));
+            writeMessage(socket, deliveryFailed(message.id, "Sender session not found", "E_SENDER_NOT_FOUND"));
             break;
           }
           const target = disconnectedTargets[0]!.info;
           const fingerprint = this.deliveryFingerprint(message, target.id, target.endpointEpoch);
           if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
           if (message.supersedes) {
-            writeMessage(socket, deliveryFailed(message.id, "Supersede target is not connected"));
+            writeMessage(socket, deliveryFailed(message.id, "Supersede target is not connected", "E_SUPERSEDE_TARGET"));
             break;
           }
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.id)) {
-            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask"));
+            writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET"));
             break;
           }
           if (message.expectsReply) {
-            writeMessage(socket, deliveryFailed(message.id, "Target session is not currently connected; blocking asks are not queued"));
+            writeMessage(socket, deliveryFailed(message.id, "Target session is not currently connected; blocking asks are not queued", "E_TARGET_DISCONNECTED"));
             break;
           }
           const liveMailboxTarget = this.findUniqueLiveSessionForDisconnectedSession(target, currentId);
@@ -801,11 +801,11 @@ class IntercomBroker {
         }
 
         if (disconnectedTargets.length > 1) {
-          writeMessage(socket, deliveryFailed(message.id, `Multiple disconnected sessions named \"${clientMessage.to}\" can receive queued mail. Use the session ID instead.`));
+          writeMessage(socket, deliveryFailed(message.id, `Multiple disconnected sessions named \"${clientMessage.to}\" can receive queued mail. Use the session ID instead.`, "E_AMBIGUOUS_TARGET"));
           break;
         }
 
-        writeMessage(socket, deliveryFailed(message.id, "Session not found"));
+        writeMessage(socket, deliveryFailed(message.id, "Session not found", "E_TARGET_NOT_FOUND"));
         break;
       }
 
@@ -854,6 +854,7 @@ class IntercomBroker {
         const queuedIndex = this.mailboxMessages.findIndex(entry => entry.message.id === clientMessage.messageId && entry.from.id === currentId);
         if (queuedIndex >= 0 && sender?.socket === socket) {
           this.mailboxMessages.splice(queuedIndex, 1);
+          this.updateDeliveryRecord(currentId, clientMessage.messageId, "failed", "Sender cancelled the queued delivery", "E_DELIVERY_CANCELLED");
           const edge = this.askEdges.get(clientMessage.messageId);
           if (edge?.from === currentId) {
             this.askEdges.delete(clientMessage.messageId);
@@ -1158,6 +1159,15 @@ class IntercomBroker {
     }
   }
 
+  private updateDeliveryRecord(fromSessionId: string, messageId: string, state: DeliveryRecord["state"], reason?: string, code?: string): void {
+    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
+    if (!record) return;
+    record.state = state;
+    record.reason = reason;
+    record.code = code;
+    record.retryable = false;
+  }
+
   private retireSession(sessionId: string, socket: net.Socket): boolean {
     const existing = this.sessions.get(sessionId);
     if (existing?.socket !== socket) return false;
@@ -1245,6 +1255,7 @@ class IntercomBroker {
         }
         this.emitBrokerReceipt(this.sessions.get(entry.from.id)?.socket, entry.message.id, "expired", now);
         this.messageReceiptRoutes.delete(entry.message.id);
+        this.updateDeliveryRecord(entry.from.id, entry.message.id, "failed", "Mailbox delivery expired", "E_DELIVERY_EXPIRED");
         this.mailboxMessages.splice(index, 1);
       }
     }
@@ -1260,6 +1271,7 @@ class IntercomBroker {
       }
       this.emitBrokerReceipt(this.sessions.get(evicted.from.id)?.socket, evicted.message.id, "expired", brokerReceivedAt);
       this.messageReceiptRoutes.delete(evicted.message.id);
+      this.updateDeliveryRecord(evicted.from.id, evicted.message.id, "failed", "Mailbox capacity evicted the delivery", "E_DELIVERY_EVICTED");
     }
     this.mailboxMessages.push({
       from: { ...from },
@@ -1326,6 +1338,7 @@ class IntercomBroker {
         to: session.info.id,
         createdAt: now,
       });
+      this.updateDeliveryRecord(entry.from.id, entry.message.id, "socket_delivered");
     }
   }
 

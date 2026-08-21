@@ -728,10 +728,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function createExtensionChannel(namespace: string, generation: number): IntercomExtensionChannel {
     const current = () => localExtensions.get(namespace)?.generation === generation;
+    const requireCurrent = () => {
+      if (!current()) throw new Error(`Extension channel ${namespace} is disposed`);
+      return localExtensions.get(namespace)!;
+    };
     return {
       namespace,
       snapshot() {
-        const extension = localExtensions.get(namespace);
+        const extension = requireCurrent();
         return {
           connected: Boolean(client?.isConnected()),
           ...(client?.brokerEpoch ? { brokerEpoch: client.brokerEpoch } : {}),
@@ -745,9 +749,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         };
       },
       publish(payload, options = {}) {
+        const extension = requireCurrent();
         const activeClient = client;
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        const extension = localExtensions.get(namespace);
         const ownerOnly = options.ownerOnly ?? false;
         const ownerEpoch = ownerOnly ? extension?.owner?.epoch : undefined;
         if (ownerOnly && !ownerEpoch) throw new Error(`No owner is available for ${namespace}`);
@@ -760,9 +764,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         });
       },
       commitState(payload, expectedRevision) {
+        const extension = requireCurrent();
         const activeClient = client;
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        const extension = localExtensions.get(namespace);
         const ownerEpoch = extension?.owner?.epoch;
         if (!ownerEpoch || extension.owner?.sessionId !== activeClient.sessionId) {
           throw new Error(`Current session is not the owner of ${namespace}`);
@@ -785,7 +789,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           const state = await activeClient.refreshExtensionState(namespace);
           if (!current()) return { ok: false as const, code: "connection_lost" as const };
           const extension = localExtensions.get(namespace);
-          if (state.present && extension) extension.state = { revision: state.revision, payload: state.payload };
+          if (extension) {
+            if (state.present) extension.state = { revision: state.revision, payload: state.payload };
+            else delete extension.state;
+          }
           return { ok: true as const, state };
         } catch {
           return { ok: false as const, code: "connection_lost" as const };
