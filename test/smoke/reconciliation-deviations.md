@@ -16,15 +16,25 @@ the reconciliation baseline and `git merge-base --is-ancestor 763770b HEAD` for 
 
 ## Repo-consistency review
 
-The review's error-channel finding was real: opaque sends mixed thrown errors, typed results, and list failures. Opaque
-send outcomes now use one typed result channel. The shared-retirement finding was also real: close and unregister had
-duplicated cleanup while in-place replacement skipped opaque retirement. All three paths now use `retireSession`, with
-replacement retiring the old endpoint before map replacement.
+The nine repeated findings map to these adjudications:
 
-The remaining reported findings were false positives against ported or upstream code: multi-commit authorship reflected
-the required integration merge; the matching key-helper bodies came from the certified opaque baseline; comment style
-matched existing repository usage; and session finder duplication was unchanged upstream v0.11 code. The final
-repo-consistency diff check reported all 38 selected files `ok` with zero findings.
+1. Cultivated authorship/multiple commits in `broker/broker.ts`: false positive caused by the required certified
+   multi-commit port.
+2. Throws-on-error in `broker/client.ts`: real and fixed by the unified typed opaque result channel.
+3. Unique function bodies for `principalKey` and `targetKey`: false positive; these are semantically distinct helpers
+   from the certified opaque baseline.
+4. Cultivated authorship in `broker/broker.ts`: duplicate of finding 1 and the same false positive.
+5. Unique function bodies for session retirement: real; duplicated close and unregister cleanup allowed replacement to
+   skip opaque retirement. Close, unregister, and replacement now use `retireSession`, with replacement retiring the old
+   endpoint before map replacement.
+6. Line comments in `broker/ask-edges.ts`: false positive; the comments were ported byte-for-byte and JSDoc is an
+   established repository style.
+7. Unique function bodies for `findSessions` and `findDisconnectedSessions`: false positive; this family is unchanged
+   upstream v0.11 code.
+8. Line comments in `broker/ask-edges.ts`: duplicate of finding 6 and the same false positive.
+9. Line comments in `broker/ask-edges.ts`: duplicate of finding 6 and the same false positive.
+
+The final repo-consistency diff check reported all 38 selected files `ok` with zero findings.
 
 ## True-Pi dogfood
 

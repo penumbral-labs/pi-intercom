@@ -138,19 +138,25 @@ function nextOffer(client: IntercomClient): Promise<Extract<OpaqueDispatchBroker
   });
 }
 
-function nextClaimedReceipt(client: IntercomClient): Promise<Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }>> {
+function nextReceipt(client: IntercomClient, status: "claimed" | "failed_closed"): Promise<Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }>> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       stop();
       reject(new Error("receipt timeout"));
     }, 5_000);
     const stop = client.onOpaqueDispatch((frame) => {
-      if (frame.type !== "opaque_dispatch_v1_receipt" || frame.receipt.status !== "claimed") return;
+      if (frame.type !== "opaque_dispatch_v1_receipt" || frame.receipt.status !== status) return;
       clearTimeout(timeout);
       stop();
       resolve(frame);
     });
   });
+}
+
+function exhaustReceiverOpaqueTokens(client: IntercomClient): void {
+  for (let index = 0; index < 59; index += 1) {
+    client.ackOpaqueReceipt(receiverNamespace, "00000000-0000-4000-8000-000000000000", 1);
+  }
 }
 
 test("new client refuses opaque writes to a featureless v0.10-style broker and keeps ordinary operations live", { concurrency: false }, async () => {
@@ -335,6 +341,48 @@ test("rate-limited retired origin socket cannot acknowledge replacement receipts
   });
 });
 
+test("rate-limited claim returns its typed result immediately and terminalizes custody", { concurrency: false }, async () => {
+  await withWireClients(async (sender, receiver) => {
+    const offered = nextOffer(receiver);
+    const accepted = sender.sendOpaqueDispatch(senderNamespace, {
+      requestId: "rate-limited-claim-request", toSessionId: "wire-receiver",
+      recipientNamespace: receiverNamespace, payload: { sentinel },
+    });
+    const offer = await offered;
+    receiver.sendOpaqueReservationResult(offer.messageId, offer.reservationId, "reserved");
+    assert.equal((await accepted).accepted, true);
+    exhaustReceiverOpaqueTokens(receiver);
+    const terminalReceipt = nextReceipt(sender, "failed_closed");
+    const result = await Promise.race([
+      receiver.claimOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("claim did not settle immediately")), 1_000)),
+    ]);
+    assert.deepEqual(result, { claimed: false, code: "rate_limited" });
+    assert.equal((await terminalReceipt).receipt.reason, "rate_limited");
+  });
+});
+
+test("rate-limited fail returns success immediately after terminalizing custody", { concurrency: false }, async () => {
+  await withWireClients(async (sender, receiver) => {
+    const offered = nextOffer(receiver);
+    const accepted = sender.sendOpaqueDispatch(senderNamespace, {
+      requestId: "rate-limited-fail-request", toSessionId: "wire-receiver",
+      recipientNamespace: receiverNamespace, payload: { sentinel },
+    });
+    const offer = await offered;
+    receiver.sendOpaqueReservationResult(offer.messageId, offer.reservationId, "reserved");
+    assert.equal((await accepted).accepted, true);
+    exhaustReceiverOpaqueTokens(receiver);
+    const terminalReceipt = nextReceipt(sender, "failed_closed");
+    const result = await Promise.race([
+      receiver.failOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("fail did not settle immediately")), 1_000)),
+    ]);
+    assert.deepEqual(result, { failedClosed: true });
+    assert.equal((await terminalReceipt).receipt.reason, "rate_limited");
+  });
+});
+
 test("wire-level opaque flow remains private and ordinary traffic remains usable", { concurrency: false }, async () => {
   await withWireClients(async (sender, receiver) => {
     const ordinaryMessages: unknown[] = [];
@@ -355,7 +403,7 @@ test("wire-level opaque flow remains private and ordinary traffic remains usable
     const accepted = await acceptedPromise;
     assert.equal(accepted.accepted, true);
 
-    const claimedReceipt = nextClaimedReceipt(sender);
+    const claimedReceipt = nextReceipt(sender, "claimed");
     assert.deepEqual(await receiver.claimOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId), { claimed: true });
     const receipt = await claimedReceipt;
     sender.ackOpaqueReceipt(senderNamespace, receipt.receipt.messageId, receipt.receipt.sequence);

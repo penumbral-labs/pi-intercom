@@ -469,7 +469,7 @@ test("reservation and claim deadlines fail closed with typed reasons", async () 
   claimHarness.manager.shutdown();
 });
 
-test("capability invalidation settles pending waiters and reservation rate limits fail closed", async () => {
+test("capability invalidation settles pending waiters", async () => {
   const capabilityHarness = harness();
   capabilityHarness.send();
   capabilityHarness.send("request", "capability-waiter");
@@ -484,16 +484,38 @@ test("capability invalidation settles pending waiters and reservation rate limit
   const invalidated = capabilityHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
   assert.equal(invalidated?.receipt.reason, "capability_invalidated");
   capabilityHarness.manager.shutdown();
+});
 
-  const rateHarness = harness();
-  rateHarness.send();
-  const rateOffer = offer(rateHarness.receiverFrames);
-  rateHarness.manager.rateLimited(rateHarness.endpoints.get("receiver")!, {
-    type: "opaque_dispatch_v1_reservation_result", endpointEpoch: "receiver-epoch", reservationId: rateOffer.reservationId, messageId: rateOffer.messageId, decision: "reserved",
-  });
-  const rateLimited = rateHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
-  assert.equal(rateLimited?.receipt.reason, "rate_limited");
-  rateHarness.manager.shutdown();
+test("rate-limited reservation operations fail closed and settle correlated claim and fail calls", () => {
+  for (const operation of ["claim", "fail"] as const) {
+    const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
+    send();
+    const offered = offer(receiverFrames);
+    manager.handle(endpoints.get("receiver")!, {
+      type: "opaque_dispatch_v1_reservation_result", endpointEpoch: "receiver-epoch",
+      reservationId: offered.reservationId, messageId: offered.messageId, decision: "reserved",
+    });
+    manager.rateLimited(endpoints.get("receiver")!, operation === "claim" ? {
+      type: "opaque_dispatch_v1_claim", operationId: "rate-limited-claim", endpointEpoch: "receiver-epoch",
+      reservationId: offered.reservationId, messageId: offered.messageId,
+    } : {
+      type: "opaque_dispatch_v1_fail", operationId: "rate-limited-fail", endpointEpoch: "receiver-epoch",
+      reservationId: offered.reservationId, messageId: offered.messageId, reason: "consumer_failed",
+    });
+
+    assert.equal(manager.activeCount, 0);
+    const terminal = senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
+    assert.equal(terminal?.receipt.reason, "rate_limited");
+    const result = receiverFrames.at(-1);
+    assert.deepEqual(result, operation === "claim" ? {
+      type: "opaque_dispatch_v1_claim_result", operationId: "rate-limited-claim",
+      reservationId: offered.reservationId, messageId: offered.messageId, claimed: false, code: "rate_limited",
+    } : {
+      type: "opaque_dispatch_v1_fail_result", operationId: "rate-limited-fail",
+      reservationId: offered.reservationId, messageId: offered.messageId, failedClosed: true,
+    });
+    manager.shutdown();
+  }
 });
 
 test("active expiry emits expired without a reservation-timeout reason", async () => {

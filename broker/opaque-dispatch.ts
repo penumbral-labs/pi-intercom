@@ -209,9 +209,22 @@ export class OpaqueDispatchManager {
   rateLimited(endpoint: OpaqueEndpoint, frame: OpaqueDispatchClientFrame): void {
     if (frame.type === "opaque_dispatch_v1_reservation_result" || frame.type === "opaque_dispatch_v1_claim" || frame.type === "opaque_dispatch_v1_fail") {
       const record = this.authorizedReservation(endpoint, frame.endpointEpoch, frame.messageId, frame.reservationId);
-      if (!record) return;
-      this.endReservation(record, "failed_closed", "rate_limited");
-      this.terminalize(record, "failed_closed", "rate_limited");
+      if (record) {
+        this.endReservation(record, "failed_closed", "rate_limited");
+        this.terminalize(record, "failed_closed", "rate_limited");
+      }
+      if (frame.type === "opaque_dispatch_v1_claim") {
+        writeOpaqueTo(endpoint, { anyOpaqueCapability: true }, {
+          type: "opaque_dispatch_v1_claim_result", operationId: frame.operationId,
+          reservationId: frame.reservationId, messageId: frame.messageId, claimed: false, code: "rate_limited",
+        });
+      } else if (frame.type === "opaque_dispatch_v1_fail") {
+        writeOpaqueTo(endpoint, { anyOpaqueCapability: true }, {
+          type: "opaque_dispatch_v1_fail_result", operationId: frame.operationId,
+          reservationId: frame.reservationId, messageId: frame.messageId,
+          failedClosed: record !== undefined, ...(record ? {} : { code: "rate_limited" as const }),
+        });
+      }
       return;
     }
     if (!("operationId" in frame)) return;
