@@ -29,7 +29,7 @@ export type OpaqueDispatchReason =
   | "unsupported_host" | "unsupported_broker" | "unsupported_target"
   | "unknown_exact_target" | "self_dispatch_unsupported" | "invalid_request"
   | "invalid_frame" | "request_conflict" | "limit_exceeded" | "rate_limited"
-  | "broker_epoch_changed" | "claim_history_unavailable"
+  | "broker_epoch_changed" | "target_rebound" | "endpoint_epoch_changed" | "claim_history_unavailable"
   | "payload_too_large" | "consumer_missing" | "consumer_unloaded"
   | "consumer_refused" | "consumer_threw" | "consumer_failed"
   | "reservation_timeout" | "claim_timeout" | "malformed_consumer_result"
@@ -60,6 +60,7 @@ export interface OpaqueDispatchEvent {
   messageId: string;
   attempt: number;
   brokerEpoch: string;
+  endpointEpoch: string;
   toSessionId: string;
   recipientNamespace: string;
   sender: OpaqueDispatchSender;
@@ -126,7 +127,9 @@ export interface IntercomExtensionChannel {
   refreshState(): Promise<ExtensionStateRefreshResult>;
   listSessions(): Promise<SessionInfo[]>;
   peerCapability(sessionId: string, recipientNamespace: string): Promise<
-    { state: "present"; version: 1 } | { state: "absent" } | { state: "unknown" }
+    { state: "present"; version: 1; endpointEpoch: string }
+    | { state: "absent"; endpointEpoch: string }
+    | { state: "unknown" }
   >;
   sendOpaqueDispatch(input: {
     requestId: string;
@@ -136,7 +139,7 @@ export interface IntercomExtensionChannel {
     supersedesMessageId?: string;
   }): Promise<SendOpaqueResult>;
   cancelMessage(messageId: string): Promise<{ cancelled: true } | { cancelled: false; code: OpaqueDispatchReason }>;
-  reconcileClaim(input: { brokerEpoch: string; messageId: string; reservationId: string }): Promise<
+  reconcileClaim(input: { brokerEpoch: string; endpointEpoch: string; messageId: string; reservationId: string }): Promise<
     { state: "claimed" } | { state: "reserved" } | { state: "stale"; code: "stale_reservation" }
     | { state: "indeterminate"; code: "broker_epoch_changed" | "claim_history_unavailable" }
   >;

@@ -1185,6 +1185,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             messageId: frame.messageId,
             attempt: frame.attempt,
             brokerEpoch: frame.brokerEpoch,
+            endpointEpoch: frame.endpointEpoch,
             toSessionId: frame.toSessionId,
             recipientNamespace: frame.recipientNamespace,
             sender: frame.sender,

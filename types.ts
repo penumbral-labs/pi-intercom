@@ -140,7 +140,7 @@ export type ClientMessage =
   | OpaqueDispatchClientFrame;
 
 export type BrokerMessage =
-  | { type: "registered"; sessionId: string; features?: string[]; brokerEpoch?: string }
+  | { type: "registered"; sessionId: string; features?: string[]; brokerEpoch?: string; endpointEpoch?: string }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
   | { type: "message"; from: SessionInfo; message: Message }
   | { type: "presence_update"; session: SessionInfo }
@@ -184,7 +184,7 @@ export type OpaqueDispatchReason =
   | "unsupported_host" | "unsupported_broker" | "unsupported_target"
   | "unknown_exact_target" | "self_dispatch_unsupported" | "invalid_request"
   | "invalid_frame" | "request_conflict" | "limit_exceeded" | "rate_limited"
-  | "broker_epoch_changed" | "claim_history_unavailable"
+  | "broker_epoch_changed" | "target_rebound" | "endpoint_epoch_changed" | "claim_history_unavailable"
   | "payload_too_large" | "consumer_missing" | "consumer_unloaded"
   | "consumer_refused" | "consumer_threw" | "consumer_failed"
   | "reservation_timeout" | "claim_timeout" | "malformed_consumer_result"
@@ -211,23 +211,27 @@ export interface OpaqueDispatchReceipt {
 }
 
 export type OpaqueDispatchClientFrame =
-  | { type: "opaque_dispatch_v1_send"; operationId: string; requestId: string; senderNamespace: string; toSessionId: string; targetEpoch?: string; recipientNamespace: string; payload: unknown; supersedesMessageId?: string }
+  | { type: "opaque_dispatch_v1_send"; operationId: string; requestId: string; senderNamespace: string; toSessionId: string; targetEpoch: string; recipientNamespace: string; payload: unknown; supersedesMessageId?: string }
   | { type: "opaque_dispatch_v1_cancel"; operationId: string; senderNamespace: string; messageId: string }
-  | { type: "opaque_dispatch_v1_reservation_result"; reservationId: string; messageId: string; decision: "reserved" | "refused" | "failed_closed"; reason?: OpaqueDispatchReason }
-  | { type: "opaque_dispatch_v1_claim"; operationId: string; reservationId: string; messageId: string }
-  | { type: "opaque_dispatch_v1_fail"; operationId: string; reservationId: string; messageId: string; reason: "consumer_failed" }
-  | { type: "opaque_dispatch_v1_claim_status"; operationId: string; recipientNamespace: string; brokerEpoch: string; reservationId: string; messageId: string }
+  | { type: "opaque_dispatch_v1_reservation_result"; endpointEpoch: string; reservationId: string; messageId: string; decision: "reserved" | "refused" | "failed_closed"; reason?: OpaqueDispatchReason }
+  | { type: "opaque_dispatch_v1_claim"; operationId: string; endpointEpoch: string; reservationId: string; messageId: string }
+  | { type: "opaque_dispatch_v1_fail"; operationId: string; endpointEpoch: string; reservationId: string; messageId: string; reason: "consumer_failed" }
+  | { type: "opaque_dispatch_v1_claim_status"; operationId: string; recipientNamespace: string; brokerEpoch: string; endpointEpoch: string; reservationId: string; messageId: string }
   | { type: "opaque_dispatch_v1_peer_capability_get"; operationId: string; toSessionId: string; recipientNamespace: string }
   | { type: "opaque_dispatch_v1_receipt_ack"; senderNamespace: string; messageId: string; sequence: number };
 
 export type OpaqueDispatchBrokerFrame =
   | { type: "opaque_dispatch_v1_ack"; operationId: string; requestId: string; messageId: string; brokerEpoch: string; deliveryState: "live" | "mailbox_queued" }
   | { type: "opaque_dispatch_v1_rejected"; operationId: string; requestId?: string; messageId?: string; code: OpaqueDispatchReason; terminal?: "refused" | "failed_closed" }
-  | { type: "opaque_dispatch_v1_offer"; reservationId: string; requestId: string; messageId: string; attempt: number; brokerEpoch: string; toSessionId: string; recipientNamespace: string; sender: OpaqueDispatchSender; payload: unknown; reserveBy: number }
+  | { type: "opaque_dispatch_v1_offer"; reservationId: string; requestId: string; messageId: string; attempt: number; brokerEpoch: string; endpointEpoch: string; toSessionId: string; recipientNamespace: string; sender: OpaqueDispatchSender; payload: unknown; reserveBy: number }
   | { type: "opaque_dispatch_v1_reservation_ended"; messageId: string; reservationId: string; outcome: "expired" | "cancelled" | "superseded" | "failed_closed"; reason?: OpaqueDispatchReason }
   | { type: "opaque_dispatch_v1_receipt"; senderNamespace: string; receipt: OpaqueDispatchReceipt }
   | { type: "opaque_dispatch_v1_claim_result"; operationId: string; reservationId: string; messageId: string; claimed: boolean; code?: OpaqueDispatchReason }
   | { type: "opaque_dispatch_v1_fail_result"; operationId: string; reservationId: string; messageId: string; failedClosed: boolean; code?: OpaqueDispatchReason }
   | { type: "opaque_dispatch_v1_claim_status_result"; operationId: string; brokerEpoch: string; reservationId: string; messageId: string; result: { state: "claimed" } | { state: "reserved" } | { state: "stale"; code: "stale_reservation" } | { state: "indeterminate"; code: "broker_epoch_changed" | "claim_history_unavailable" } }
   | { type: "opaque_dispatch_v1_cancel_result"; operationId: string; messageId: string; cancelled: boolean; code?: OpaqueDispatchReason }
-  | { type: "opaque_dispatch_v1_peer_capability_result"; operationId: string; toSessionId: string; recipientNamespace: string; state: "present" | "absent" | "unknown"; version?: 1 };
+  | ({ type: "opaque_dispatch_v1_peer_capability_result"; operationId: string; toSessionId: string; recipientNamespace: string } & (
+      | { state: "present"; version: 1; endpointEpoch: string }
+      | { state: "absent"; endpointEpoch: string }
+      | { state: "unknown" }
+    ));

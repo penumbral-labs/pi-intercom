@@ -158,6 +158,7 @@ export function isExtensionStateSnapshot(value: unknown): value is ExtensionStat
 const OPAQUE_REASONS = new Set<OpaqueDispatchReason>([
   "unsupported_host", "unsupported_broker", "unsupported_target", "unknown_exact_target", "self_dispatch_unsupported",
   "invalid_request", "invalid_frame", "request_conflict", "limit_exceeded", "rate_limited", "broker_epoch_changed",
+  "target_rebound", "endpoint_epoch_changed",
   "claim_history_unavailable", "payload_too_large", "consumer_missing", "consumer_unloaded", "consumer_refused",
   "consumer_threw", "consumer_failed", "reservation_timeout", "claim_timeout", "malformed_consumer_result",
   "stale_reservation", "receiver_disconnected", "capability_invalidated", "queued_supersede_unsupported",
@@ -202,29 +203,29 @@ export function isOpaqueDispatchClientFrame(value: unknown): value is OpaqueDisp
   if (!isRecord(value) || typeof value.type !== "string") return false;
   switch (value.type) {
     case "opaque_dispatch_v1_send":
-      return hasExactKeys(value, ["type", "operationId", "requestId", "senderNamespace", "toSessionId", "recipientNamespace", "payload"], ["targetEpoch", "supersedesMessageId"])
+      return hasExactKeys(value, ["type", "operationId", "requestId", "senderNamespace", "toSessionId", "targetEpoch", "recipientNamespace", "payload"], ["supersedesMessageId"])
         && isBoundedId(value.operationId) && isBoundedId(value.requestId) && isNamespace(value.senderNamespace)
-        && isSessionId(value.toSessionId) && (value.targetEpoch === undefined || isBoundedId(value.targetEpoch)) && isNamespace(value.recipientNamespace)
+        && isSessionId(value.toSessionId) && isBoundedId(value.targetEpoch) && isNamespace(value.recipientNamespace)
         && (value.supersedesMessageId === undefined || isUuid(value.supersedesMessageId));
     case "opaque_dispatch_v1_cancel":
       return hasExactKeys(value, ["type", "operationId", "senderNamespace", "messageId"])
         && isBoundedId(value.operationId) && isNamespace(value.senderNamespace) && isUuid(value.messageId);
     case "opaque_dispatch_v1_reservation_result":
-      return hasExactKeys(value, ["type", "reservationId", "messageId", "decision"], ["reason"])
-        && isUuid(value.reservationId) && isUuid(value.messageId)
+      return hasExactKeys(value, ["type", "endpointEpoch", "reservationId", "messageId", "decision"], ["reason"])
+        && isBoundedId(value.endpointEpoch) && isUuid(value.reservationId) && isUuid(value.messageId)
         && (value.decision === "reserved" || value.decision === "refused" || value.decision === "failed_closed")
         && (value.decision === "reserved"
           ? value.reason === undefined
           : value.reason === undefined || (isOpaqueDispatchReason(value.reason) && OPAQUE_CONSUMER_REASONS.has(value.reason)));
     case "opaque_dispatch_v1_claim":
-      return hasExactKeys(value, ["type", "operationId", "reservationId", "messageId"])
-        && isBoundedId(value.operationId) && isUuid(value.reservationId) && isUuid(value.messageId);
+      return hasExactKeys(value, ["type", "operationId", "endpointEpoch", "reservationId", "messageId"])
+        && isBoundedId(value.operationId) && isBoundedId(value.endpointEpoch) && isUuid(value.reservationId) && isUuid(value.messageId);
     case "opaque_dispatch_v1_fail":
-      return hasExactKeys(value, ["type", "operationId", "reservationId", "messageId", "reason"])
-        && isBoundedId(value.operationId) && isUuid(value.reservationId) && isUuid(value.messageId) && value.reason === "consumer_failed";
+      return hasExactKeys(value, ["type", "operationId", "endpointEpoch", "reservationId", "messageId", "reason"])
+        && isBoundedId(value.operationId) && isBoundedId(value.endpointEpoch) && isUuid(value.reservationId) && isUuid(value.messageId) && value.reason === "consumer_failed";
     case "opaque_dispatch_v1_claim_status":
-      return hasExactKeys(value, ["type", "operationId", "recipientNamespace", "brokerEpoch", "reservationId", "messageId"])
-        && isBoundedId(value.operationId) && isNamespace(value.recipientNamespace) && isUuid(value.brokerEpoch)
+      return hasExactKeys(value, ["type", "operationId", "recipientNamespace", "brokerEpoch", "endpointEpoch", "reservationId", "messageId"])
+        && isBoundedId(value.operationId) && isNamespace(value.recipientNamespace) && isUuid(value.brokerEpoch) && isBoundedId(value.endpointEpoch)
         && isUuid(value.reservationId) && isUuid(value.messageId);
     case "opaque_dispatch_v1_peer_capability_get":
       return hasExactKeys(value, ["type", "operationId", "toSessionId", "recipientNamespace"])
@@ -250,9 +251,9 @@ export function isOpaqueDispatchBrokerFrame(value: unknown): value is OpaqueDisp
         && (value.messageId === undefined || isUuid(value.messageId)) && isOpaqueDispatchReason(value.code)
         && (value.terminal === undefined || value.terminal === "refused" || value.terminal === "failed_closed");
     case "opaque_dispatch_v1_offer":
-      return hasExactKeys(value, ["type", "reservationId", "requestId", "messageId", "attempt", "brokerEpoch", "toSessionId", "recipientNamespace", "sender", "payload", "reserveBy"])
+      return hasExactKeys(value, ["type", "reservationId", "requestId", "messageId", "attempt", "brokerEpoch", "endpointEpoch", "toSessionId", "recipientNamespace", "sender", "payload", "reserveBy"])
         && isUuid(value.reservationId) && isBoundedId(value.requestId) && isUuid(value.messageId)
-        && isSafeInteger(value.attempt, 1, 8) && isUuid(value.brokerEpoch) && isSessionId(value.toSessionId)
+        && isSafeInteger(value.attempt, 1, 8) && isUuid(value.brokerEpoch) && isBoundedId(value.endpointEpoch) && isSessionId(value.toSessionId)
         && isNamespace(value.recipientNamespace) && isOpaqueSender(value.sender) && isSafeInteger(value.reserveBy);
     case "opaque_dispatch_v1_reservation_ended":
       return hasExactKeys(value, ["type", "messageId", "reservationId", "outcome"], ["reason"])
@@ -279,10 +280,12 @@ export function isOpaqueDispatchBrokerFrame(value: unknown): value is OpaqueDisp
         && isBoundedId(value.operationId) && isUuid(value.messageId) && typeof value.cancelled === "boolean"
         && (value.code === undefined || isOpaqueDispatchReason(value.code));
     case "opaque_dispatch_v1_peer_capability_result":
-      return hasExactKeys(value, ["type", "operationId", "toSessionId", "recipientNamespace", "state"], ["version"])
-        && isBoundedId(value.operationId) && isSessionId(value.toSessionId) && isNamespace(value.recipientNamespace)
-        && (value.state === "present" || value.state === "absent" || value.state === "unknown")
-        && (value.version === undefined || value.version === 1) && (value.state === "present" ? value.version === 1 : value.version === undefined);
+      if (!isBoundedId(value.operationId) || !isSessionId(value.toSessionId) || !isNamespace(value.recipientNamespace)) return false;
+      if (value.state === "present") return hasExactKeys(value, ["type", "operationId", "toSessionId", "recipientNamespace", "state", "version", "endpointEpoch"])
+        && value.version === 1 && isBoundedId(value.endpointEpoch);
+      if (value.state === "absent") return hasExactKeys(value, ["type", "operationId", "toSessionId", "recipientNamespace", "state", "endpointEpoch"])
+        && isBoundedId(value.endpointEpoch);
+      return value.state === "unknown" && hasExactKeys(value, ["type", "operationId", "toSessionId", "recipientNamespace", "state"]);
     default:
       return false;
   }

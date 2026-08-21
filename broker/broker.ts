@@ -281,18 +281,7 @@ class IntercomBroker {
     socket.on("close", () => {
       clearRegistrationTimeout();
       this.connections.delete(socket);
-      if (sessionId) {
-        const existing = this.sessions.get(sessionId);
-        if (existing?.socket === socket) {
-          this.rememberDisconnectedSession(existing.info);
-          this.sessions.delete(sessionId);
-          this.clearMessageReceiptRoutesForSession(sessionId);
-          this.broadcast({ type: "session_left", sessionId }, sessionId);
-          this.recomputeNamespaceOwners();
-          this.opaqueDispatch.endpointDisconnected(sessionId);
-          this.scheduleShutdownCheck();
-        }
-      }
+      if (sessionId) this.retireSession(sessionId, socket);
     });
 
     socket.on("error", (error) => {
@@ -433,9 +422,10 @@ class IntercomBroker {
           socket.destroy();
           break;
         }
+        const ownerOrder = previous?.ownerOrder ?? this.nextOwnerOrder++;
         if (previous) {
           this.clearAskEdgesForSession(id);
-          this.clearMessageReceiptRoutesForSession(id);
+          this.retireSession(id, previous.socket);
           previous.socket.end();
         }
         setId(id);
@@ -460,7 +450,7 @@ class IntercomBroker {
           socket,
           info,
           lastPresenceBroadcastAt: Date.now(),
-          ownerOrder: previous?.ownerOrder ?? this.nextOwnerOrder++,
+          ownerOrder,
           extensions,
         };
         this.sessions.set(id, connectedSession);
@@ -485,6 +475,7 @@ class IntercomBroker {
             OPAQUE_DISPATCH_FEATURE,
           ],
           brokerEpoch: BROKER_EPOCH,
+          endpointEpoch: info.endpointEpoch,
         });
         this.broadcast({ type: "session_joined", session: info }, id);
 
@@ -518,16 +509,7 @@ class IntercomBroker {
         if (!currentId) {
           throw new Error("Received unregister before register");
         }
-        const existing = this.sessions.get(currentId);
-        if (existing?.socket === socket) {
-          this.rememberDisconnectedSession(existing.info);
-          this.sessions.delete(currentId);
-          this.clearMessageReceiptRoutesForSession(currentId);
-          this.broadcast({ type: "session_left", sessionId: currentId }, currentId);
-          this.recomputeNamespaceOwners();
-          this.opaqueDispatch.endpointDisconnected(currentId);
-          this.scheduleShutdownCheck();
-        }
+        this.retireSession(currentId, socket);
         setId(null);
         break;
       }
@@ -1033,13 +1015,17 @@ class IntercomBroker {
           ?? this.disconnectedSessions.get(clientMessage.toSessionId)?.info;
         const receive = target?.opaqueDispatch?.namespaces.some((entry) =>
           entry.namespace === clientMessage.recipientNamespace && entry.roles.includes("receive"));
+        const result = target
+          ? receive
+            ? { state: "present" as const, version: 1 as const, endpointEpoch: target.endpointEpoch! }
+            : { state: "absent" as const, endpointEpoch: target.endpointEpoch! }
+          : { state: "unknown" as const };
         writeOpaqueTo(this.opaqueEndpoint(currentId), { anyOpaqueCapability: true }, {
           type: "opaque_dispatch_v1_peer_capability_result",
           operationId: clientMessage.operationId,
           toSessionId: clientMessage.toSessionId,
           recipientNamespace: clientMessage.recipientNamespace,
-          state: target ? (receive ? "present" : "absent") : "unknown",
-          ...(receive ? { version: 1 } : {}),
+          ...result,
         });
         break;
       }
@@ -1166,6 +1152,19 @@ class IntercomBroker {
     for (const [key, record] of this.deliveryRecords) {
       if (now - record.createdAt > DELIVERY_RECORD_RETENTION_MS) this.deliveryRecords.delete(key);
     }
+  }
+
+  private retireSession(sessionId: string, socket: net.Socket): boolean {
+    const existing = this.sessions.get(sessionId);
+    if (existing?.socket !== socket) return false;
+    this.opaqueDispatch.endpointDisconnected(sessionId);
+    this.rememberDisconnectedSession(existing.info);
+    this.sessions.delete(sessionId);
+    this.clearMessageReceiptRoutesForSession(sessionId);
+    this.broadcast({ type: "session_left", sessionId }, sessionId);
+    this.recomputeNamespaceOwners();
+    this.scheduleShutdownCheck();
+    return true;
   }
 
   private opaqueEndpoint(sessionId: string): OpaqueEndpoint | undefined {

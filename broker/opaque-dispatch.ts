@@ -22,7 +22,7 @@ const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
 
 export interface OpaqueEndpoint {
   sessionId: string;
-  endpointEpoch?: string;
+  endpointEpoch: string;
   info: SessionInfo;
   extensions?: ExtensionCapability[];
   connected: boolean;
@@ -82,6 +82,7 @@ interface RecordState {
   requestId: string;
   messageId: string;
   targetSessionId: string;
+  targetEpoch: string;
   recipientNamespace: string;
   createdAt: number;
   payload?: unknown;
@@ -157,8 +158,8 @@ export function canonicalizeOpaquePayload(value: unknown): CanonicalPayloadResul
   }
 }
 
-function fingerprint(payloadJson: string, targetSessionId: string, targetEpoch: string, recipientNamespace: string, supersedesMessageId?: string): string {
-  const envelope = `{"payload":${payloadJson},"recipientNamespace":${JSON.stringify(recipientNamespace)},"supersedesMessageId":${JSON.stringify(supersedesMessageId ?? null)},"targetEpoch":${JSON.stringify(targetEpoch)},"toSessionId":${JSON.stringify(targetSessionId)}}`;
+function fingerprint(payloadJson: string, targetSessionId: string, recipientNamespace: string, supersedesMessageId?: string): string {
+  const envelope = `{"payload":${payloadJson},"recipientNamespace":${JSON.stringify(recipientNamespace)},"supersedesMessageId":${JSON.stringify(supersedesMessageId ?? null)},"toSessionId":${JSON.stringify(targetSessionId)}}`;
   return createHash("sha256").update(envelope).digest("hex");
 }
 
@@ -207,7 +208,7 @@ export class OpaqueDispatchManager {
 
   rateLimited(endpoint: OpaqueEndpoint, frame: OpaqueDispatchClientFrame): void {
     if (frame.type === "opaque_dispatch_v1_reservation_result" || frame.type === "opaque_dispatch_v1_claim" || frame.type === "opaque_dispatch_v1_fail") {
-      const record = this.authorizedReservation(endpoint, frame.messageId, frame.reservationId);
+      const record = this.authorizedReservation(endpoint, frame.endpointEpoch, frame.messageId, frame.reservationId);
       if (!record) return;
       this.endReservation(record, "failed_closed", "rate_limited");
       this.rejectWaiters(record, "rate_limited", "failed_closed");
@@ -225,8 +226,12 @@ export class OpaqueDispatchManager {
   }
 
   endpointAvailable(sessionId: string): void {
+    const endpoint = this.hooks.endpoint(sessionId);
     for (const record of this.records.values()) {
-      if (record.status === "queued" && record.targetSessionId === sessionId) this.offer(record);
+      if (record.status === "queued" && record.targetSessionId === sessionId) {
+        if (endpoint?.endpointEpoch !== record.targetEpoch) this.terminalize(record, "failed_closed", "endpoint_epoch_changed");
+        else this.offer(record);
+      }
       if (record.originSessionId === sessionId) this.replayReceipts(record);
     }
   }
@@ -298,7 +303,7 @@ export class OpaqueDispatchManager {
     const canonical = canonicalizeOpaquePayload(frame.payload);
     if (!canonical.ok) return void reject(canonical.code);
     const key = `${origin.sessionId}\0${frame.senderNamespace}\0${frame.requestId}`;
-    const digest = fingerprint(canonical.json, frame.toSessionId, frame.targetEpoch ?? "", frame.recipientNamespace, frame.supersedesMessageId);
+    const digest = fingerprint(canonical.json, frame.toSessionId, frame.recipientNamespace, frame.supersedesMessageId);
     const existing = this.records.get(key);
     if (existing) {
       if (existing.digest !== digest) return void reject("request_conflict", existing.messageId);
@@ -310,7 +315,8 @@ export class OpaqueDispatchManager {
       return this.replayResult(existing, frame.operationId);
     }
     const target = this.hooks.endpoint(frame.toSessionId);
-    if (!target || (target.endpointEpoch !== undefined && target.endpointEpoch !== frame.targetEpoch)) return void reject("unknown_exact_target");
+    if (!target) return void reject("unknown_exact_target");
+    if (target.endpointEpoch !== frame.targetEpoch) return void reject("target_rebound");
     if (!hasRole(target, frame.recipientNamespace, "receive")) return void reject("unsupported_target");
     if (!this.hasCapacity(origin.sessionId, frame.senderNamespace, frame.toSessionId, frame.recipientNamespace)) return void reject("limit_exceeded");
     if (frame.supersedesMessageId) {
@@ -327,7 +333,7 @@ export class OpaqueDispatchManager {
     const record: RecordState = {
       key, digest, originSessionId: origin.sessionId, senderNamespace: frame.senderNamespace,
       requestId: frame.requestId, messageId: randomUUID(), targetSessionId: frame.toSessionId,
-      recipientNamespace: frame.recipientNamespace, createdAt: now, payload: canonical.normalized,
+      targetEpoch: frame.targetEpoch, recipientNamespace: frame.recipientNamespace, createdAt: now, payload: canonical.normalized,
       status: "queued", attempt: 0,
       waiters: [{ operationId: frame.operationId, requestId: frame.requestId }], receipts: [], ackedThrough: 0,
     };
@@ -357,6 +363,7 @@ export class OpaqueDispatchManager {
 
   private offer(record: RecordState): void {
     const target = this.hooks.endpoint(record.targetSessionId);
+    if (target && target.endpointEpoch !== record.targetEpoch) return this.terminalize(record, "failed_closed", "endpoint_epoch_changed");
     if (!target?.connected || !target.write || !hasRole(target, record.recipientNamespace, "receive") || record.payload === undefined) return;
     if (record.attempt >= MAX_OPAQUE_ATTEMPTS) return this.terminalize(record, "failed_closed", "attempt_limit");
     record.attempt += 1;
@@ -374,7 +381,7 @@ export class OpaqueDispatchManager {
     const origin = this.hooks.endpoint(record.originSessionId);
     const offered = writeOpaqueTo(target, { namespace: record.recipientNamespace, role: "receive" }, {
       type: "opaque_dispatch_v1_offer", reservationId, requestId: record.requestId, messageId: record.messageId,
-      attempt: record.attempt, brokerEpoch: this.hooks.brokerEpoch, toSessionId: record.targetSessionId,
+      attempt: record.attempt, brokerEpoch: this.hooks.brokerEpoch, endpointEpoch: record.targetEpoch, toSessionId: record.targetSessionId,
       recipientNamespace: record.recipientNamespace,
       sender: {
         sessionId: record.originSessionId, namespace: record.senderNamespace,
@@ -396,6 +403,7 @@ export class OpaqueDispatchManager {
     const record = this.byMessageId.get(frame.messageId);
     const reservation = record?.reservation;
     if (!record || !reservation || reservation.id !== frame.reservationId || reservation.targetSessionId !== endpoint.sessionId
+      || record.targetEpoch !== endpoint.endpointEpoch || frame.endpointEpoch !== record.targetEpoch
       || (frame.decision === "reserved" ? record.status !== "offered" : (record.status !== "offered" && record.status !== "reserved"))) return;
     // An exact current receiver may fail closed after its capability-removal frame
     // has been read; accepting only the negative settlement preserves dispose order.
@@ -423,11 +431,12 @@ export class OpaqueDispatchManager {
   private claim(endpoint: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_claim" }>): void {
     const known = this.byMessageId.get(frame.messageId);
     if (known?.status === "claimed" && known.lastReservationId === frame.reservationId
-      && known.targetSessionId === endpoint.sessionId && hasRole(endpoint, known.recipientNamespace, "receive")) {
+      && known.targetSessionId === endpoint.sessionId && known.targetEpoch === endpoint.endpointEpoch
+      && frame.endpointEpoch === known.targetEpoch && hasRole(endpoint, known.recipientNamespace, "receive")) {
       writeOpaqueTo(endpoint, { namespace: known.recipientNamespace, role: "receive" }, { type: "opaque_dispatch_v1_claim_result", operationId: frame.operationId, reservationId: frame.reservationId, messageId: frame.messageId, claimed: true });
       return;
     }
-    const record = this.authorizedReservation(endpoint, frame.messageId, frame.reservationId);
+    const record = this.authorizedReservation(endpoint, frame.endpointEpoch, frame.messageId, frame.reservationId);
     if (!record || record.status !== "reserved") {
       writeOpaqueTo(endpoint, { anyOpaqueCapability: true }, { type: "opaque_dispatch_v1_claim_result", operationId: frame.operationId, reservationId: frame.reservationId, messageId: frame.messageId, claimed: false, code: "stale_reservation" });
       return;
@@ -444,7 +453,7 @@ export class OpaqueDispatchManager {
   }
 
   private fail(endpoint: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_fail" }>): void {
-    const record = this.authorizedReservation(endpoint, frame.messageId, frame.reservationId);
+    const record = this.authorizedReservation(endpoint, frame.endpointEpoch, frame.messageId, frame.reservationId);
     if (!record || record.status !== "reserved") {
       writeOpaqueTo(endpoint, { anyOpaqueCapability: true }, { type: "opaque_dispatch_v1_fail_result", operationId: frame.operationId, reservationId: frame.reservationId, messageId: frame.messageId, failedClosed: false, code: "stale_reservation" });
       return;
@@ -470,7 +479,9 @@ export class OpaqueDispatchManager {
     let result: Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_claim_status_result" }>["result"];
     if (frame.brokerEpoch !== this.hooks.brokerEpoch) result = { state: "indeterminate", code: "broker_epoch_changed" };
     else if (!record) result = { state: "indeterminate", code: "claim_history_unavailable" };
-    else if (record.targetSessionId !== endpoint.sessionId || record.recipientNamespace !== frame.recipientNamespace || !hasRole(endpoint, frame.recipientNamespace, "receive")) result = { state: "indeterminate", code: "claim_history_unavailable" };
+    else if (record.targetSessionId !== endpoint.sessionId || record.recipientNamespace !== frame.recipientNamespace
+      || record.targetEpoch !== endpoint.endpointEpoch || frame.endpointEpoch !== record.targetEpoch
+      || !hasRole(endpoint, frame.recipientNamespace, "receive")) result = { state: "indeterminate", code: "claim_history_unavailable" };
     else if (record.status === "claimed" && record.lastReservationId === frame.reservationId) result = { state: "claimed" };
     else if (record.status === "reserved" && record.reservation?.id === frame.reservationId) result = { state: "reserved" };
     else result = { state: "stale", code: "stale_reservation" };
@@ -483,9 +494,10 @@ export class OpaqueDispatchManager {
     record.ackedThrough = Math.max(record.ackedThrough, frame.sequence);
   }
 
-  private authorizedReservation(endpoint: OpaqueEndpoint, messageId: string, reservationId: string): RecordState | undefined {
+  private authorizedReservation(endpoint: OpaqueEndpoint, endpointEpoch: string, messageId: string, reservationId: string): RecordState | undefined {
     const record = this.byMessageId.get(messageId);
     return record?.reservation?.id === reservationId && record.targetSessionId === endpoint.sessionId
+      && record.targetEpoch === endpoint.endpointEpoch && record.targetEpoch === endpointEpoch
       && hasRole(endpoint, record.recipientNamespace, "receive") ? record : undefined;
   }
 
@@ -531,7 +543,9 @@ export class OpaqueDispatchManager {
     if (!reservation) return;
     clearTimeout(reservation.timer);
     const target = this.hooks.endpoint(record.targetSessionId);
-    writeOpaqueTo(target, { namespace: record.recipientNamespace, role: "receive" }, { type: "opaque_dispatch_v1_reservation_ended", messageId: record.messageId, reservationId: reservation.id, outcome, ...(reason ? { reason } : {}) });
+    if (target?.endpointEpoch === record.targetEpoch) {
+      writeOpaqueTo(target, { namespace: record.recipientNamespace, role: "receive" }, { type: "opaque_dispatch_v1_reservation_ended", messageId: record.messageId, reservationId: reservation.id, outcome, ...(reason ? { reason } : {}) });
+    }
     record.reservation = undefined;
   }
 
