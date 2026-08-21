@@ -483,13 +483,20 @@ Registry-ready v2 advertises `opaque-dispatch-v1` and `extension-state-refresh-v
 no ordinary name/prefix/cwd/mailbox fallback and no confirmation dialog.
 
 Each accepted record, offer, reservation, and claim is bound to the broker-owned endpoint epoch returned by peer capability
-lookup. Senders re-resolve one admission-time `target_rebound` using the same request ID. A request ID identifies one logical
-send: identical retries replay its original acknowledgement or terminal result, while changed content is a
-`request_conflict`. Every registration mints a new endpoint epoch. Disconnected-target custody therefore reports
-`mailbox_queued` and a `queued` receipt only until the target reconnects, then deterministically fails closed with an
-`endpoint_epoch_changed` receipt without offering the payload. After that terminal rotation result, the sender must use a
-new request ID to create work for the replacement endpoint; reusing the old ID replays the old terminal result for the
-one-hour tombstone lifetime.
+lookup. Every opaque frame is authorized against the session's current live socket: the frame's connection must still be the
+exact socket stored for that session ID, including on the rate-limited path. Replaced sockets cannot act as their successor.
+The authority is intentionally asymmetric: the origin session ID plus sender namespace authorizes send, cancel, and receipt
+acknowledgement, while the target session ID plus recipient namespace and endpoint epoch authorizes reservation, claim,
+failure, and claim reconciliation. Namespace ownership metadata is descriptive here and does not grant origin authority.
+
+Senders re-resolve one admission-time `target_rebound` using the same request ID. A request ID identifies one logical send:
+identical retries replay its original acknowledgement or terminal result, while changed content is a `request_conflict`.
+Every registration mints a new endpoint epoch. `endpointAvailable(sessionId)` is called only after the replacement session is
+installed with its fresh epoch; queued custody for that target is then terminalized as `endpoint_epoch_changed` before any
+payload can be offered. Disconnected-target custody therefore reports `mailbox_queued` and a `queued` receipt only until the
+target reconnects, then deterministically fails closed with an `endpoint_epoch_changed` receipt without offering the
+payload. After that terminal rotation result, the sender must use a new request ID to create work for the replacement
+endpoint; reusing the old ID replays the old terminal result for the one-hour tombstone lifetime.
 
 Consumers must persist and fsync the broker epoch, endpoint epoch, message ID, reservation ID, and payload before calling
 `claim()`. The registered and offer contracts expose the consumer's endpoint epoch. Only an accepted claim result authorizes

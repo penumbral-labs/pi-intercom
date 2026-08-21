@@ -15,6 +15,7 @@
     "reply-tracker.ts",
     "stale-asks.ts",
     "broker/**/*.ts",
+    "!broker/**/*.test.ts",
     "ui/**/*.ts",
     "skills/**/*"
   ],

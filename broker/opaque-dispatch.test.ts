@@ -79,7 +79,7 @@ test("live dispatch offers once, reserves, then claims with ordered receipts", (
   manager.shutdown();
 });
 
-test("synchronous offer write failure terminalizes instead of stranding capacity", () => {
+test("synchronous offer write failure terminalizes as receiver disconnected", () => {
   const { manager, endpoints, senderFrames, send } = harness();
   endpoints.get("receiver")!.write = () => { throw new Error("sync write failed"); };
   send();
@@ -208,11 +208,11 @@ test("stale endpoint epochs reject opaque dispatch before payload custody", () =
   manager.shutdown();
 });
 
-test("reserved supersede ends the old reservation before offering replacement", () => {
+test("offered supersede settles pending waiters before offering replacement", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send("original", "original-op");
+  send("original", "original-waiter");
   const original = offer(receiverFrames);
-  manager.handle(endpoints.get("receiver")!, { type: "opaque_dispatch_v1_reservation_result", endpointEpoch: "receiver-epoch", reservationId: original.reservationId, messageId: original.messageId, decision: "reserved" });
   manager.handle(endpoints.get("sender")!, {
     type: "opaque_dispatch_v1_send",
     operationId: "replacement-op",
@@ -227,7 +227,13 @@ test("reserved supersede ends the old reservation before offering replacement", 
   const originalEndedIndex = receiverFrames.findIndex((frame) => frame.type === "opaque_dispatch_v1_reservation_ended" && frame.messageId === original.messageId);
   const replacementOfferIndex = receiverFrames.findIndex((frame) => frame.type === "opaque_dispatch_v1_offer" && frame.messageId !== original.messageId);
   assert.ok(originalEndedIndex >= 0 && replacementOfferIndex > originalEndedIndex);
-  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "superseded"), true);
+  assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_receipt"
+    && frame.receipt.status === "superseded"), true);
+  const waiters = senderFrames.filter((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_rejected" }> => frame.type === "opaque_dispatch_v1_rejected" && frame.requestId === "original");
+  assert.deepEqual(waiters.map((frame) => ({ operationId: frame.operationId, code: frame.code, terminal: frame.terminal })), [
+    { operationId: "original-op", code: "already_terminal", terminal: "failed_closed" },
+    { operationId: "original-waiter", code: "already_terminal", terminal: "failed_closed" },
+  ]);
   manager.shutdown();
 });
 
@@ -296,14 +302,19 @@ test("a disconnected offer is never attempted on its replacement endpoint", () =
   manager.shutdown();
 });
 
-test("cancel ends reservation before terminal receipt", () => {
+test("cancel ends reservation and rejects pending send waiters before terminal receipt", () => {
   const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
   send();
+  send("request", "pending-send");
   const offered = offer(receiverFrames);
-  manager.handle(endpoints.get("receiver")!, { type: "opaque_dispatch_v1_reservation_result", endpointEpoch: "receiver-epoch", reservationId: offered.reservationId, messageId: offered.messageId, decision: "reserved" });
   const before = receiverFrames.length;
   manager.handle(endpoints.get("sender")!, { type: "opaque_dispatch_v1_cancel", operationId: "cancel-op", senderNamespace: "sender/v1", messageId: offered.messageId });
   assert.equal(receiverFrames[before]?.type, "opaque_dispatch_v1_reservation_ended");
+  const waiters = senderFrames.filter((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_rejected" }> => frame.type === "opaque_dispatch_v1_rejected" && frame.requestId === "request");
+  assert.deepEqual(waiters.map((frame) => ({ operationId: frame.operationId, code: frame.code, terminal: frame.terminal })), [
+    { operationId: "send-op", code: "already_terminal", terminal: "failed_closed" },
+    { operationId: "pending-send", code: "already_terminal", terminal: "failed_closed" },
+  ]);
   const terminal = senderFrames.find((frame) => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "cancelled");
   assert.ok(terminal);
   assert.equal(senderFrames.at(-1)?.type, "opaque_dispatch_v1_cancel_result");
@@ -458,16 +469,18 @@ test("reservation and claim deadlines fail closed with typed reasons", async () 
   claimHarness.manager.shutdown();
 });
 
-test("capability invalidation and reservation rate limits fail closed", async () => {
+test("capability invalidation settles pending waiters and reservation rate limits fail closed", async () => {
   const capabilityHarness = harness();
   capabilityHarness.send();
-  const capabilityOffer = offer(capabilityHarness.receiverFrames);
-  capabilityHarness.manager.handle(capabilityHarness.endpoints.get("receiver")!, {
-    type: "opaque_dispatch_v1_reservation_result", endpointEpoch: "receiver-epoch", reservationId: capabilityOffer.reservationId, messageId: capabilityOffer.messageId, decision: "reserved",
-  });
+  capabilityHarness.send("request", "capability-waiter");
   capabilityHarness.endpoints.get("receiver")!.extensions = [];
   capabilityHarness.manager.capabilityChanged("receiver");
   await new Promise((resolve) => setImmediate(resolve));
+  const invalidatedWaiters = capabilityHarness.senderFrames.filter((frame) => frame.type === "opaque_dispatch_v1_rejected");
+  assert.deepEqual(invalidatedWaiters.map((frame) => ({ operationId: frame.operationId, code: frame.code, terminal: frame.terminal })), [
+    { operationId: "send-op", code: "capability_invalidated", terminal: "failed_closed" },
+    { operationId: "capability-waiter", code: "capability_invalidated", terminal: "failed_closed" },
+  ]);
   const invalidated = capabilityHarness.senderFrames.find((frame): frame is Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }> => frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.status === "failed_closed");
   assert.equal(invalidated?.receipt.reason, "capability_invalidated");
   capabilityHarness.manager.shutdown();

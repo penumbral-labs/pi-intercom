@@ -7,6 +7,13 @@ implementation return `Promise<ExtensionStateRefreshResult>` so unsupported brok
 without an unsupported wire write. README and `extension-api.ts` are the public API source of truth. The approved PRD
 remains unchanged as planning history.
 
+## Certified lineage
+
+The reconciliation was verified against the certified opaque baseline when its history was available. That ancestry
+check belongs in release/review validation rather than `npm test`: exported source archives and shallow checkouts may
+not contain the certified commit graph. A full checkout can still run `git merge-base --is-ancestor 0685e199 HEAD` for
+the reconciliation baseline and `git merge-base --is-ancestor 763770b HEAD` for the reviewed transport-fix lineage.
+
 ## Repo-consistency review
 
 The review's error-channel finding was real: opaque sends mixed thrown errors, typed results, and list failures. Opaque

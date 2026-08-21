@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { MAX_PENDING_ASK_EDGES_PER_SESSION } from "./broker/ask-edges.ts";
 import { BROKER_SESSION_ID, type BrokerMessage, type Message, type SessionInfo } from "./types.ts";
@@ -387,11 +387,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
   }
 });
 
-test("reconciliation baseline and production broker launch remain pinned", () => {
-  assert.equal(
-    execFileSync("git", ["merge-base", "0685e199", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
-    execFileSync("git", ["rev-parse", "0685e199"], { cwd: repoDir, encoding: "utf8" }).trim(),
-  );
+test("production broker launch remains pinned", () => {
   const launch = getBrokerLaunchSpec(
     path.join(repoDir, "broker", "broker.ts"),
     "npx",

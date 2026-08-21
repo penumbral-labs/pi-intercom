@@ -1180,13 +1180,7 @@ class IntercomBroker {
         info: connected.info,
         extensions: connected.extensions,
         connected: true,
-        write: (frame) => {
-          try {
-            writeMessage(connected.socket, frame);
-          } catch {
-            // The opaque state machine contains a synchronous destination write failure.
-          }
-        },
+        write: (frame) => writeMessage(connected.socket, frame),
       };
     }
     const disconnected = this.disconnectedSessions.get(sessionId);

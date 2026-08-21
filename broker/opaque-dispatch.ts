@@ -211,7 +211,6 @@ export class OpaqueDispatchManager {
       const record = this.authorizedReservation(endpoint, frame.endpointEpoch, frame.messageId, frame.reservationId);
       if (!record) return;
       this.endReservation(record, "failed_closed", "rate_limited");
-      this.rejectWaiters(record, "rate_limited", "failed_closed");
       this.terminalize(record, "failed_closed", "rate_limited");
       return;
     }
@@ -371,7 +370,6 @@ export class OpaqueDispatchManager {
     const timer = setTimeout(() => {
       if (record.reservation?.id !== reservationId || record.status !== "offered") return;
       this.endReservation(record, "failed_closed", "reservation_timeout");
-      this.rejectWaiters(record, "reservation_timeout", "failed_closed");
       this.terminalize(record, "failed_closed", "reservation_timeout");
     }, this.reservationTimeoutMs());
     timer.unref?.();
@@ -393,7 +391,6 @@ export class OpaqueDispatchManager {
     if (!offered) {
       clearTimeout(timer);
       record.reservation = undefined;
-      this.rejectWaiters(record, "receiver_disconnected", "failed_closed");
       this.terminalize(record, "failed_closed", "receiver_disconnected");
     }
   }
@@ -412,7 +409,6 @@ export class OpaqueDispatchManager {
       const fallback = frame.decision === "refused" ? "consumer_refused" : "consumer_failed";
       const reason = frame.reason && OPAQUE_CONSUMER_REASONS.has(frame.reason) ? frame.reason : fallback;
       this.endReservation(record, "failed_closed", reason);
-      this.rejectWaiters(record, reason, frame.decision === "refused" ? "refused" : "failed_closed");
       this.terminalize(record, frame.decision === "refused" ? "refused" : "failed_closed", reason);
       return;
     }
@@ -551,13 +547,13 @@ export class OpaqueDispatchManager {
   private expire(record: RecordState): void {
     if (record.status === "terminal" || record.status === "claimed") return;
     this.endReservation(record, "expired");
-    this.rejectWaiters(record, "already_terminal", "failed_closed");
     this.terminalize(record, "expired");
   }
 
   private terminalize(record: RecordState, status: Exclude<OpaqueDispatchStatus, "queued" | "reserved" | "claimed">, reason?: OpaqueDispatchReason): void {
     if (record.status === "terminal" || record.status === "claimed") return;
     if (record.activeTimer) clearTimeout(record.activeTimer);
+    this.rejectWaiters(record, reason ?? "already_terminal", status === "refused" ? "refused" : "failed_closed");
     record.status = "terminal";
     record.terminalStatus = status;
     record.terminalReason = reason;
