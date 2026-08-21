@@ -4,6 +4,14 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Added bounded opaque dispatch with exact session/namespace routing, synchronous reservation, durable claim reconciliation, typed receipts, and broker-mediated payload custody.
+- Exposed broker-owned endpoint epochs to registered clients, opaque offers, and peer capability results.
+
+### Changed
+- Opaque dispatch now keeps temporary offline queueing while binding queued, offered, reserved, and claimed state to one endpoint epoch; endpoint rotation fails closed instead of transferring custody.
+- Opaque sends resolve endpoint epochs through the opaque capability channel and retry one `target_rebound` with the same idempotent request ID.
+
 ## [0.11.0] - 2026-08-19
 
 ### Highlights

@@ -14,7 +14,7 @@ const sentinel = "opaque-dogfood-privacy-sentinel";
 const senderNamespace = "dogfood/sender";
 const receiverNamespace = "dogfood/receiver";
 const sender = new IntercomClient();
-const receiver = new IntercomClient();
+let receiver = new IntercomClient();
 
 function registration(name: string, namespace: string, role: "send" | "receive"): SessionRegistration {
   return {
@@ -65,7 +65,7 @@ try {
   const accepted = await acceptedPromise;
   assert.equal(accepted.accepted, true);
 
-  writeFileSync(durablePath, JSON.stringify({ brokerEpoch: offer.brokerEpoch, messageId: offer.messageId, reservationId: offer.reservationId, payload: offer.payload }));
+  writeFileSync(durablePath, JSON.stringify({ brokerEpoch: offer.brokerEpoch, endpointEpoch: offer.endpointEpoch, messageId: offer.messageId, reservationId: offer.reservationId, payload: offer.payload }));
   const file = openSync(durablePath, "r");
   fsyncSync(file);
   closeSync(file);
@@ -73,6 +73,7 @@ try {
   assert.deepEqual(await receiver.claimOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId), { claimed: true });
   assert.deepEqual(await receiver.reconcileOpaqueClaim(receiverNamespace, {
     brokerEpoch: offer.brokerEpoch,
+    endpointEpoch: offer.endpointEpoch,
     messageId: offer.messageId,
     reservationId: offer.reservationId,
   }), { state: "claimed" });
@@ -80,7 +81,33 @@ try {
   assert.equal(JSON.stringify(ordinaryMessages).includes(sentinel), false);
   assert.equal(JSON.stringify(genericBrokerMessages).includes(sentinel), false);
   assert.equal((await sender.send("dogfood-receiver", { text: "ordinary-dogfood-after-opaque" })).delivered, true);
-  console.log(JSON.stringify({ ok: true, brokerEpoch: offer.brokerEpoch, messageId: offer.messageId, durablePath, privacySentinel: "absent-from-ordinary-and-generic-paths" }));
+
+  const oldEpoch = receiver.endpointEpoch;
+  await receiver.disconnect();
+  const queued = await sender.sendOpaqueDispatch(senderNamespace, {
+    requestId: "dogfood-queued-rotation", toSessionId: "dogfood-receiver", recipientNamespace: receiverNamespace,
+    payload: { sentinel, action: "must-fail-on-rotation" },
+  });
+  assert.equal(queued.accepted && queued.deliveryState, "mailbox_queued");
+  const epochChanged = new Promise<Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_receipt" }>>((resolve, reject) => {
+    const timeout = setTimeout(() => { stop(); reject(new Error("dogfood endpoint rotation receipt timeout")); }, 5_000);
+    const stop = sender.onOpaqueDispatch((frame) => {
+      if (frame.type !== "opaque_dispatch_v1_receipt" || frame.receipt.reason !== "endpoint_epoch_changed") return;
+      clearTimeout(timeout); stop(); resolve(frame);
+    });
+  });
+  receiver = new IntercomClient();
+  let replacementOffers = 0;
+  receiver.onOpaqueDispatch((frame) => { if (frame.type === "opaque_dispatch_v1_offer") replacementOffers += 1; });
+  await receiver.connect(registration("dogfood-receiver-replacement", receiverNamespace, "receive"), "dogfood-receiver");
+  assert.notEqual(receiver.endpointEpoch, oldEpoch);
+  await epochChanged;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(replacementOffers, 0);
+
+  console.log(JSON.stringify({ ok: true, brokerEpoch: offer.brokerEpoch, endpointEpoch: offer.endpointEpoch,
+    messageId: offer.messageId, durablePath, rotationFence: "endpoint_epoch_changed",
+    privacySentinel: "absent-from-ordinary-and-generic-paths" }));
 } finally {
   await sender.disconnect().catch(() => undefined);
   await receiver.disconnect().catch(() => undefined);

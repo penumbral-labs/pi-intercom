@@ -374,8 +374,10 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
         "opaque-dispatch-v1",
       ],
       brokerEpoch: (registerMessages[0] as { brokerEpoch: string }).brokerEpoch,
+      endpointEpoch: (registerMessages[0] as { endpointEpoch: string }).endpointEpoch,
     });
     assert.match((registerMessages[0] as { brokerEpoch: string }).brokerEpoch, /^[0-9a-f-]{36}$/);
+    assert.match((registerMessages[0] as { endpointEpoch: string }).endpointEpoch, /^[0-9a-f-]{36}$/);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
       broker.kill("SIGTERM");
@@ -1275,6 +1277,52 @@ test("opaque claim releases receiver reservation before dispose", { concurrency:
     receiverChannel?.dispose();
     await sender.disconnect().catch(() => undefined);
     await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("opaque queued custody fails closed when a stable session reconnects at a new endpoint epoch", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const sender = new IntercomClient();
+  const receiver = new IntercomClient();
+  const replacement = new IntercomClient();
+  const senderNamespace = "opaque/epoch-sender";
+  const receiverNamespace = "opaque/epoch-receiver";
+  const registration = (name: string) => ({
+    name, cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(),
+    extensions: [{ namespace: receiverNamespace, ownerEligible: false, opaqueDispatch: { version: 1 as const, roles: ["receive" as const] } }],
+  });
+  let replacementOffers = 0;
+  try {
+    await receiver.connect(registration("opaque-epoch-receiver"), "opaque-epoch-receiver");
+    const firstEpoch = receiver.endpointEpoch;
+    await sender.connect({
+      name: "opaque-epoch-sender", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace: senderNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "opaque-epoch-sender");
+    await receiver.disconnect();
+    const accepted = await sender.sendOpaqueDispatch(senderNamespace, {
+      requestId: "queued-rotation-request", toSessionId: "opaque-epoch-receiver",
+      recipientNamespace: receiverNamespace, payload: { private: true },
+    });
+    assert.equal(accepted.accepted && accepted.deliveryState, "mailbox_queued");
+    const terminal = new Promise<Extract<BrokerMessage, { type: "opaque_dispatch_v1_receipt" }>>((resolve, reject) => {
+      const timeout = setTimeout(() => { stop(); reject(new Error("endpoint rotation receipt timeout")); }, 2_000);
+      const stop = sender.onOpaqueDispatch((frame) => {
+        if (frame.type !== "opaque_dispatch_v1_receipt" || frame.receipt.reason !== "endpoint_epoch_changed") return;
+        clearTimeout(timeout); stop(); resolve(frame);
+      });
+    });
+    replacement.onOpaqueDispatch((frame) => { if (frame.type === "opaque_dispatch_v1_offer") replacementOffers += 1; });
+    await replacement.connect(registration("opaque-epoch-replacement"), "opaque-epoch-receiver");
+    assert.notEqual(replacement.endpointEpoch, firstEpoch);
+    assert.equal((await terminal).receipt.reason, "endpoint_epoch_changed");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(replacementOffers, 0);
+  } finally {
+    await replacement.disconnect().catch(() => undefined);
+    await receiver.disconnect().catch(() => undefined);
+    await sender.disconnect().catch(() => undefined);
     await cleanup();
   }
 });

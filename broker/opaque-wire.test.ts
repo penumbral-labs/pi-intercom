@@ -139,12 +139,12 @@ test("new client refuses opaque writes to a featureless v0.10-style broker and k
   try {
     await new Promise<void>((resolve, reject) => server.listen(getBrokerSocketPath(process.platform, agentDir), resolve).once("error", reject));
     await client.connect(registration("new-client", senderNamespace, "send"), "new-client");
-    await assert.rejects(client.sendOpaqueDispatch(senderNamespace, {
+    assert.deepEqual(await client.sendOpaqueDispatch(senderNamespace, {
       requestId: "unsupported-request",
       toSessionId: "old-peer",
       recipientNamespace: receiverNamespace,
       payload: { secret: sentinel },
-    }), /unsupported_broker/);
+    }), { accepted: false, requestId: "unsupported-request", code: "unsupported_broker" });
     assert.deepEqual(await client.listSessions(), []);
     assert.equal((await client.send("old-peer", { text: "ordinary-still-live" })).delivered, true);
   } finally {
@@ -231,6 +231,7 @@ test("wire-level opaque flow remains private and ordinary traffic remains usable
     sender.ackOpaqueReceipt(senderNamespace, receipt.receipt.messageId, receipt.receipt.sequence);
     assert.deepEqual(await receiver.reconcileOpaqueClaim(receiverNamespace, {
       brokerEpoch: offer.brokerEpoch,
+      endpointEpoch: offer.endpointEpoch,
       messageId: offer.messageId,
       reservationId: offer.reservationId,
     }), { state: "claimed" });

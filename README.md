@@ -482,12 +482,19 @@ Registry-ready v2 advertises `opaque-dispatch-v1` and `extension-state-refresh-v
 `receive`, or both; `receive` requires synchronous reservation. Addressing is exact full session ID plus namespace, with
 no ordinary name/prefix/cwd/mailbox fallback and no confirmation dialog.
 
-Consumers must persist and fsync the broker epoch, message ID, reservation ID, and payload before calling `claim()`. Only
-an accepted claim result authorizes consumer-owned model injection. Active records live 24 hours; terminal replay lives one
-hour. Attempts are capped at 8, receipts at 20, active records at 256 globally and 32 per sender/target namespace, and
-tombstones at 512 globally and 64 per sender/target namespace. Pending operations are capped at 256 globally and 32 per
-namespace. Same-epoch restart can reconcile retained claim history; epoch/history loss is indeterminate and never
-automatically injects or resends. Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
+Each accepted record, offer, reservation, and claim is bound to the broker-owned endpoint epoch returned by peer capability
+lookup. Senders re-resolve one admission-time `target_rebound` using the same request ID; the idempotency digest excludes the
+epoch, so retries cannot be trapped as request conflicts. Offline peers retain their last endpoint epoch, allowing temporary
+disconnect queueing; reconnecting with that epoch can receive queued work, while replacement with a new epoch fails closed
+with `endpoint_epoch_changed` and never re-offers custody.
+
+Consumers must persist and fsync the broker epoch, endpoint epoch, message ID, reservation ID, and payload before calling
+`claim()`. The registered and offer contracts expose the consumer's endpoint epoch. Only an accepted claim result authorizes
+consumer-owned model injection. Claim reconciliation is allowed only when the persisted broker and endpoint epochs match the
+retained reservation; epoch/history loss is indeterminate and never automatically injects or resends. Active records live 24
+hours; terminal replay lives one hour. Attempts are capped at 8, receipts at 20, active records at 256 globally and 32 per
+sender/target namespace, and tombstones at 512 globally and 64 per sender/target namespace. Pending operations are capped at
+256 globally and 32 per namespace. Opaque content never enters ordinary messages, reply waiters, transcripts, UI, generic
 extension events, or model context. This local same-user transport is not remote authorization and provides no detach.
 
 `refreshState()` returns `ExtensionStateRefreshResult` rather than a bare snapshot: successful results carry
