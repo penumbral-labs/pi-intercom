@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { IntercomClient } from "./client.ts";
+import { IntercomClient, IntercomListSessionsError } from "./client.ts";
 import { writeMessage } from "./framing.ts";
 
 /**
@@ -54,6 +54,7 @@ async function registeredClientAgainstFakeSocket(): Promise<{
   serverSide: net.Socket;
   closeServerSideAbruptly(): void;
   stopResponding(): void;
+  rejectListsAsOversized(): void;
 }> {
   const { getBrokerSocketPath } = await import("./paths.ts");
   const { mkdirSync, unlinkSync } = await import("node:fs");
@@ -63,14 +64,15 @@ async function registeredClientAgainstFakeSocket(): Promise<{
   try { unlinkSync(socketPath); } catch { /* no stale socket */ }
 
   const client = new IntercomClient();
-  let resolveReady: (value: { serverSide: net.Socket; closeServerSideAbruptly(): void; stopResponding(): void }) => void;
+  let resolveReady: (value: { serverSide: net.Socket; closeServerSideAbruptly(): void; stopResponding(): void; rejectListsAsOversized(): void }) => void;
   let rejectReady: (reason: unknown) => void;
-  const ready = new Promise<{ serverSide: net.Socket; closeServerSideAbruptly(): void; stopResponding(): void }>((res, rej) => {
+  const ready = new Promise<{ serverSide: net.Socket; closeServerSideAbruptly(): void; stopResponding(): void; rejectListsAsOversized(): void }>((res, rej) => {
     resolveReady = res;
     rejectReady = rej;
   });
 
   let responding = true;
+  let listsAreOversized = false;
   const server = net.createServer((serverSide) => {
     serverSide.on("data", (data) => {
       if (!responding) return; // simulate a dead/unresponsive broker: drop everything
@@ -84,7 +86,9 @@ async function registeredClientAgainstFakeSocket(): Promise<{
           writeMessage(serverSide, { type: "registered", sessionId: json.sessionId ?? "stable-test", features: [] });
         }
         if (json.type === "list") {
-          writeMessage(serverSide, { type: "sessions", requestId: json.requestId, sessions: [] });
+          writeMessage(serverSide, listsAreOversized
+            ? { type: "sessions_failed", requestId: json.requestId, code: "response_too_large", error: "Intercom session list is too large" }
+            : { type: "sessions", requestId: json.requestId, sessions: [] });
         }
       } catch {
         // ignore parse errors in the fake
@@ -103,6 +107,9 @@ async function registeredClientAgainstFakeSocket(): Promise<{
         // client. Only an active liveness probe can detect this.
         responding = false;
       },
+      rejectListsAsOversized() {
+        listsAreOversized = true;
+      },
     });
   });
   server.on("error", (err) => rejectReady(err));
@@ -119,8 +126,8 @@ async function registeredClientAgainstFakeSocket(): Promise<{
     },
     "stable-liveness-unit",
   );
-  const { serverSide, closeServerSideAbruptly, stopResponding } = await ready;
-  return { client, serverSide, closeServerSideAbruptly, stopResponding };
+  const { serverSide, closeServerSideAbruptly, stopResponding, rejectListsAsOversized } = await ready;
+  return { client, serverSide, closeServerSideAbruptly, stopResponding, rejectListsAsOversized };
 }
 
 test("client emits disconnected when the peer destroys the socket without a FIN", async () => {
@@ -142,6 +149,21 @@ test("client emits disconnected when the peer destroys the socket without a FIN"
     ]);
     assert.ok(event, "expected a disconnected event");
     assert.equal(client.isConnected(), false);
+  } finally {
+    await client.disconnect().catch(() => undefined);
+  }
+});
+
+test("client liveness heartbeat keeps a responsive broker connected when lists are oversized", async () => {
+  const { client, rejectListsAsOversized } = await registeredClientAgainstFakeSocket();
+  try {
+    rejectListsAsOversized();
+    await assert.rejects(
+      client.listSessions({ timeoutMs: 500 }),
+      (error: unknown) => error instanceof IntercomListSessionsError && error.code === "response_too_large",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(client.isConnected(), true);
   } finally {
     await client.disconnect().catch(() => undefined);
   }

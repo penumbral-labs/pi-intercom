@@ -562,7 +562,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const replyTracker = new ReplyTracker();
   const staleAsks = new StaleAsks();
   const seenInboundMessages = new Map<string, number>();
-  const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; detail?: string }>();
+  const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; code?: "E_DELIVERY_TOO_LARGE"; detail?: string }>();
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
   }
@@ -1328,21 +1328,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           for (const extension of localExtensions.values()) {
             delete extension.state;
             extension.pendingDispatches.clear();
-            if (message.brokerEpoch) {
-              for (const dispatch of [...extension.acceptedDispatches.values()]) {
-                if (dispatch.brokerEpoch === message.brokerEpoch) continue;
-                try {
-                  extension.registration.opaqueDispatch?.onTransportIndeterminate?.({
-                    requestId: dispatch.requestId,
-                    messageId: dispatch.messageId,
-                    previousBrokerEpoch: dispatch.brokerEpoch,
-                    currentBrokerEpoch: message.brokerEpoch,
-                  });
-                } catch {
-                  // One extension callback cannot break intercom or another namespace.
-                }
-                extension.acceptedDispatches.delete(dispatch.messageId);
+            const opaqueSupported = message.features?.includes(OPAQUE_DISPATCH_FEATURE) ?? false;
+            for (const dispatch of [...extension.acceptedDispatches.values()]) {
+              if (opaqueSupported && message.brokerEpoch === dispatch.brokerEpoch) continue;
+              try {
+                extension.registration.opaqueDispatch?.onTransportIndeterminate?.({
+                  requestId: dispatch.requestId,
+                  messageId: dispatch.messageId,
+                  previousBrokerEpoch: dispatch.brokerEpoch,
+                  ...(opaqueSupported && message.brokerEpoch ? { currentBrokerEpoch: message.brokerEpoch } : {}),
+                });
+              } catch {
+                // One extension callback cannot break intercom or another namespace.
               }
+              extension.acceptedDispatches.delete(dispatch.messageId);
             }
           }
           for (const namespace of localExtensions.keys()) {
@@ -1391,6 +1390,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           latestOutboundReceipts.set(message.receipt.messageId, {
             status: message.receipt.status,
             timestamp: message.receipt.timestamp,
+            ...(message.receipt.code ? { code: message.receipt.code } : {}),
             ...(message.receipt.detail ? { detail: message.receipt.detail } : {}),
           });
           break;

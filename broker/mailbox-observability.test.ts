@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isMessageControl, isSessionInfo } from "./protocol.ts";
+import { isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
 import { BROKER_SESSION_ID, CORRELATED_OPERATIONS_FEATURE } from "../types.ts";
 
 test("ordinary correlation feature and reserved broker identity are stable", () => {
@@ -16,6 +16,16 @@ test("ordinary correlation feature and reserved broker identity are stable", () 
     lastActivity: 1,
     status: "broker",
     trustedLocal: true,
+  }), true);
+});
+
+test("message receipt validation accepts typed terminal mailbox failures", () => {
+  assert.equal(isMessageReceipt({
+    messageId: "message-1",
+    status: "failed",
+    timestamp: 1,
+    code: "E_DELIVERY_TOO_LARGE",
+    detail: "Mailbox message is too large after broker metadata was added",
   }), true);
 });
 

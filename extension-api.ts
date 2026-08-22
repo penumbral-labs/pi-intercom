@@ -73,7 +73,8 @@ export interface OpaqueDispatchTransportIndeterminateEvent {
   requestId: string;
   messageId: string;
   previousBrokerEpoch: string;
-  currentBrokerEpoch: string;
+  /** Absent when the replacement connection does not advertise opaque dispatch or an epoch. */
+  currentBrokerEpoch?: string;
 }
 
 export interface OpaqueDispatchRegistration {

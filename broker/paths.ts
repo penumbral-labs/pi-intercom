@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { chmodSync, mkdirSync, readFileSync } from "fs";
-import { isAbsolute, join, resolve } from "path";
+import { isAbsolute, join, resolve, win32 } from "path";
 import { homedir } from "os";
 
 export const INTERCOM_DIR_MODE = 0o700;
@@ -19,17 +19,18 @@ export interface BrokerTcpEndpoint {
 export type BrokerConnectTarget = string | BrokerTcpEndpoint;
 
 /**
- * Disambiguating suffix for the Windows named pipe.
- *
- * sanitizePipeSegment collapses every run of non-alphanumerics to a single dash, so distinct
- * agent directories can sanitize to the same segment ("C:/a/b" and "C:/a-b" both yield "c-a-b")
- * and would otherwise share one pipe. The hash is taken over the normalized *input string* —
- * lowercased, separators unified — deliberately not path.resolve(), which would make the result
- * depend on process.cwd() and break the cross-platform unit tests.
+ * Canonical Windows spelling used for both the readable pipe segment and its collision-resistant
+ * suffix. win32.normalize is used explicitly so equivalent Windows paths hash identically even
+ * when tests run on another platform; drive/UNC roots remain distinct.
  */
-function pipeAgentDirHash(agentDir: string): string {
-  const normalized = agentDir.replace(/\\/g, "/").toLowerCase();
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+function normalizeWindowsAgentDir(agentDir: string): string {
+  const normalized = win32.normalize(agentDir).toLowerCase();
+  const root = win32.parse(normalized).root;
+  return normalized.length > root.length ? normalized.replace(/[\\/]+$/, "") : normalized;
+}
+
+function pipeAgentDirHash(normalizedAgentDir: string): string {
+  return createHash("sha256").update(normalizedAgentDir).digest("hex").slice(0, 16);
 }
 
 function sanitizePipeSegment(value: string): string {
@@ -82,7 +83,8 @@ export function getBrokerSocketPath(
   agentDir: string = getAgentDirPath(),
 ): string {
   if (platform === "win32") {
-    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(agentDir)}-${pipeAgentDirHash(agentDir)}`;
+    const normalizedAgentDir = normalizeWindowsAgentDir(agentDir);
+    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(normalizedAgentDir)}-${pipeAgentDirHash(normalizedAgentDir)}`;
   }
 
   return join(getIntercomDirPath(agentDir), "broker.sock");

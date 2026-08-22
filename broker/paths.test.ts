@@ -165,7 +165,18 @@ test("getBrokerSocketPath distinguishes agent dirs that sanitize to the same seg
   assert.notEqual(first, second);
 });
 
-test("getBrokerSocketPath is deterministic and separator/case insensitive", () => {
-  assert.equal(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:/a/b"));
-  assert.equal(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:\\A\\B"));
+test("getBrokerSocketPath is deterministic and applies Windows path equivalence cross-platform", () => {
+  const canonical = getBrokerSocketPath("win32", "C:/a/b");
+  assert.equal(canonical, getBrokerSocketPath("win32", "C:/a/b"));
+  assert.equal(canonical, getBrokerSocketPath("win32", "C:\\A\\B"));
+  assert.equal(canonical, getBrokerSocketPath("win32", "c:\\a\\.\\x\\..\\b\\"));
+});
+
+test("getBrokerSocketPath preserves distinct Windows paths after normalization", () => {
+  assert.notEqual(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:/a/c"));
+  assert.notEqual(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "D:/a/b"));
+  assert.notEqual(
+    getBrokerSocketPath("win32", "\\\\server-a\\share\\agent"),
+    getBrokerSocketPath("win32", "\\\\server-b\\share\\agent"),
+  );
 });

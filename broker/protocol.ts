@@ -47,12 +47,14 @@ function isSafeInteger(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_IN
 
 function isMessageReceiptStatus(value: unknown): value is MessageReceiptStatus {
   return value === "receiver_received" || value === "queued" || value === "injected" || value === "acknowledged"
-    || value === "expired" || value === "cancelled" || value === "superseded" || value === "cancellation_requested";
+    || value === "expired" || value === "cancelled" || value === "superseded" || value === "failed"
+    || value === "cancellation_requested";
 }
 
 export function isMessageReceipt(value: unknown): value is MessageReceipt {
   if (!isRecord(value)) return false;
   if (typeof value.messageId !== "string" || !isMessageReceiptStatus(value.status) || typeof value.timestamp !== "number") return false;
+  if (value.code !== undefined && value.code !== "E_DELIVERY_TOO_LARGE") return false;
   return value.detail === undefined || typeof value.detail === "string";
 }
 

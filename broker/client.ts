@@ -66,6 +66,13 @@ const MAX_PENDING_OPERATIONS = 256;
 const MAX_PENDING_OPERATIONS_PER_NAMESPACE = 32;
 export const MAX_POISONED_LEGACY_MESSAGE_IDS = 256;
 
+export class IntercomListSessionsError extends Error {
+  constructor(readonly code: "response_too_large", message: string) {
+    super(message);
+    this.name = "IntercomListSessionsError";
+  }
+}
+
 function namespacePendingCount<T>(pending: Map<string, PendingRequest<T>>, namespace: string): number {
   let count = 0;
   for (const request of pending.values()) if (request.namespace === namespace) count += 1;
@@ -190,9 +197,9 @@ export class IntercomClient extends EventEmitter {
     try {
       await this.listSessions({ timeoutMs: getLivenessTimeoutMs() });
     } catch (error) {
-      // A timeout or write error means the socket is half-open: the broker is
-      // gone but the OS never delivered a close event. Destroy the socket so
-      // the onClose handler emits "disconnected" and the extension reconnects.
+      // A correlated application refusal proves the broker is responsive; only transport-style
+      // failures should tear down the socket and drive reconnection.
+      if (error instanceof IntercomListSessionsError) return;
       const socket = this.socket;
       if (socket && !socket.destroyed) {
         this.disconnectError = toError(error);
@@ -432,6 +439,18 @@ export class IntercomClient extends EventEmitter {
 
         this.pendingLists.delete(requestId);
         pending.resolve(sessions);
+        break;
+      }
+
+      case "sessions_failed": {
+        const { requestId, code, error } = brokerMessage;
+        if (typeof requestId !== "string" || code !== "response_too_large" || typeof error !== "string") {
+          throw new Error("Invalid sessions_failed message");
+        }
+        const pending = this.pendingLists.get(requestId);
+        if (!pending) break;
+        this.pendingLists.delete(requestId);
+        pending.reject(new IntercomListSessionsError(code, error));
         break;
       }
 

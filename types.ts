@@ -67,12 +67,13 @@ export interface Attachment {
   language?: string;
 }
 
-export type MessageReceiptStatus = "receiver_received" | "queued" | "injected" | "acknowledged" | "expired" | "cancelled" | "superseded" | "cancellation_requested";
+export type MessageReceiptStatus = "receiver_received" | "queued" | "injected" | "acknowledged" | "expired" | "cancelled" | "superseded" | "failed" | "cancellation_requested";
 
 export interface MessageReceipt {
   messageId: string;
   status: MessageReceiptStatus;
   timestamp: number;
+  code?: "E_DELIVERY_TOO_LARGE";
   detail?: string;
 }
 
@@ -142,6 +143,7 @@ export type ClientMessage =
 export type BrokerMessage =
   | { type: "registered"; sessionId: string; features?: string[]; brokerEpoch?: string; endpointEpoch?: string }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
+  | { type: "sessions_failed"; requestId: string; code: "response_too_large"; error: string }
   | { type: "message"; from: SessionInfo; message: Message }
   | { type: "presence_update"; session: SessionInfo }
   | { type: "session_joined"; session: SessionInfo }

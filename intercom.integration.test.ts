@@ -34,7 +34,7 @@ const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
-const { IntercomClient } = await import("./broker/client.ts");
+const { IntercomClient, IntercomListSessionsError } = await import("./broker/client.ts");
 const { getAskTimeoutMs } = await import("./config.ts");
 const { getBrokerLaunchSpec, getTsxCliPath } = await import("./broker/spawn.ts");
 test.after(() => {
@@ -1701,6 +1701,28 @@ test("a dispatch settling across reconnect cannot release a newer attempt with t
       previousBrokerEpoch: "33333333-3333-4333-8333-333333333333",
       currentBrokerEpoch: "44444444-4444-4444-8444-444444444444",
     }]);
+
+    const fourth = channel!.sendOpaqueDispatch({ ...input, requestId: "capability-lost-request" });
+    assert.equal((await fourth).accepted, true);
+    raw.emit("broker_message", {
+      type: "registered",
+      sessionId: "dispatch-marker-race",
+      endpointEpoch: "legacy-endpoint",
+      features: ["extension-bus-v1"],
+    });
+    assert.deepEqual(indeterminate.at(-1), {
+      requestId: "capability-lost-request",
+      messageId,
+      previousBrokerEpoch: "33333333-3333-4333-8333-333333333333",
+    });
+    raw.emit("broker_message", {
+      type: "registered",
+      sessionId: "dispatch-marker-race",
+      brokerEpoch: "55555555-5555-4555-8555-555555555555",
+      endpointEpoch: "restored-endpoint",
+      features: ["extension-bus-v1", "opaque-dispatch-v1"],
+    });
+    assert.equal(indeterminate.length, 2, "capability loss must clear accepted dispatch markers");
   } finally {
     IntercomClient.prototype.connect = originalConnect;
     IntercomClient.prototype.sendOpaqueDispatch = originalSend;
@@ -5414,6 +5436,142 @@ test("broker allows replacing the sender's own ask when the sender is at its ask
     assert.equal(replacement.delivered, true);
   } finally {
     await sink.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("oversized queued mailbox entries terminalize on reconnect instead of lingering", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("oversized-mailbox-sender", "oversized-mailbox-sender");
+  const replacement = new IntercomClient();
+  const secondReplacement = new IntercomClient();
+  try {
+    const { createMessageReader, MAX_FRAME_BYTES } = await import("./broker/framing.ts");
+    const targetId = planner.sessionId!;
+    await planner.disconnect();
+    const frames: Array<{
+      type?: string;
+      messageId?: string;
+      code?: string;
+      receipt?: { messageId?: string; status?: string; code?: string; detail?: string };
+    }> = [];
+    const reader = createMessageReader((message) => frames.push(message as (typeof frames)[number]), (error) => {
+      throw error;
+    });
+    raw.socket.on("data", reader);
+
+    const build = (padding: string) => JSON.stringify({
+      type: "send",
+      to: targetId,
+      message: { id: "oversized-mailbox-message", timestamp: 1, content: { text: padding } },
+    });
+    const payload = build("x".repeat(MAX_FRAME_BYTES - Buffer.byteLength(build(""), "utf8")));
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(Buffer.byteLength(payload, "utf8"), 0);
+    raw.socket.write(Buffer.concat([header, Buffer.from(payload, "utf8")]));
+
+    const waitForFrame = async (predicate: (frame: (typeof frames)[number]) => boolean) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const frame = frames.find(predicate);
+        if (frame) return frame;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error(`Timed out waiting for mailbox frame; saw ${JSON.stringify(frames)}`);
+    };
+    assert.equal((await waitForFrame((frame) => frame.type === "delivered" && frame.messageId === "oversized-mailbox-message")).type, "delivered");
+
+    await replacement.connect({
+      name: "planner", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+    }, targetId);
+    const terminal = await waitForFrame((frame) => frame.type === "message_receipt"
+      && frame.receipt?.messageId === "oversized-mailbox-message" && frame.receipt.status === "failed");
+    assert.equal(terminal.receipt?.code, "E_DELIVERY_TOO_LARGE");
+    assert.match(terminal.receipt?.detail ?? "", /too large after broker metadata/);
+
+    raw.writeMessage(raw.socket, JSON.parse(payload));
+    const replay = await waitForFrame((frame) => frame.type === "delivery_failed"
+      && frame.messageId === "oversized-mailbox-message");
+    assert.equal(replay.code, "E_DELIVERY_TOO_LARGE");
+
+    await replacement.disconnect();
+    await secondReplacement.connect({
+      name: "planner", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+    }, targetId);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(frames.filter((frame) => frame.type === "message_receipt"
+      && frame.receipt?.messageId === "oversized-mailbox-message" && frame.receipt.status === "failed").length, 1);
+  } finally {
+    raw.socket.destroy();
+    await replacement.disconnect().catch(() => undefined);
+    await secondReplacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("oversized session lists reject the matching request without disconnecting the client", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const net = await import("node:net");
+  const { createMessageReader, MAX_FRAME_BYTES, writeMessage } = await import("./broker/framing.ts");
+  const { getBrokerSocketPath } = await import("./broker/paths.ts");
+  const oversized = new IntercomClient();
+  const fillerSockets: Array<import("node:net").Socket> = [];
+  try {
+    for (let index = 0; index < 24; index += 1) {
+      const socket = net.connect(getBrokerSocketPath());
+      fillerSockets.push(socket);
+      await once(socket, "connect");
+      const registered = new Promise<void>((resolve, reject) => {
+        const reader = createMessageReader((message) => {
+          if ((message as { type?: string }).type !== "registered") return;
+          socket.off("data", reader);
+          resolve();
+        }, reject);
+        socket.on("data", reader);
+      });
+      writeMessage(socket, {
+        type: "register",
+        sessionId: `oversized-list-filler-${index}`,
+        session: {
+          name: `oversized-list-filler-${index}`,
+          cwd: `/${"c".repeat(49_000)}-${index}`,
+          model: "test-model",
+          pid: process.pid,
+          startedAt: Date.now(),
+          lastActivity: Date.now(),
+        },
+      });
+      await registered;
+    }
+    await oversized.connect({
+      name: "oversized-list-client", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+    }, "oversized-list-client");
+
+    await assert.rejects(
+      oversized.listSessions({ timeoutMs: 1_000 }),
+      (error: unknown) => error instanceof IntercomListSessionsError
+        && error.code === "response_too_large"
+        && error.message === "Intercom session list is too large",
+    );
+    assert.equal(oversized.isConnected(), true);
+    assert.ok(MAX_FRAME_BYTES < Buffer.byteLength(JSON.stringify({
+      type: "sessions",
+      requestId: "request-id",
+      sessions: fillerSockets.map((_, index) => ({
+        id: `oversized-list-filler-${index}`,
+        cwd: `/${"c".repeat(49_000)}-${index}`,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: 1,
+        lastActivity: 1,
+      })),
+    }), "utf8"));
+  } finally {
+    for (const socket of fillerSockets) socket.destroy();
+    await oversized.disconnect().catch(() => undefined);
     await cleanup();
   }
 });

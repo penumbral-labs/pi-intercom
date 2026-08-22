@@ -622,7 +622,12 @@ class IntercomBroker {
           writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
         } catch (error) {
           if (error instanceof IntercomFrameTooLargeError) {
-            writeMessage(socket, { type: "error", error: "Intercom session list is too large" });
+            writeMessage(socket, {
+              type: "sessions_failed",
+              requestId: clientMessage.requestId,
+              code: "response_too_large",
+              error: "Intercom session list is too large",
+            });
             break;
           }
           throw error;
@@ -1307,14 +1312,21 @@ class IntercomBroker {
     };
   }
 
-  private emitBrokerReceipt(socket: net.Socket | undefined, messageId: string, status: MessageReceiptStatus, timestamp = Date.now()): void {
+  private emitBrokerReceipt(
+    socket: net.Socket | undefined,
+    messageId: string,
+    status: MessageReceiptStatus,
+    timestamp = Date.now(),
+    detail?: string,
+    code?: "E_DELIVERY_TOO_LARGE",
+  ): void {
     if (!socket || socket.destroyed || socket.writableEnded || !socket.writable) {
       return;
     }
     writeMessage(socket, {
       type: "message_receipt",
       from: this.brokerSessionInfo(timestamp),
-      receipt: { messageId, status, timestamp },
+      receipt: { messageId, status, timestamp, ...(code ? { code } : {}), ...(detail ? { detail } : {}) },
     });
   }
 
@@ -1393,8 +1405,27 @@ class IntercomBroker {
         });
       } catch (error) {
         if (error instanceof IntercomFrameTooLargeError) {
-          console.error(`Skipping oversized mailbox redelivery ${entry.message.id}: ${error.message}`);
-          index += 1;
+          this.mailboxMessages.splice(index, 1);
+          if (entry.message.expectsReply) {
+            this.askEdges.delete(entry.message.id);
+            this.removePendingAskRecord(entry.message.id);
+          }
+          this.messageReceiptRoutes.delete(entry.message.id);
+          this.updateDeliveryRecord(
+            entry.from.id,
+            entry.message.id,
+            "failed",
+            "Mailbox message is too large after broker metadata was added",
+            "E_DELIVERY_TOO_LARGE",
+          );
+          this.emitBrokerReceipt(
+            this.sessions.get(entry.from.id)?.socket,
+            entry.message.id,
+            "failed",
+            now,
+            "Mailbox message is too large after broker metadata was added",
+            "E_DELIVERY_TOO_LARGE",
+          );
           continue;
         }
         throw error;
