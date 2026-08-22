@@ -9,10 +9,16 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Exposed broker-owned endpoint epochs to registered clients, opaque offers, and peer capability results.
 
 ### Changed
-- Late replies now follow the ask's abandonment reason: replies after cancellation or successful supersession are dropped, while replies after a plain timeout remain visible with a stale-reply warning. Timed-out asks no longer block reverse asks or consume active ask capacity, reply-only authorization is globally bounded with oldest-first eviction, and a rejected superseding ask leaves the earlier ask live.
+- Late replies now follow the ask's abandonment reason: replies after cancellation or successful supersession by either `ask` or plain `send` are dropped, while replies after a plain timeout remain visible with a stale-reply warning. Timed-out asks no longer block reverse asks or consume active ask capacity, reply-only authorization is globally bounded with oldest-first eviction, and a rejected superseding delivery leaves the earlier ask live.
 - Opaque dispatch now retains temporary disconnected custody only long enough to report `mailbox_queued` followed by a deterministic `endpoint_epoch_changed` receipt on reconnect; every reconnect rotates the endpoint epoch and never transfers queued custody. Expired disconnected endpoints are pruned before capability lookup or send admission.
 - Opaque sends resolve endpoint epochs through the opaque capability channel and retry one admission-time `target_rebound` with the same idempotent request ID. A terminal endpoint-rotation result remains bound to that request ID for the tombstone lifetime, so sending work to the replacement endpoint requires a new request ID.
 - Opaque receipt acknowledgements are cumulative by sequence; reconnect replay includes only unacknowledged receipts. At global capacity, admission may evict the oldest queued record across principals with an `expired` / `limit_exceeded` receipt.
+
+### Fixed
+- Oversized session-list responses now reject only their correlated request through `sessions_failed` without disconnecting a healthy client or failing unrelated requests and liveness probes.
+- Mailbox deliveries that exceed the frame limit after broker metadata is added now terminalize with `E_DELIVERY_TOO_LARGE` instead of lingering for replay.
+- Oversized forwarded receipt details are replaced with a non-sensitive omission notice, or omitted entirely when needed, without leaking the original detail or disconnecting either peer.
+- Equivalent Windows agent-directory spellings now canonicalize to the same broker named-pipe path while distinct paths remain isolated.
 
 ## [0.11.0] - 2026-08-19
 

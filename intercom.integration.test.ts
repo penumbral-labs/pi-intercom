@@ -3817,6 +3817,145 @@ test("rejected superseding ask keeps the prior ask eligible for a late reply", {
   }
 });
 
+test("accepted plain send supersede drops a late reply to the prior ask", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("plain-send-supersede-worker", { sessionId: "session-plain-send-supersede-worker", hasUI: true });
+  const originalOn = EventEmitter.prototype.on;
+  let inboundMessageHandler: ((from: SessionInfo, message: Message) => void) | undefined;
+  EventEmitter.prototype.on = function (eventName: string | symbol, listener: (...args: any[]) => void) {
+    if (eventName === "message") inboundMessageHandler = listener;
+    return originalOn.call(this, eventName, listener);
+  };
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "plain-send-supersede-worker");
+    EventEmitter.prototype.on = originalOn;
+    const plannerSession = await waitForSessionByName(planner, "planner");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    assert.ok(inboundMessageHandler);
+
+    const originalMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const originalAsk = intercomTool.execute("original-before-plain-send-supersede", {
+      action: "ask",
+      to: "planner",
+      message: "This ask will be superseded by a plain send.",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, originalQuestion] = await originalMessage;
+    assert.equal((await originalAsk).details?.error, true);
+
+    const replacementMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const replacementResult = await intercomTool.execute("accepted-plain-send-supersede", {
+      action: "send",
+      to: "planner",
+      message: "Plain-send replacement.",
+      supersedes: originalQuestion.id,
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(replacementResult.details?.error, true);
+    const [, replacement] = await replacementMessage;
+    assert.equal(replacement.supersedes, originalQuestion.id);
+
+    inboundMessageHandler!(plannerSession, {
+      id: "late-reply-after-plain-send-supersede",
+      timestamp: Date.now(),
+      replyTo: originalQuestion.id,
+      content: { text: "This stale reply must be dropped." },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 0, "an accepted plain-send supersede must drop the prior late reply");
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    if (previousTimeout === undefined) {
+      delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    } else {
+      process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
+    }
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("rejected plain send supersede keeps the prior ask eligible for a late reply", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("rejected-plain-send-supersede-worker", { sessionId: "session-rejected-plain-send-supersede-worker", hasUI: true });
+  const originalOn = EventEmitter.prototype.on;
+  const originalSend = IntercomClient.prototype.send;
+  let inboundMessageHandler: ((from: SessionInfo, message: Message) => void) | undefined;
+  EventEmitter.prototype.on = function (eventName: string | symbol, listener: (...args: any[]) => void) {
+    if (eventName === "message") inboundMessageHandler = listener;
+    return originalOn.call(this, eventName, listener);
+  };
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "rejected-plain-send-supersede-worker");
+    EventEmitter.prototype.on = originalOn;
+    const plannerSession = await waitForSessionByName(planner, "planner");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    assert.ok(inboundMessageHandler);
+
+    const originalMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const originalAsk = intercomTool.execute("original-before-rejected-plain-send-supersede", {
+      action: "ask",
+      to: "planner",
+      message: "Keep this ask stale-visible if the plain-send replacement fails.",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, originalQuestion] = await originalMessage;
+    assert.equal((await originalAsk).details?.error, true);
+
+    IntercomClient.prototype.send = async function (to, options) {
+      if (options.supersedes === originalQuestion.id) {
+        return {
+          id: options.messageId ?? "rejected-plain-send-supersede",
+          delivered: false,
+          delivery: "failed",
+          retryable: false,
+          outcomeKnown: true,
+          reason: "Plain-send replacement rejected for test",
+        };
+      }
+      return originalSend.call(this, to, options);
+    };
+    const replacementResult = await intercomTool.execute("rejected-plain-send-supersede", {
+      action: "send",
+      to: "planner",
+      message: "Rejected plain-send replacement.",
+      supersedes: originalQuestion.id,
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(replacementResult.details?.delivered, false);
+    assert.match(replacementResult.content[0]?.text ?? "", /Plain-send replacement rejected for test/);
+
+    inboundMessageHandler!(plannerSession, {
+      id: "late-reply-after-rejected-plain-send-supersede",
+      timestamp: Date.now(),
+      replyTo: originalQuestion.id,
+      content: { text: "The original ask remains stale-visible." },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 1, "a rejected plain-send replacement must preserve prior stale handling");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Late reply to abandoned ask/);
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /The original ask remains stale-visible/);
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    IntercomClient.prototype.send = originalSend;
+    if (previousTimeout === undefined) {
+      delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    } else {
+      process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
+    }
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("regular intercom ask cancellation clears broker mutual-ask edge", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
@@ -5624,7 +5763,10 @@ test("near-cap receipt and cancellation forwarding preserve healthy connections"
         detail,
       },
     });
-    const payload = build("x".repeat(MAX_FRAME_BYTES - Buffer.byteLength(build(""), "utf8")));
+    const sensitiveDetail = "private-receipt-detail:" + "x".repeat(
+      MAX_FRAME_BYTES - Buffer.byteLength(build("private-receipt-detail:"), "utf8"),
+    );
+    const payload = build(sensitiveDetail);
     assert.equal(Buffer.byteLength(payload, "utf8"), MAX_FRAME_BYTES);
     const header = Buffer.alloc(4);
     header.writeUInt32BE(MAX_FRAME_BYTES, 0);
@@ -5635,6 +5777,7 @@ test("near-cap receipt and cancellation forwarding preserve healthy connections"
     assert.equal(receiptFrame.from?.id, "oversize-receipt-receiver-id");
     assert.equal(receiptFrame.receipt?.status, "acknowledged");
     assert.equal(receiptFrame.receipt?.detail, "Receipt detail omitted to fit the intercom frame limit");
+    assert.equal(JSON.stringify(receiptFrame).includes(sensitiveDetail), false, "omitted receipt content must not leak into the forwarded frame");
 
     assert.equal(sender.socket.destroyed, false, "sender connection must survive receipt reduction");
     assert.equal(receiver.socket.destroyed, false, "receiver connection must survive receipt reduction");

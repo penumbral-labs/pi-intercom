@@ -2467,6 +2467,9 @@ Usage:
                 details: deliveryDetails(result),
               };
             }
+            if (supersedes) {
+              classifyAbandonedAsk(supersedes, sendTo, "superseded");
+            }
             pi.appendEntry("intercom_sent", {
               to: targetDisplay,
               message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
