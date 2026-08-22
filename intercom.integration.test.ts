@@ -1414,6 +1414,7 @@ test("terminal opaque receipts arriving before send acceptance are not cached as
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(channel?.snapshot().capabilities.opaqueDispatchVersion, 1);
+    assert.equal(channel?.snapshot().supported, true);
 
     assert.deepEqual(await channel?.sendOpaqueDispatch({
       requestId: "terminal-before-acceptance-request",
