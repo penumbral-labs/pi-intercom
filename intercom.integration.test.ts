@@ -1424,7 +1424,7 @@ test("terminal opaque receipts arriving before send acceptance are not cached as
   }
 });
 
-test("routine rejected opaque dispatches do not retain terminal race markers", { concurrency: false }, async () => {
+test("rejected opaque dispatch releases its marker for the same request without poisoning unrelated requests", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { cleanup } = await setupClients();
   const harness = createExtensionHarness("rejected-dispatch-sender", { sessionId: "rejected-dispatch-sender" });
@@ -1491,18 +1491,25 @@ test("routine rejected opaque dispatches do not retain terminal race markers", {
       terminal: "refused",
     });
 
+    const unrelatedMessageId = "44444444-4444-4444-8444-444444444444";
     IntercomClient.prototype.sendOpaqueDispatch = async function (_senderNamespace, input) {
       activeClient = this;
       return {
         accepted: true as const,
         requestId: input.requestId,
-        messageId: leakedMessageId,
+        messageId: input.requestId === "routine-rejected-request" ? leakedMessageId : unrelatedMessageId,
         brokerEpoch: "22222222-2222-4222-8222-222222222222",
         deliveryState: "live" as const,
       };
     };
     assert.equal((await channel!.sendOpaqueDispatch({
-      requestId: "later-accepted-request",
+      requestId: "routine-rejected-request",
+      toSessionId: "receiver",
+      recipientNamespace: "receiver/v1",
+      payload: null,
+    })).accepted, true);
+    assert.equal((await channel!.sendOpaqueDispatch({
+      requestId: "unrelated-accepted-request",
       toSessionId: "receiver",
       recipientNamespace: "receiver/v1",
       payload: null,
@@ -1518,12 +1525,162 @@ test("routine rejected opaque dispatches do not retain terminal race markers", {
       features: ["extension-bus-v1", "opaque-dispatch-v1"],
     });
     assert.deepEqual(indeterminate, [{
-      requestId: "later-accepted-request",
+      requestId: "routine-rejected-request",
       messageId: leakedMessageId,
+      previousBrokerEpoch: "22222222-2222-4222-8222-222222222222",
+      currentBrokerEpoch: "33333333-3333-4333-8333-333333333333",
+    }, {
+      requestId: "unrelated-accepted-request",
+      messageId: unrelatedMessageId,
       previousBrokerEpoch: "22222222-2222-4222-8222-222222222222",
       currentBrokerEpoch: "33333333-3333-4333-8333-333333333333",
     }]);
   } finally {
+    IntercomClient.prototype.sendOpaqueDispatch = originalSend;
+    channel?.dispose();
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("a dispatch settling across reconnect cannot release a newer attempt with the same request and message identity", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("dispatch-marker-race", { sessionId: "dispatch-marker-race" });
+  let channel: IntercomExtensionChannel | undefined;
+  const indeterminate: unknown[] = [];
+  const originalConnect = IntercomClient.prototype.connect;
+  const originalSend = IntercomClient.prototype.sendOpaqueDispatch;
+  let connectedClient: InstanceType<typeof IntercomClient> | undefined;
+  let firstSendClient: InstanceType<typeof IntercomClient> | undefined;
+  let secondSendClient: InstanceType<typeof IntercomClient> | undefined;
+  let resolveFirst: ((result: Awaited<ReturnType<typeof originalSend>>) => void) | undefined;
+  let resolveSecond: ((result: Awaited<ReturnType<typeof originalSend>>) => void) | undefined;
+  const requestId = "reused-request";
+  const messageId = "55555555-5555-4555-8555-555555555555";
+  let connectCount = 0;
+  let callCount = 0;
+
+  try {
+    IntercomClient.prototype.connect = async function (...args: Parameters<typeof originalConnect>) {
+      await originalConnect.apply(this, args);
+      connectedClient = this;
+      connectCount += 1;
+    };
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "dispatch-marker-race/v1",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["send"],
+        onTransportIndeterminate: (event: unknown) => indeterminate.push(event),
+      },
+      onReady: (value: IntercomExtensionChannel) => { channel = value; },
+      onEvent: () => undefined,
+    });
+    IntercomClient.prototype.sendOpaqueDispatch = async function (_senderNamespace, input) {
+      callCount += 1;
+      if (callCount === 1) {
+        firstSendClient = this;
+        return new Promise((resolve) => { resolveFirst = resolve; });
+      }
+      if (callCount === 2) {
+        secondSendClient = this;
+        const raw = this as unknown as { emit(event: string, frame: unknown): void };
+        raw.emit("opaque_dispatch", {
+          type: "opaque_dispatch_v1_receipt",
+          senderNamespace: "dispatch-marker-race/v1",
+          receipt: {
+            requestId: input.requestId,
+            messageId,
+            status: "claimed",
+            at: Date.now(),
+            attempt: 1,
+            sequence: 1,
+          },
+        });
+        return new Promise((resolve) => { resolveSecond = resolve; });
+      }
+      const raw = this as unknown as { emit(event: string, frame: unknown): void };
+      raw.emit("opaque_dispatch", {
+        type: "opaque_dispatch_v1_receipt",
+        senderNamespace: "dispatch-marker-race/v1",
+        receipt: {
+          requestId: input.requestId,
+          messageId,
+          status: "claimed",
+          at: Date.now(),
+          attempt: 1,
+          sequence: 2,
+        },
+      });
+      return {
+        accepted: true as const,
+        requestId: input.requestId,
+        messageId,
+        brokerEpoch: "22222222-2222-4222-8222-222222222222",
+        deliveryState: "live" as const,
+      };
+    };
+    await harness.emitLifecycle("session_start");
+    const deadline = Date.now() + 2_000;
+    while (!channel?.snapshot().capabilities.opaqueDispatchVersion && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(channel?.snapshot().capabilities.opaqueDispatchVersion, 1);
+
+    const input = {
+      requestId,
+      toSessionId: "receiver",
+      recipientNamespace: "receiver/v1",
+      payload: null,
+    };
+    const first = channel!.sendOpaqueDispatch(input);
+    assert.ok(resolveFirst);
+    assert.ok(firstSendClient);
+
+    await harness.emitLifecycle("session_start");
+    const reconnectDeadline = Date.now() + 2_000;
+    while (connectCount < 2 && Date.now() < reconnectDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(connectCount, 2);
+    assert.notEqual(connectedClient, firstSendClient);
+
+    const second = channel!.sendOpaqueDispatch(input);
+    assert.ok(resolveSecond);
+    assert.equal(secondSendClient, connectedClient);
+    resolveFirst({
+      accepted: false,
+      requestId,
+      code: "consumer_refused",
+    });
+    assert.equal((await first).accepted, false);
+    resolveSecond({
+      accepted: true,
+      requestId,
+      messageId,
+      brokerEpoch: "22222222-2222-4222-8222-222222222222",
+      deliveryState: "live",
+    });
+    assert.equal((await second).accepted, true);
+
+    const third = channel!.sendOpaqueDispatch(input);
+    assert.equal((await third).accepted, true);
+
+    assert.ok(secondSendClient);
+    const raw = secondSendClient as unknown as { emit(event: string, frame: unknown): void };
+    raw.emit("broker_message", {
+      type: "registered",
+      sessionId: "dispatch-marker-race",
+      brokerEpoch: "33333333-3333-4333-8333-333333333333",
+      endpointEpoch: "next-endpoint",
+      features: ["extension-bus-v1", "opaque-dispatch-v1"],
+    });
+    assert.deepEqual(indeterminate, []);
+  } finally {
+    IntercomClient.prototype.connect = originalConnect;
     IntercomClient.prototype.sendOpaqueDispatch = originalSend;
     channel?.dispose();
     await harness.emitLifecycle("session_shutdown");
@@ -1769,6 +1926,58 @@ test("opaque consumer refusal and callback failures retain typed terminal reason
       await harness.emitLifecycle("session_shutdown");
       await cleanup();
     }
+  }
+});
+
+test("session shutdown aborts a pending receiver reservation", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const sender = new IntercomClient();
+  const harness = createExtensionHarness("shutdown-reservation-receiver", { sessionId: "shutdown-reservation-receiver" });
+  let signal: AbortSignal | undefined;
+  try {
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "opaque/shutdown-receiver",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["receive"],
+        onReserve: (_event: unknown, reservation: { signal: AbortSignal }) => {
+          signal = reservation.signal;
+          return "reserved";
+        },
+      },
+      onReady: () => undefined,
+      onEvent: () => undefined,
+    });
+    await harness.emitLifecycle("session_start");
+    await sender.connect({
+      name: "shutdown-reservation-sender",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      extensions: [{ namespace: "opaque/shutdown-sender", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "shutdown-reservation-sender");
+    await waitForSessionId(sender, "shutdown-reservation-receiver");
+    const accepted = await sender.sendOpaqueDispatch("opaque/shutdown-sender", {
+      requestId: "shutdown-reservation-request",
+      toSessionId: "shutdown-reservation-receiver",
+      recipientNamespace: "opaque/shutdown-receiver",
+      payload: null,
+    });
+    assert.equal(accepted.accepted, true);
+    assert.equal(signal?.aborted, false);
+
+    await harness.emitLifecycle("session_shutdown");
+    assert.equal(signal?.aborted, true);
+    assert.equal(signal?.reason, "receiver_disconnected");
+  } finally {
+    await sender.disconnect().catch(() => undefined);
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
   }
 });
 
@@ -4095,19 +4304,23 @@ test("subagent result relay reports a negative acknowledgement before an inactiv
   harness.pi.events.on("subagent:result-intercom-delivery", (payload) => deliveryAcks.push(payload));
 
   piIntercomExtension(harness.pi as never);
-  harness.pi.events.emit("subagent:result-intercom", {
-    to: "orchestrator",
-    requestId: "inactive-result",
-    message: "must not dispatch",
-  });
-  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    harness.pi.events.emit("subagent:result-intercom", {
+      to: "orchestrator",
+      requestId: "inactive-result",
+      message: "must not dispatch",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(harness.sentMessages.length, 0);
-  assert.deepEqual(deliveryAcks, [{
-    requestId: "inactive-result",
-    delivered: false,
-    error: "Intercom runtime is not active",
-  }]);
+    assert.equal(harness.sentMessages.length, 0);
+    assert.deepEqual(deliveryAcks, [{
+      requestId: "inactive-result",
+      delivered: false,
+      error: "Intercom runtime is not active",
+    }]);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+  }
 });
 
 test("async ask can be replied to later from the single pending ask fallback", { concurrency: false }, async () => {

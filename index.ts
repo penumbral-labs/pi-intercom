@@ -536,8 +536,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     generation: number;
     reservations: Map<string, { controller: AbortController; reservationId: string }>;
     acceptedDispatches: Map<string, { requestId: string; messageId: string; brokerEpoch: string }>;
-    pendingDispatches: Map<string, number>;
-    terminalPendingDispatches: Map<string, string>;
+    pendingDispatches: Map<string, Set<{ client: IntercomClient; terminalMessageId?: string }>>;
   }>();
   let nextExtensionGeneration = 1;
   let runtimeContext: ExtensionContext | null = null;
@@ -829,21 +828,23 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (!extension || extension.generation !== generation) {
           return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
         }
-        extension.pendingDispatches.set(input.requestId, (extension.pendingDispatches.get(input.requestId) ?? 0) + 1);
+        const dispatchAttempt: { client: IntercomClient; terminalMessageId?: string } = { client: activeClient };
+        const pendingAttempts = extension.pendingDispatches.get(input.requestId) ?? new Set();
+        pendingAttempts.add(dispatchAttempt);
+        extension.pendingDispatches.set(input.requestId, pendingAttempts);
         try {
           const result = await activeClient.sendOpaqueDispatch(namespace, input);
           if (!current() || client !== activeClient) {
             return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
           }
           if (result.accepted && extension.generation === generation) {
-            const terminalMessageId = extension.terminalPendingDispatches.get(result.requestId);
-            if (terminalMessageId === undefined) {
+            if (dispatchAttempt.terminalMessageId === undefined) {
               extension.acceptedDispatches.set(result.messageId, {
                 requestId: result.requestId,
                 messageId: result.messageId,
                 brokerEpoch: result.brokerEpoch,
               });
-            } else if (terminalMessageId !== result.messageId) {
+            } else if (dispatchAttempt.terminalMessageId !== result.messageId) {
               return { accepted: false as const, requestId: input.requestId, code: "invalid_frame" as const };
             }
           }
@@ -851,14 +852,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         } catch (error) {
           return { accepted: false as const, requestId: input.requestId, code: opaqueErrorReason(error, "connection_lost") };
         } finally {
-          if (localExtensions.get(namespace) === extension && extension.generation === generation) {
-            const pendingCount = extension.pendingDispatches.get(input.requestId) ?? 0;
-            if (pendingCount <= 1) {
-              extension.pendingDispatches.delete(input.requestId);
-              extension.terminalPendingDispatches.delete(input.requestId);
-            } else {
-              extension.pendingDispatches.set(input.requestId, pendingCount - 1);
-            }
+          const activeAttempts = extension.pendingDispatches.get(input.requestId);
+          if (activeAttempts?.delete(dispatchAttempt) && activeAttempts.size === 0) {
+            extension.pendingDispatches.delete(input.requestId);
           }
         }
       },
@@ -903,7 +899,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           extension.reservations.clear();
           extension.acceptedDispatches.clear();
           extension.pendingDispatches.clear();
-          extension.terminalPendingDispatches.clear();
         }
         localExtensions.delete(namespace);
         if (activeClient?.isConnected() && activeClient.supportsFeature(EXTENSION_BUS_FEATURE)) {
@@ -952,7 +947,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       reservations: new Map(),
       acceptedDispatches: new Map(),
       pendingDispatches: new Map(),
-      terminalPendingDispatches: new Map(),
     });
     const activeClient = client;
     const connected = Boolean(activeClient?.isConnected());
@@ -1289,9 +1283,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       } finally {
         if (extension && extension.generation === localExtensions.get(frame.senderNamespace)?.generation) {
           if (frame.receipt.status !== "queued" && frame.receipt.status !== "reserved") {
-            if (!extension.acceptedDispatches.delete(frame.receipt.messageId)
-              && extension.pendingDispatches.has(frame.receipt.requestId)) {
-              extension.terminalPendingDispatches.set(frame.receipt.requestId, frame.receipt.messageId);
+            if (!extension.acceptedDispatches.delete(frame.receipt.messageId)) {
+              for (const attempt of extension.pendingDispatches.get(frame.receipt.requestId) ?? []) {
+                if (attempt.client === nextClient) attempt.terminalMessageId = frame.receipt.messageId;
+              }
             }
           }
           try {
@@ -1313,7 +1308,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           for (const extension of localExtensions.values()) {
             delete extension.state;
             extension.pendingDispatches.clear();
-            extension.terminalPendingDispatches.clear();
             if (message.brokerEpoch) {
               for (const dispatch of [...extension.acceptedDispatches.values()]) {
                 if (dispatch.brokerEpoch === message.brokerEpoch) continue;
@@ -1417,7 +1411,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         for (const reservation of extension.reservations.values()) reservation.controller.abort("receiver_disconnected");
         extension.reservations.clear();
         extension.pendingDispatches.clear();
-        extension.terminalPendingDispatches.clear();
         emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
         emitLocalExtensionEvent(namespace, { type: "owner" });
       }
@@ -1794,9 +1787,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     replyTracker.reset();
     staleAsks.clear();
     for (const extension of localExtensions.values()) {
+      for (const reservation of extension.reservations.values()) {
+        reservation.controller.abort("receiver_disconnected");
+      }
+      extension.reservations.clear();
       extension.acceptedDispatches.clear();
       extension.pendingDispatches.clear();
-      extension.terminalPendingDispatches.clear();
     }
     agentRunning = false;
     activeTools.clear();
