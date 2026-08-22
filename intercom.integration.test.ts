@@ -5777,7 +5777,7 @@ test("near-cap receipt and cancellation forwarding preserve healthy connections"
     assert.equal(receiptFrame.from?.id, "oversize-receipt-receiver-id");
     assert.equal(receiptFrame.receipt?.status, "acknowledged");
     assert.equal(receiptFrame.receipt?.detail, "Receipt detail omitted to fit the intercom frame limit");
-    assert.equal(JSON.stringify(receiptFrame).includes(sensitiveDetail), false, "omitted receipt content must not leak into the forwarded frame");
+    assert.equal(JSON.stringify(receiptFrame).includes("private-receipt-detail:"), false, "omitted receipt content must not leak into the forwarded frame");
 
     assert.equal(sender.socket.destroyed, false, "sender connection must survive receipt reduction");
     assert.equal(receiver.socket.destroyed, false, "receiver connection must survive receipt reduction");
