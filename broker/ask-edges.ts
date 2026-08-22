@@ -1,3 +1,5 @@
+import { STALE_ASK_RETENTION_MS } from "../config.ts";
+
 // Sole owner of pending ask-edge state.
 //
 // An "ask edge" records that `from` is awaiting a reply to message `id` from `to`. The broker
@@ -36,6 +38,7 @@ export interface AskEdgeCapacityRefusal {
 export type AskEdgeCapacity = { ok: true } | AskEdgeCapacityRefusal;
 
 export const MAX_PENDING_ASK_EDGES_PER_SESSION = 16;
+export const ASK_REPLY_AUTHORIZATION_RETENTION_MS = STALE_ASK_RETENTION_MS;
 
 function pairKey(from: string, to: string): string {
   return `${from}\0${to}`;
@@ -139,13 +142,16 @@ export class AskEdges {
     }
   }
 
-  // Drops every edge where `sessionId` is either party.
-  deleteForSession(sessionId: string): void {
+  // Drops every edge where `sessionId` is either party and returns their message IDs.
+  deleteForSession(sessionId: string): string[] {
+    const deleted: string[] = [];
     for (const [messageId, edge] of this.edges) {
       if (edge.from === sessionId || edge.to === sessionId) {
         this.delete(messageId);
+        deleted.push(messageId);
       }
     }
+    return deleted;
   }
 
   clear(): void {

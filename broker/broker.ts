@@ -1,5 +1,5 @@
 import net from "net";
-import { writeFileSync, unlinkSync } from "fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import {
@@ -8,7 +8,7 @@ import {
   createMessageReader,
   IntercomFrameTooLargeError,
 } from "./framing.ts";
-import { AskEdges } from "./ask-edges.ts";
+import { ASK_REPLY_AUTHORIZATION_RETENTION_MS, AskEdges } from "./ask-edges.ts";
 import {
   isBoundedId,
   isExtensionCapability,
@@ -25,6 +25,7 @@ import {
   getBrokerListenTarget,
   getBrokerPortFilePath,
   getIntercomDirPath,
+  INTERCOM_DIR_MODE,
   INTERCOM_PROTOCOL_NAME,
   INTERCOM_PROTOCOL_VERSION,
   INTERCOM_RUNTIME_FILE_MODE,
@@ -50,6 +51,7 @@ const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
 const PID_PATH = join(INTERCOM_DIR, "broker.pid");
 const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
+const PENDING_ASKS_DIR = join(INTERCOM_DIR, "pending-asks");
 const BROKER_STATE_ID = randomUUID();
 const BROKER_EPOCH = randomUUID();
 const MAX_SESSIONS = 128;
@@ -130,6 +132,45 @@ interface MailboxMessage {
   queuedAt: number;
 }
 
+interface PendingAskRecord {
+  askId: string;
+  messageId: string;
+  asker: { sessionId: string; name: string | null };
+  target: { sessionId: string; name: string | null };
+  question: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPendingAskRecord(value: unknown): value is PendingAskRecord {
+  if (!isRecord(value) || !isRecord(value.asker) || !isRecord(value.target)) return false;
+  return typeof value.askId === "string"
+    && typeof value.messageId === "string"
+    && typeof value.asker.sessionId === "string"
+    && (typeof value.asker.name === "string" || value.asker.name === null)
+    && typeof value.target.sessionId === "string"
+    && (typeof value.target.name === "string" || value.target.name === null)
+    && typeof value.question === "string"
+    && typeof value.createdAt === "number"
+    && Number.isSafeInteger(value.createdAt)
+    && typeof value.expiresAt === "number"
+    && Number.isSafeInteger(value.expiresAt)
+    && value.expiresAt >= value.createdAt;
+}
+
+function pendingAskRecordPath(messageId: string): string {
+  return join(PENDING_ASKS_DIR, `${encodeURIComponent(messageId)}.json`);
+}
+
+function ensurePendingAskRecordDir(): void {
+  mkdirSync(PENDING_ASKS_DIR, { recursive: true, mode: INTERCOM_DIR_MODE });
+  if (process.platform !== "win32") chmodSync(PENDING_ASKS_DIR, INTERCOM_DIR_MODE);
+}
+
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
   private askEdges = new AskEdges(MAX_SESSIONS * 4);
@@ -150,6 +191,8 @@ class IntercomBroker {
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
     assertNoLiveBroker(PID_PATH);
+    ensurePendingAskRecordDir();
+    this.prunePendingAskRecords();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
     this.opaqueDispatch = new OpaqueDispatchManager({
       brokerEpoch: BROKER_EPOCH,
@@ -726,9 +769,11 @@ class IntercomBroker {
           // never arrive.
           if (message.expectsReply) {
             this.askEdges.add(message.id, currentId, target.info.id);
+            this.writePendingAskRecord(message, fromSession.info, target.info, brokerReceivedAt);
           }
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
+            this.removePendingAskRecord(message.replyTo);
           }
           this.messageReceiptRoutes.set(message.id, { from: currentId, to: target.info.id, createdAt: brokerReceivedAt });
           this.recordDelivery(currentId, message.id, fingerprint, "socket_delivered");
@@ -793,6 +838,7 @@ class IntercomBroker {
           }
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
+            this.removePendingAskRecord(message.replyTo);
           }
           const delivery = liveMailboxTarget ? "socket_delivered" : "queued";
           this.recordDelivery(currentId, message.id, fingerprint, delivery);
@@ -858,6 +904,7 @@ class IntercomBroker {
           const edge = this.askEdges.get(clientMessage.messageId);
           if (edge?.from === currentId) {
             this.askEdges.delete(clientMessage.messageId);
+            this.removePendingAskRecord(clientMessage.messageId);
           }
           this.emitBrokerReceipt(socket, clientMessage.messageId, "cancelled");
           writeMessage(socket, delivered(clientMessage.messageId));
@@ -881,6 +928,7 @@ class IntercomBroker {
         const edge = this.askEdges.get(clientMessage.messageId);
         if (edge?.from === currentId) {
           this.askEdges.delete(clientMessage.messageId);
+          this.removePendingAskRecord(clientMessage.messageId);
         }
         writeMessage(socket, delivered(clientMessage.messageId));
         break;
@@ -897,6 +945,7 @@ class IntercomBroker {
         const edge = this.askEdges.get(clientMessage.messageId);
         if (session?.socket === socket && edge?.from === currentId) {
           this.askEdges.delete(clientMessage.messageId);
+          this.removePendingAskRecord(clientMessage.messageId);
         }
         break;
       }
@@ -1343,11 +1392,56 @@ class IntercomBroker {
   }
 
   private pruneAskEdges(now = Date.now()): void {
-    this.askEdges.pruneOlderThan(this.askTimeoutMs, now);
+    this.prunePendingAskRecords(now);
+    // The caller's waiter expires at askTimeoutMs, but the extension documents late replies
+    // as visible for its bounded stale-ask window. Keep broker authorization for that same window.
+    this.askEdges.pruneOlderThan(this.askTimeoutMs + ASK_REPLY_AUTHORIZATION_RETENTION_MS, now);
   }
 
   private clearAskEdgesForSession(sessionId: string): void {
-    this.askEdges.deleteForSession(sessionId);
+    for (const messageId of this.askEdges.deleteForSession(sessionId)) {
+      this.removePendingAskRecord(messageId);
+    }
+  }
+
+  private writePendingAskRecord(message: Message, from: SessionInfo, target: SessionInfo, createdAt: number): void {
+    ensurePendingAskRecordDir();
+    const record: PendingAskRecord = {
+      askId: message.id,
+      messageId: message.id,
+      asker: { sessionId: from.id, name: from.name ?? null },
+      target: { sessionId: target.id, name: target.name ?? null },
+      question: message.content.text,
+      createdAt,
+      expiresAt: createdAt + this.askTimeoutMs,
+    };
+    const filePath = pendingAskRecordPath(message.id);
+    writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { mode: INTERCOM_RUNTIME_FILE_MODE });
+    restrictIntercomRuntimeFile(filePath);
+  }
+
+  private removePendingAskRecord(messageId: string): void {
+    try {
+      unlinkSync(pendingAskRecordPath(messageId));
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "ENOENT") throw error;
+    }
+  }
+
+  private prunePendingAskRecords(now = Date.now()): void {
+    ensurePendingAskRecordDir();
+    for (const entry of readdirSync(PENDING_ASKS_DIR, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const filePath = join(PENDING_ASKS_DIR, entry.name);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(readFileSync(filePath, "utf8"));
+      } catch {
+        unlinkSync(filePath);
+        continue;
+      }
+      if (!isPendingAskRecord(parsed) || now > parsed.expiresAt) unlinkSync(filePath);
+    }
   }
 
   private pruneMessageReceiptRoutes(now = Date.now()): void {

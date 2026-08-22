@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AskEdges, MAX_PENDING_ASK_EDGES_PER_SESSION } from "./ask-edges.ts";
+import { ASK_REPLY_AUTHORIZATION_RETENTION_MS, AskEdges, MAX_PENDING_ASK_EDGES_PER_SESSION } from "./ask-edges.ts";
 
 const GLOBAL_CAP = 512; // MAX_SESSIONS * 4 in the broker
 
@@ -123,11 +123,15 @@ test("add replaces an existing id without double-counting capacity", () => {
   assert.equal(edges.canAdd("a").ok, true);
 });
 
-test("pruneOlderThan drops only edges past the age bound", () => {
+test("pruneOlderThan retains reply authorization for the bounded late-reply window", () => {
   const edges = new AskEdges(GLOBAL_CAP);
+  const waiterTimeoutMs = 50;
+  const authorizationAgeMs = waiterTimeoutMs + ASK_REPLY_AUTHORIZATION_RETENTION_MS;
   edges.add("old", "a", "b", 1000);
   edges.add("new", "a", "c", 5000);
-  edges.pruneOlderThan(1000, 5500);
+  edges.pruneOlderThan(authorizationAgeMs, 1000 + authorizationAgeMs);
+  assert.equal(edges.has("old"), true, "the full late-reply window remains authorized after waiter timeout");
+  edges.pruneOlderThan(authorizationAgeMs, 1001 + authorizationAgeMs);
   assert.equal(edges.has("old"), false);
   assert.equal(edges.has("new"), true);
   // Counters follow the prune, so "a" is not stuck at a phantom count.
@@ -140,7 +144,7 @@ test("deleteForSession removes edges where the session is either party", () => {
   edges.add("m1", "a", "b");
   edges.add("m2", "c", "a");
   edges.add("m3", "c", "d");
-  edges.deleteForSession("a");
+  assert.deepEqual(edges.deleteForSession("a"), ["m1", "m2"]);
   assert.equal(edges.has("m1"), false);
   assert.equal(edges.has("m2"), false);
   assert.equal(edges.has("m3"), true);

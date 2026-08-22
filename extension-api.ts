@@ -100,6 +100,7 @@ export type IntercomExtensionEvent =
 
 export interface ExtensionChannelSnapshot {
   connected: boolean;
+  supported: boolean;
   brokerEpoch?: string;
   capabilities: {
     extensionBus: boolean;

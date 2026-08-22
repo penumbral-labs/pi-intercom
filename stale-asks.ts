@@ -1,3 +1,5 @@
+import { STALE_ASK_RETENTION_MS } from "./config.ts";
+
 export type StaleAskTier = "cancelled" | "superseded" | "timed_out";
 
 interface StaleAskEntry {
@@ -7,7 +9,7 @@ interface StaleAskEntry {
 }
 
 export const MAX_STALE_ASKS = 256;
-export const STALE_ASK_RETENTION_MS = 60 * 60 * 1000;
+export { STALE_ASK_RETENTION_MS };
 
 export class StaleAsks {
   private entries = new Map<string, StaleAskEntry>();

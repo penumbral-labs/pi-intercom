@@ -739,6 +739,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         const extension = requireCurrent();
         return {
           connected: Boolean(client?.isConnected()),
+          supported: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
           ...(client?.brokerEpoch ? { brokerEpoch: client.brokerEpoch } : {}),
           capabilities: {
             extensionBus: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
@@ -1196,36 +1197,49 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         const generation = extension.generation;
         const controller = new AbortController();
         extension.reservations.set(frame.messageId, { controller, reservationId: frame.reservationId });
+        let reservationDecisionSent = false;
+        let releaseReservationDecision: (() => void) | undefined;
+        const reservationDecisionSentPromise = new Promise<void>((resolve) => {
+          releaseReservationDecision = resolve;
+        });
+        const afterReservationDecision = async <T>(action: () => Promise<T>): Promise<T> => {
+          if (!reservationDecisionSent) await reservationDecisionSentPromise;
+          return action();
+        };
         const reservation: OpaqueDispatchReservation = {
           messageId: frame.messageId,
           reservationId: frame.reservationId,
           attempt: frame.attempt,
           signal: controller.signal,
           async claim() {
-            if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
-              return { claimed: false, code: "stale_reservation" };
-            }
-            try { return await nextClient.claimOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
-            catch (error) { return { claimed: false, code: opaqueErrorReason(error, "connection_lost") }; }
-            finally {
-              const active = localExtensions.get(frame.recipientNamespace);
-              if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
-                active.reservations.delete(frame.messageId);
+            return afterReservationDecision(async () => {
+              if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
+                return { claimed: false as const, code: "stale_reservation" as const };
               }
-            }
+              try { return await nextClient.claimOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
+              catch (error) { return { claimed: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
+              finally {
+                const active = localExtensions.get(frame.recipientNamespace);
+                if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
+                  active.reservations.delete(frame.messageId);
+                }
+              }
+            });
           },
           async fail() {
-            if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
-              return { failedClosed: false, code: "stale_reservation" };
-            }
-            try { return await nextClient.failOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
-            catch (error) { return { failedClosed: false, code: opaqueErrorReason(error, "connection_lost") }; }
-            finally {
-              const active = localExtensions.get(frame.recipientNamespace);
-              if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
-                active.reservations.delete(frame.messageId);
+            return afterReservationDecision(async () => {
+              if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
+                return { failedClosed: false as const, code: "stale_reservation" as const };
               }
-            }
+              try { return await nextClient.failOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
+              catch (error) { return { failedClosed: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
+              finally {
+                const active = localExtensions.get(frame.recipientNamespace);
+                if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
+                  active.reservations.delete(frame.messageId);
+                }
+              }
+            });
           },
         };
         let decision: unknown;
@@ -1249,9 +1263,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (decision === "reserved" || decision === "refused") {
           try {
             nextClient.sendOpaqueReservationResult(frame.messageId, frame.reservationId, decision);
+            reservationDecisionSent = true;
+            releaseReservationDecision?.();
           } catch {
             controller.abort("connection_lost");
             extension.reservations.delete(frame.messageId);
+            reservationDecisionSent = true;
+            releaseReservationDecision?.();
           }
         } else {
           const reason: OpaqueDispatchReason = decision === "consumer_threw" ? "consumer_threw" : "malformed_consumer_result";
@@ -1262,6 +1280,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           }
           controller.abort(reason);
           extension.reservations.delete(frame.messageId);
+          reservationDecisionSent = true;
+          releaseReservationDecision?.();
         }
         return;
       }

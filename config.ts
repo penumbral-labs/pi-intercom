@@ -3,6 +3,7 @@ import { join } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+export const STALE_ASK_RETENTION_MS = 60 * 60 * 1000;
 
 /**
  * Largest delay setTimeout can represent. Above this Node coerces the delay to 1ms, so an

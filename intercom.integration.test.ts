@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -35,6 +35,7 @@ const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
 const { IntercomClient } = await import("./broker/client.ts");
+const { getAskTimeoutMs } = await import("./config.ts");
 const { getBrokerLaunchSpec, getTsxCliPath } = await import("./broker/spawn.ts");
 test.after(() => {
   for (const key of Object.keys(process.env)) {
@@ -459,6 +460,24 @@ function waitForReply(client: InstanceType<typeof IntercomClient>, replyTo: stri
     };
     client.on("message", handler);
   });
+}
+
+function pendingAskRecordPath(messageId: string): string {
+  return path.join(sharedHomeDir, ".pi", "agent", "intercom", "pending-asks", `${encodeURIComponent(messageId)}.json`);
+}
+
+function readPendingAskRecord(messageId: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(pendingAskRecordPath(messageId), "utf8")) as Record<string, unknown>;
+}
+
+async function waitForPendingAskRecordRemoved(messageId: string): Promise<void> {
+  const filePath = pendingAskRecordPath(messageId);
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    if (!existsSync(filePath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(existsSync(filePath), false);
 }
 
 async function waitForSessionByName(client: InstanceType<typeof IntercomClient>, name: string): Promise<SessionInfo> {
@@ -1267,6 +1286,7 @@ test("extension channels register locally without creating conversation messages
   assert.equal(channel?.namespace, "test-extension/v1");
   assert.deepEqual(channel?.snapshot(), {
     connected: false,
+    supported: false,
     capabilities: { extensionBus: false },
   });
   assert.deepEqual(extensionEvents, []);
@@ -1308,6 +1328,7 @@ test("disposed extension channels cannot act on a replacement registration", asy
   }), { state: "indeterminate", code: "claim_history_unavailable" });
   assert.deepEqual(replacementChannel.snapshot(), {
     connected: false,
+    supported: false,
     capabilities: { extensionBus: false },
   });
   replacementChannel.dispose();
@@ -1789,6 +1810,58 @@ test("refreshing absent extension state clears the cached snapshot", { concurren
   }
 });
 
+test("synchronous opaque reservation actions wait until the reserved decision is emitted", { concurrency: false }, async () => {
+  for (const action of ["claim", "fail"] as const) {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const { cleanup } = await setupClients();
+    const sender = new IntercomClient();
+    const sessionId = `synchronous-${action}-receiver`;
+    const receiverNamespace = `opaque/synchronous-${action}-receiver`;
+    const senderNamespace = `opaque/synchronous-${action}-sender`;
+    const harness = createExtensionHarness(sessionId, { hasUI: true, sessionId });
+    let actionResult: Promise<unknown> | undefined;
+    let receiverChannel: IntercomExtensionChannel | undefined;
+
+    try {
+      piIntercomExtension(harness.pi as never);
+      harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+        namespace: receiverNamespace,
+        ownerEligible: false,
+        opaqueDispatch: {
+          version: 1,
+          roles: ["receive"],
+          onReserve: (_event: unknown, reservation: { claim(): Promise<unknown>; fail(): Promise<unknown> }) => {
+            actionResult = reservation[action]();
+            return "reserved";
+          },
+        },
+        onReady: (channel: IntercomExtensionChannel) => { receiverChannel = channel; },
+        onEvent: () => undefined,
+      });
+      await harness.emitLifecycle("session_start");
+      await sender.connect({
+        name: `synchronous-${action}-sender`, cwd: repoDir, model: "test-model", pid: process.pid,
+        startedAt: Date.now(), lastActivity: Date.now(),
+        extensions: [{ namespace: senderNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+      }, `synchronous-${action}-sender`);
+      await waitForSessionId(sender, sessionId);
+
+      const result = await sender.sendOpaqueDispatch(senderNamespace, {
+        requestId: `synchronous-${action}-request`, toSessionId: sessionId,
+        recipientNamespace: receiverNamespace, payload: null,
+      });
+      assert.equal(result.accepted, true, `${action} must not race ahead of the reserved decision`);
+      assert.ok(actionResult);
+      assert.deepEqual(await actionResult, action === "claim" ? { claimed: true } : { failedClosed: true });
+    } finally {
+      receiverChannel?.dispose();
+      await sender.disconnect().catch(() => undefined);
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  }
+});
+
 test("opaque claim releases receiver reservation before dispose", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { cleanup } = await setupClients();
@@ -2070,7 +2143,7 @@ test("opaque extension sends consumer_unloaded before dispose removes capability
     assert.equal(receiverSession.opaqueDispatch?.namespaces.some((entry) => entry.namespace === "opaque/receiver" && entry.roles.includes("receive")), true);
     senderChannel = {
       namespace: "opaque/sender",
-      snapshot: () => ({ connected: true, capabilities: { extensionBus: true, opaqueDispatchVersion: 1 } }),
+      snapshot: () => ({ connected: true, supported: true, capabilities: { extensionBus: true, opaqueDispatchVersion: 1 } }),
       publish: () => undefined,
       commitState: () => undefined,
       refreshState: async () => ({ ok: false, code: "connection_lost" }),
@@ -2093,7 +2166,7 @@ test("opaque extension sends consumer_unloaded before dispose removes capability
         resolve(frame);
       });
     });
-    const result = await senderChannel.sendOpaqueDispatch({
+    const result = await senderChannel!.sendOpaqueDispatch({
       requestId: "dispose-request",
       toSessionId: "opaque-receiver",
       recipientNamespace: "opaque/receiver",
@@ -3182,6 +3255,74 @@ test("regular intercom asks fail safely when started concurrently", { concurrenc
     assert.equal(results.filter((result) => /First answer/.test(result.content[0]?.text ?? "")).length, 1);
     await harness.emitLifecycle("session_shutdown");
   } finally {
+    await cleanup();
+  }
+});
+
+test("broker writes and removes bounded local pending ask records", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const answeredId = "pending-record-answered";
+  const cancelledId = "pending-record-cancelled";
+
+  try {
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: answeredId,
+      text: "Can you decide?",
+      expectsReply: true,
+    })).delivered, true);
+    const record = readPendingAskRecord(answeredId);
+    assert.deepEqual(record, {
+      askId: answeredId,
+      messageId: answeredId,
+      asker: { sessionId: planner.sessionId, name: "planner" },
+      target: { sessionId: orchestrator.sessionId, name: "orchestrator" },
+      question: "Can you decide?",
+      createdAt: record.createdAt,
+      expiresAt: record.expiresAt,
+    });
+    assert.equal(Number(record.expiresAt) - Number(record.createdAt), getAskTimeoutMs());
+
+    assert.equal((await orchestrator.send(planner.sessionId!, { text: "Yes.", replyTo: answeredId })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(answeredId)), false);
+
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: cancelledId,
+      text: "Should I stop?",
+      expectsReply: true,
+    })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(cancelledId)), true);
+    planner.cancelAsk(cancelledId);
+    await waitForPendingAskRecordRemoved(cancelledId);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("broker removes the durable pending record at waiter timeout but authorizes a bounded late reply", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const askId = "pending-record-late-reply";
+
+  try {
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: askId,
+      text: "Will this time out?",
+      expectsReply: true,
+    })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(askId)), true);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal((await planner.send(orchestrator.sessionId!, { text: "Prune records." })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(askId)), false);
+
+    const received = waitForReply(planner, askId);
+    const lateReply = await orchestrator.send(planner.sessionId!, { text: "Late answer.", replyTo: askId });
+    assert.equal(lateReply.delivered, true);
+    assert.equal((await received).message.content.text, "Late answer.");
+  } finally {
+    if (previousTimeout === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
     await cleanup();
   }
 });
