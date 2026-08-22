@@ -536,7 +536,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     generation: number;
     reservations: Map<string, { controller: AbortController; reservationId: string }>;
     acceptedDispatches: Map<string, { requestId: string; messageId: string; brokerEpoch: string }>;
-    terminalDispatches: Set<string>;
+    pendingDispatches: Map<string, number>;
+    terminalPendingDispatches: Map<string, string>;
   }>();
   let nextExtensionGeneration = 1;
   let runtimeContext: ExtensionContext | null = null;
@@ -818,37 +819,60 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       },
       async sendOpaqueDispatch(input) {
         const activeClient = client;
-        if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+        if (!current() || !activeClient?.isConnected()) {
+          return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+        }
+        if (!activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
           return { accepted: false as const, requestId: input.requestId, code: "unsupported_broker" as const };
         }
+        const extension = localExtensions.get(namespace);
+        if (!extension || extension.generation !== generation) {
+          return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+        }
+        extension.pendingDispatches.set(input.requestId, (extension.pendingDispatches.get(input.requestId) ?? 0) + 1);
         try {
           const result = await activeClient.sendOpaqueDispatch(namespace, input);
-          const extension = localExtensions.get(namespace);
-          if (!current()) {
+          if (!current() || client !== activeClient) {
             return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
           }
-          if (result.accepted && extension?.generation === generation) {
-            if (!extension.terminalDispatches.delete(result.messageId)) {
+          if (result.accepted && extension.generation === generation) {
+            const terminalMessageId = extension.terminalPendingDispatches.get(result.requestId);
+            if (terminalMessageId === undefined) {
               extension.acceptedDispatches.set(result.messageId, {
                 requestId: result.requestId,
                 messageId: result.messageId,
                 brokerEpoch: result.brokerEpoch,
               });
+            } else if (terminalMessageId !== result.messageId) {
+              return { accepted: false as const, requestId: input.requestId, code: "invalid_frame" as const };
             }
           }
           return result;
         } catch (error) {
           return { accepted: false as const, requestId: input.requestId, code: opaqueErrorReason(error, "connection_lost") };
+        } finally {
+          if (localExtensions.get(namespace) === extension && extension.generation === generation) {
+            const pendingCount = extension.pendingDispatches.get(input.requestId) ?? 0;
+            if (pendingCount <= 1) {
+              extension.pendingDispatches.delete(input.requestId);
+              extension.terminalPendingDispatches.delete(input.requestId);
+            } else {
+              extension.pendingDispatches.set(input.requestId, pendingCount - 1);
+            }
+          }
         }
       },
       async cancelMessage(messageId) {
         const activeClient = client;
-        if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+        if (!current() || !activeClient?.isConnected()) {
+          return { cancelled: false as const, code: "connection_lost" as const };
+        }
+        if (!activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
           return { cancelled: false as const, code: "unsupported_broker" as const };
         }
         try {
           const result = await activeClient.cancelOpaqueDispatch(namespace, messageId);
-          return current() ? result : { cancelled: false as const, code: "connection_lost" as const };
+          return current() && client === activeClient ? result : { cancelled: false as const, code: "connection_lost" as const };
         } catch (error) { return { cancelled: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
       },
       async reconcileClaim(input) {
@@ -877,6 +901,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             reservation.controller.abort("consumer_unloaded");
           }
           extension.reservations.clear();
+          extension.acceptedDispatches.clear();
+          extension.pendingDispatches.clear();
+          extension.terminalPendingDispatches.clear();
         }
         localExtensions.delete(namespace);
         if (activeClient?.isConnected() && activeClient.supportsFeature(EXTENSION_BUS_FEATURE)) {
@@ -924,7 +951,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       generation,
       reservations: new Map(),
       acceptedDispatches: new Map(),
-      terminalDispatches: new Set(),
+      pendingDispatches: new Map(),
+      terminalPendingDispatches: new Map(),
     });
     const activeClient = client;
     const connected = Boolean(activeClient?.isConnected());
@@ -1261,8 +1289,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       } finally {
         if (extension && extension.generation === localExtensions.get(frame.senderNamespace)?.generation) {
           if (frame.receipt.status !== "queued" && frame.receipt.status !== "reserved") {
-            if (!extension.acceptedDispatches.delete(frame.receipt.messageId)) {
-              extension.terminalDispatches.add(frame.receipt.messageId);
+            if (!extension.acceptedDispatches.delete(frame.receipt.messageId)
+              && extension.pendingDispatches.has(frame.receipt.requestId)) {
+              extension.terminalPendingDispatches.set(frame.receipt.requestId, frame.receipt.messageId);
             }
           }
           try {
@@ -1281,8 +1310,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           if (supported && localExtensions.size > 0) {
             nextClient.updateExtensionCapabilities(currentExtensionCapabilities());
           }
-          if (message.brokerEpoch) {
-            for (const extension of localExtensions.values()) {
+          for (const extension of localExtensions.values()) {
+            delete extension.state;
+            extension.pendingDispatches.clear();
+            extension.terminalPendingDispatches.clear();
+            if (message.brokerEpoch) {
               for (const dispatch of [...extension.acceptedDispatches.values()]) {
                 if (dispatch.brokerEpoch === message.brokerEpoch) continue;
                 try {
@@ -1384,6 +1416,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         extension.owner = undefined;
         for (const reservation of extension.reservations.values()) reservation.controller.abort("receiver_disconnected");
         extension.reservations.clear();
+        extension.pendingDispatches.clear();
+        extension.terminalPendingDispatches.clear();
         emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
         emitLocalExtensionEvent(namespace, { type: "owner" });
       }
@@ -1759,6 +1793,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
     staleAsks.clear();
+    for (const extension of localExtensions.values()) {
+      extension.acceptedDispatches.clear();
+      extension.pendingDispatches.clear();
+      extension.terminalPendingDispatches.clear();
+    }
     agentRunning = false;
     activeTools.clear();
     if (client) {

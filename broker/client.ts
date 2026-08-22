@@ -1062,9 +1062,13 @@ export class IntercomClient extends EventEmitter {
 
   async cancelOpaqueDispatch(senderNamespace: string, messageId: string) {
     const result = await this.runOpaqueOperation(senderNamespace, (operationId) => ({ type: "opaque_dispatch_v1_cancel", operationId, senderNamespace, messageId }));
-    return result.type === "opaque_dispatch_v1_cancel_result" && result.cancelled
-      ? { cancelled: true as const }
-      : { cancelled: false as const, code: result.type === "opaque_dispatch_v1_cancel_result" ? result.code ?? "invalid_frame" as const : "invalid_frame" as const };
+    if (result.type === "opaque_dispatch_v1_cancel_result" && result.cancelled) return { cancelled: true as const };
+    return {
+      cancelled: false as const,
+      code: result.type === "opaque_dispatch_v1_cancel_result" || result.type === "opaque_dispatch_v1_rejected"
+        ? result.code ?? "invalid_frame" as const
+        : "invalid_frame" as const,
+    };
   }
 
   sendOpaqueReservationResult(messageId: string, reservationId: string, decision: "reserved" | "refused" | "failed_closed", reason?: OpaqueDispatchReason): void {

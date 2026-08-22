@@ -161,6 +161,21 @@ test("opaque send re-resolves one target rebound with the same request ID", asyn
   assert.equal(queryCount, 2);
 });
 
+test("opaque cancel preserves a broker rejection code", async () => {
+  const client = new IntercomClient();
+  const operationIds: string[] = [];
+  const raw = installOpaqueSocket(client, operationIds);
+  const pending = client.cancelOpaqueDispatch("sender/v1", "11111111-1111-4111-8111-111111111111");
+  assert.equal(operationIds.length, 1);
+  raw.handleBrokerMessage({
+    type: "opaque_dispatch_v1_rejected",
+    operationId: operationIds[0],
+    messageId: "11111111-1111-4111-8111-111111111111",
+    code: "rate_limited",
+  });
+  assert.deepEqual(await pending, { cancelled: false, code: "rate_limited" });
+});
+
 test("opaque claim result settles only the correlated operation", async () => {
   const client = new IntercomClient();
   const raw = internals(client);
