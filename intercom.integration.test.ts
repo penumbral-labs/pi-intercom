@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -3281,6 +3281,7 @@ test("broker writes and removes bounded local pending ask records", { concurrenc
       expiresAt: record.expiresAt,
     });
     assert.equal(Number(record.expiresAt) - Number(record.createdAt), getAskTimeoutMs());
+    if (process.platform !== "win32") assert.equal(statSync(pendingAskRecordPath(answeredId)).mode & 0o777, 0o600);
 
     assert.equal((await orchestrator.send(planner.sessionId!, { text: "Yes.", replyTo: answeredId })).delivered, true);
     assert.equal(existsSync(pendingAskRecordPath(answeredId)), false);
@@ -3535,9 +3536,13 @@ test("extension applies cancelled, superseded, and timed-out stale-reply tiers",
       to: "planner",
       message: "This ask will time out.",
     }, new AbortController().signal, undefined, harness.ctx);
-    const [, timedOutQuestion] = await timedOutMessage;
+    const [timedOutFrom, timedOutQuestion] = await timedOutMessage;
     assert.equal((await timedOutAsk).details?.error, true);
-    emitLateReply("late-timeout-reply", timedOutQuestion.id, "Visible after timeout.");
+    assert.equal((await planner.send(timedOutFrom.id, {
+      messageId: "late-timeout-reply",
+      text: "Visible after timeout.",
+      replyTo: timedOutQuestion.id,
+    })).delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(harness.sentMessages.length, 1);
     assert.match(harness.sentMessages[0]?.message.content ?? "", /Late reply to abandoned ask/);
