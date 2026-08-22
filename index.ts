@@ -1607,6 +1607,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function startSessionRuntime(ctx: ExtensionContext): void {
     const previousClient = client;
+    for (const extension of localExtensions.values()) {
+      for (const reservation of extension.reservations.values()) {
+        reservation.controller.abort("receiver_disconnected");
+      }
+      extension.reservations.clear();
+      for (const [requestId, attempts] of extension.pendingDispatches) {
+        for (const attempt of attempts) {
+          if (attempt.client === previousClient) attempts.delete(attempt);
+        }
+        if (attempts.size === 0) extension.pendingDispatches.delete(requestId);
+      }
+    }
     shuttingDown = false;
     disposed = false;
     runtimeStarted = true;
@@ -2537,9 +2549,6 @@ Usage:
               };
             }
             questionId = randomUUID();
-            if (supersedes) {
-              classifyAbandonedAsk(supersedes, sendTo, "superseded");
-            }
             replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
             replyPromise.catch(() => undefined);
             const sendResult = await connectedClient.send(sendTo, {
@@ -2567,6 +2576,9 @@ Usage:
                 content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
                 details: { error: true, ...deliveryDetails(sendResult) },
               };
+            }
+            if (supersedes) {
+              classifyAbandonedAsk(supersedes, sendTo, "superseded");
             }
             pi.appendEntry("intercom_sent", {
               to: targetDisplay,

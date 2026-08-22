@@ -1929,6 +1929,61 @@ test("opaque consumer refusal and callback failures retain typed terminal reason
   }
 });
 
+test("session restart aborts a pending receiver reservation before replacing the client", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const sender = new IntercomClient();
+  let sessionId = "restart-reservation-before";
+  const harness = createExtensionHarness("restart-reservation-receiver", { sessionId: () => sessionId });
+  let signal: AbortSignal | undefined;
+  try {
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "opaque/restart-receiver",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["receive"],
+        onReserve: (_event: unknown, reservation: { signal: AbortSignal }) => {
+          signal = reservation.signal;
+          return "reserved";
+        },
+      },
+      onReady: () => undefined,
+      onEvent: () => undefined,
+    });
+    await harness.emitLifecycle("session_start");
+    await sender.connect({
+      name: "restart-reservation-sender",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      extensions: [{ namespace: "opaque/restart-sender", ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "restart-reservation-sender");
+    await waitForSessionId(sender, sessionId);
+    const accepted = await sender.sendOpaqueDispatch("opaque/restart-sender", {
+      requestId: "restart-reservation-request",
+      toSessionId: sessionId,
+      recipientNamespace: "opaque/restart-receiver",
+      payload: null,
+    });
+    assert.equal(accepted.accepted, true);
+    assert.equal(signal?.aborted, false);
+
+    sessionId = "restart-reservation-after";
+    await harness.emitLifecycle("turn_start");
+    assert.equal(signal?.aborted, true);
+    assert.equal(signal?.reason, "receiver_disconnected");
+    await waitForSessionId(sender, sessionId);
+  } finally {
+    await sender.disconnect().catch(() => undefined);
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("session shutdown aborts a pending receiver reservation", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { cleanup } = await setupClients();
@@ -3364,6 +3419,7 @@ test("extension applies cancelled, superseded, and timed-out stale-reply tiers",
       supersedes: supersededQuestion.id,
     }, new AbortController().signal, undefined, harness.ctx);
     const [, replacementQuestion] = await replacementMessage;
+    await new Promise((resolve) => setTimeout(resolve, 20));
     emitLateReply("late-superseded-reply", supersededQuestion.id, "Too late after supersession.");
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(harness.sentMessages.length, 1, "superseded late reply must be dropped");
@@ -3374,6 +3430,83 @@ test("extension applies cancelled, superseded, and timed-out stale-reply tiers",
     assert.match(replacementResult.content[0]?.text ?? "", /Current answer/);
   } finally {
     EventEmitter.prototype.on = originalOn;
+    if (previousTimeout === undefined) {
+      delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    } else {
+      process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
+    }
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("rejected superseding ask keeps the prior ask eligible for a late reply", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("rejected-supersede-worker", { sessionId: "session-rejected-supersede-worker", hasUI: true });
+  const originalOn = EventEmitter.prototype.on;
+  const originalSend = IntercomClient.prototype.send;
+  let inboundMessageHandler: ((from: SessionInfo, message: Message) => void) | undefined;
+  EventEmitter.prototype.on = function (eventName: string | symbol, listener: (...args: any[]) => void) {
+    if (eventName === "message") inboundMessageHandler = listener;
+    return originalOn.call(this, eventName, listener);
+  };
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "rejected-supersede-worker");
+    EventEmitter.prototype.on = originalOn;
+    const plannerSession = await waitForSessionByName(planner, "planner");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    assert.ok(inboundMessageHandler);
+
+    const originalMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const originalAsk = intercomTool.execute("original-before-rejected-supersede", {
+      action: "ask",
+      to: "planner",
+      message: "Keep this ask live if its replacement fails.",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, originalQuestion] = await originalMessage;
+    assert.equal((await originalAsk).details?.error, true);
+
+    IntercomClient.prototype.send = async function (to, options) {
+      if (options.supersedes === originalQuestion.id) {
+        return {
+          id: options.messageId!,
+          delivered: false,
+          delivery: "failed",
+          retryable: false,
+          outcomeKnown: true,
+          reason: "Replacement rejected for test",
+        };
+      }
+      return originalSend.call(this, to, options);
+    };
+    const replacementResult = await intercomTool.execute("rejected-supersede", {
+      action: "ask",
+      to: "planner",
+      message: "Rejected replacement.",
+      supersedes: originalQuestion.id,
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(replacementResult.details?.error, true);
+    assert.match(replacementResult.content[0]?.text ?? "", /Replacement rejected for test/);
+
+    inboundMessageHandler!(plannerSession, {
+      id: "late-reply-after-rejected-supersede",
+      timestamp: Date.now(),
+      replyTo: originalQuestion.id,
+      content: { text: "The original ask is still live." },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 1, "a rejected replacement must not cause the prior late reply to be dropped");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Late reply to abandoned ask/);
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /The original ask is still live/);
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    IntercomClient.prototype.send = originalSend;
     if (previousTimeout === undefined) {
       delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
     } else {
