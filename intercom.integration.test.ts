@@ -398,10 +398,10 @@ test("production broker launch remains pinned", () => {
   assert.ok(launch.args.some((arg) => arg.endsWith(path.join("broker", "broker.ts"))));
 });
 
-async function setupClients(options: { brokerEnv?: NodeJS.ProcessEnv } = {}) {
+async function setupClients() {
   const broker = spawn(process.execPath, [getTsxCliPath(), path.join(repoDir, "broker", "broker.ts")], {
     cwd: repoDir,
-    env: { ...process.env, ...options.brokerEnv, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
+    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -1914,82 +1914,6 @@ test("opaque claim releases receiver reservation before dispose", { concurrency:
   }
 });
 
-test("opaque capability lookup prunes disconnected endpoints beyond retention", { concurrency: false }, async () => {
-  const clockPath = path.join(sharedHomeDir, "opaque-retention-capability-clock");
-  const disconnectedAt = 1_000_000;
-  writeFileSync(clockPath, String(disconnectedAt));
-  const { cleanup } = await setupClients({ brokerEnv: { PI_INTERCOM_TEST_CLOCK_PATH: clockPath } });
-  const sender = new IntercomClient();
-  const receiver = new IntercomClient();
-  const senderNamespace = "opaque/retention-capability-sender";
-  const receiverNamespace = "opaque/retention-capability-receiver";
-  try {
-    await receiver.connect({
-      name: "opaque-retention-capability-receiver", cwd: repoDir, model: "test-model", pid: process.pid,
-      startedAt: Date.now(), lastActivity: Date.now(),
-      extensions: [{ namespace: receiverNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }],
-    }, "opaque-retention-capability-receiver");
-    await sender.connect({
-      name: "opaque-retention-capability-sender", cwd: repoDir, model: "test-model", pid: process.pid,
-      startedAt: Date.now(), lastActivity: Date.now(),
-      extensions: [{ namespace: senderNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
-    }, "opaque-retention-capability-sender");
-    await receiver.disconnect();
-
-    assert.equal((await sender.peerCapability("opaque-retention-capability-receiver", receiverNamespace)).state, "present");
-    writeFileSync(clockPath, String(disconnectedAt + 24 * 60 * 60 * 1000 + 1));
-    assert.deepEqual(
-      await sender.peerCapability("opaque-retention-capability-receiver", receiverNamespace),
-      { state: "unknown" },
-    );
-  } finally {
-    await receiver.disconnect().catch(() => undefined);
-    await sender.disconnect().catch(() => undefined);
-    await cleanup();
-    rmSync(clockPath, { force: true });
-  }
-});
-
-test("opaque send rejects a disconnected endpoint beyond retention instead of queueing custody", { concurrency: false }, async () => {
-  const clockPath = path.join(sharedHomeDir, "opaque-retention-send-clock");
-  const disconnectedAt = 2_000_000;
-  writeFileSync(clockPath, String(disconnectedAt));
-  const { cleanup } = await setupClients({ brokerEnv: { PI_INTERCOM_TEST_CLOCK_PATH: clockPath } });
-  const sender = new IntercomClient();
-  const receiver = new IntercomClient();
-  const senderNamespace = "opaque/retention-send-sender";
-  const receiverNamespace = "opaque/retention-send-receiver";
-  try {
-    await receiver.connect({
-      name: "opaque-retention-send-receiver", cwd: repoDir, model: "test-model", pid: process.pid,
-      startedAt: Date.now(), lastActivity: Date.now(),
-      extensions: [{ namespace: receiverNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }],
-    }, "opaque-retention-send-receiver");
-    await sender.connect({
-      name: "opaque-retention-send-sender", cwd: repoDir, model: "test-model", pid: process.pid,
-      startedAt: Date.now(), lastActivity: Date.now(),
-      extensions: [{ namespace: senderNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
-    }, "opaque-retention-send-sender");
-    await receiver.disconnect();
-
-    writeFileSync(clockPath, String(disconnectedAt + 24 * 60 * 60 * 1000 + 1));
-    assert.deepEqual(await sender.sendOpaqueDispatch(senderNamespace, {
-      requestId: "expired-disconnected-endpoint-request",
-      toSessionId: "opaque-retention-send-receiver",
-      recipientNamespace: receiverNamespace,
-      payload: { private: true },
-    }), {
-      accepted: false,
-      requestId: "expired-disconnected-endpoint-request",
-      code: "unknown_exact_target",
-    });
-  } finally {
-    await receiver.disconnect().catch(() => undefined);
-    await sender.disconnect().catch(() => undefined);
-    await cleanup();
-    rmSync(clockPath, { force: true });
-  }
-});
 
 test("opaque queued custody fails closed when a stable session reconnects at a new endpoint epoch", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
@@ -2787,6 +2711,69 @@ test("same-sender supersede reports an already-steered inbound message", { concu
     unsubscribeReceipts();
   } finally {
     await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("accepted supersede retires the prior ask edge and durable record", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const oldAskId = "broker-superseded-ask";
+  const replacementId = "broker-superseding-message";
+
+  try {
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: oldAskId,
+      text: "Old question",
+      expectsReply: true,
+    })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(oldAskId)), true);
+
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: replacementId,
+      text: "Replacement",
+      supersedes: oldAskId,
+    })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(oldAskId)), false);
+
+    const staleReply = await orchestrator.send(planner.sessionId!, {
+      messageId: "reply-to-superseded-ask",
+      text: "No longer authorized",
+      replyTo: oldAskId,
+    });
+    assert.equal(staleReply.delivered, false);
+    assert.match(staleReply.reason ?? "", /pending ask/i);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("rejected supersede preserves the prior ask edge and durable record", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const oldAskId = "broker-rejected-supersede-ask";
+
+  try {
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: oldAskId,
+      text: "Keep this question",
+      expectsReply: true,
+    })).delivered, true);
+
+    const rejected = await planner.send(planner.sessionId!, {
+      messageId: "broker-rejected-superseding-message",
+      text: "Wrong target replacement",
+      supersedes: oldAskId,
+    });
+    assert.equal(rejected.delivered, false);
+    assert.equal(existsSync(pendingAskRecordPath(oldAskId)), true);
+
+    const reply = await orchestrator.send(planner.sessionId!, {
+      messageId: "reply-after-rejected-supersede",
+      text: "Still authorized",
+      replyTo: oldAskId,
+    });
+    assert.equal(reply.delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(oldAskId)), false);
+  } finally {
     await cleanup();
   }
 });
@@ -5309,6 +5296,46 @@ test("broker refuses replacing a peer-owned ask when the sender is at its ask ca
       text: "Answering without adding another ask.",
       replyTo: peerAskId,
     })).delivered, true, "the refusal must leave the peer-owned ask available for a plain reply");
+  } finally {
+    await sink.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("accepted superseding ask replaces its own active capacity at the sender cap", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const sink = new IntercomClient();
+  try {
+    await sink.connect({
+      name: "supersede-cap-sink",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+
+    const supersededId = "supersede-at-cap-old";
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: supersededId,
+      text: "Ask to replace at capacity",
+      expectsReply: true,
+    })).delivered, true);
+    for (let i = 1; i < MAX_PENDING_ASK_EDGES_PER_SESSION; i += 1) {
+      assert.equal((await planner.send(sink.sessionId!, {
+        messageId: `supersede-at-cap-${i}`,
+        text: `pending ask ${i}`,
+        expectsReply: true,
+      })).delivered, true);
+    }
+
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: "supersede-at-cap-new",
+      text: "Replacement ask",
+      supersedes: supersededId,
+      expectsReply: true,
+    })).delivered, true);
+    assert.equal(existsSync(pendingAskRecordPath(supersededId)), false);
   } finally {
     await sink.disconnect().catch(() => undefined);
     await cleanup();

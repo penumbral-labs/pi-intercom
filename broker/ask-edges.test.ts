@@ -113,6 +113,15 @@ test("replacing an existing edge discounts only capacity owned by the same asker
   assert.equal(full.canAdd("z", "m1").ok, true, "any replacement preserves global capacity");
 });
 
+test("capacity checks discount multiple active edges retired by one accepted replacement", () => {
+  const edges = new AskEdges(2, 1);
+  edges.add("reply-target", "target", "asker");
+  edges.add("superseded", "asker", "target");
+
+  assert.equal(edges.canAdd("asker", "reply-target").ok, false);
+  assert.equal(edges.canAdd("asker", ["reply-target", "superseded"]).ok, true);
+});
+
 test("add replaces an existing id without double-counting capacity", () => {
   const edges = new AskEdges(GLOBAL_CAP, 2);
   edges.add("m1", "a", "b");
@@ -147,6 +156,28 @@ test("timed-out asks do not consume active capacity", () => {
   assert.equal(edges.size, 1, "reply authorization remains stored separately from active capacity");
   assert.equal(edges.canAdd("a").ok, true);
   assert.equal(edges.canAdd("c").ok, true);
+});
+
+test("reply-only capacity evicts the deterministic oldest authorizations without changing active caps", () => {
+  const edges = new AskEdges(2, 1, 2);
+  edges.add("old-by-time", "a", "x", 999);
+  edges.add("old-by-order", "b", "x", 1000);
+  edges.expireActiveOlderThan(0, 1001);
+
+  edges.add("new-by-order", "c", "x", 1000);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1001), ["old-by-time"]);
+  assert.equal(edges.has("old-by-time"), false);
+  assert.equal(edges.has("old-by-order"), true);
+  assert.equal(edges.has("new-by-order"), true);
+
+  edges.add("newest", "d", "x", 1001);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1002), ["old-by-order"]);
+  assert.equal(edges.has("old-by-order"), false, "equal timestamps are ordered by insertion");
+  assert.equal(edges.has("new-by-order"), true);
+  assert.equal(edges.has("newest"), true);
+  assert.equal(edges.activeSize, 0);
+  assert.equal(edges.canAdd("a").ok, true, "reply-only eviction must not alter per-session active accounting");
+  assert.equal(edges.canAdd("e").ok, true, "reply-only eviction must not alter global active accounting");
 });
 
 test("pruneOlderThan retains reply authorization for the bounded late-reply window", () => {

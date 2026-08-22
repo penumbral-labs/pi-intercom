@@ -30,6 +30,7 @@ interface StoredAskEdge extends AskEdge {
   // Cached `${from}\0${to}` key so active counters can be maintained without recomputing.
   pairKey: string;
   active: boolean;
+  insertionOrder: number;
 }
 
 export interface AskEdgeCapacityRefusal {
@@ -51,8 +52,14 @@ export class AskEdges {
   private readonly activeByAsker = new Map<string, number>();
   private readonly activeByPair = new Map<string, number>();
   private activeCount = 0;
+  private replyOnlyCount = 0;
+  private nextInsertionOrder = 0;
 
-  constructor(private readonly maxGlobal: number, private readonly maxPerSession = MAX_PENDING_ASK_EDGES_PER_SESSION) {}
+  constructor(
+    private readonly maxGlobal: number,
+    private readonly maxPerSession = MAX_PENDING_ASK_EDGES_PER_SESSION,
+    private readonly maxReplyOnly = maxGlobal,
+  ) {}
 
   get size(): number {
     return this.edges.size;
@@ -72,17 +79,27 @@ export class AskEdges {
 
   // Whether adding an edge from `from` is allowed.
   //
-  // `replacingMessageId` names an edge this add would replace. Replacing an active edge preserves
-  // global capacity, but it preserves this asker's capacity only when that edge belongs to the
-  // same asker. Replacing reply-only authorization adds a new active edge and must satisfy both
-  // limits normally.
-  canAdd(from: string, replacingMessageId?: string): AskEdgeCapacity {
-    const replaced = replacingMessageId === undefined ? undefined : this.edges.get(replacingMessageId);
-    if ((!replaced || !replaced.active) && this.activeCount >= this.maxGlobal) {
+  // `replacingMessageIds` names validated edges this add will retire after successful delivery.
+  // Replacing active edges preserves global capacity, but preserves this asker's capacity only for
+  // edges belonging to that asker. Reply-only authorizations do not affect active capacity.
+  canAdd(from: string, replacingMessageIds?: string | readonly string[]): AskEdgeCapacity {
+    const replacementIds = typeof replacingMessageIds === "string"
+      ? [replacingMessageIds]
+      : replacingMessageIds ?? [];
+    const replaced = new Set<StoredAskEdge>();
+    for (const messageId of replacementIds) {
+      const edge = this.edges.get(messageId);
+      if (edge?.active) replaced.add(edge);
+    }
+    const replacedActiveCount = replaced.size;
+    if (this.activeCount - replacedActiveCount >= this.maxGlobal) {
       return { ok: false, reason: "Too many pending intercom asks" };
     }
-    const askerCountAfterReplacement = (this.activeByAsker.get(from) ?? 0)
-      - (replaced?.active && replaced.from === from ? 1 : 0);
+    let replacedForAsker = 0;
+    for (const edge of replaced) {
+      if (edge.from === from) replacedForAsker += 1;
+    }
+    const askerCountAfterReplacement = (this.activeByAsker.get(from) ?? 0) - replacedForAsker;
     if (askerCountAfterReplacement >= this.maxPerSession) {
       return { ok: false, reason: "Too many pending intercom asks from this session" };
     }
@@ -93,7 +110,14 @@ export class AskEdges {
   add(messageId: string, from: string, to: string, now = Date.now()): void {
     this.delete(messageId);
     const key = pairKey(from, to);
-    this.edges.set(messageId, { from, to, pairKey: key, createdAt: now, active: true });
+    this.edges.set(messageId, {
+      from,
+      to,
+      pairKey: key,
+      createdAt: now,
+      active: true,
+      insertionOrder: this.nextInsertionOrder++,
+    });
     this.activeCount += 1;
     this.increment(this.activeByAsker, from);
     this.increment(this.activeByPair, key);
@@ -106,6 +130,7 @@ export class AskEdges {
     }
     this.edges.delete(messageId);
     if (edge.active) this.deactivate(edge);
+    else this.replyOnlyCount -= 1;
     return true;
   }
 
@@ -142,12 +167,24 @@ export class AskEdges {
     return count > 0;
   }
 
-  // Removes timed-out asks from deadlock and capacity accounting while retaining their edges for
-  // late-reply authorization.
-  expireActiveOlderThan(maxAgeMs: number, now = Date.now()): void {
+  // Removes timed-out asks from deadlock and active-capacity accounting while retaining a bounded
+  // set for late-reply authorization. Returns reply-only IDs evicted from oldest to newest.
+  expireActiveOlderThan(maxAgeMs: number, now = Date.now()): string[] {
     for (const edge of this.edges.values()) {
       if (edge.active && now - edge.createdAt > maxAgeMs) this.deactivate(edge);
     }
+    if (this.replyOnlyCount <= this.maxReplyOnly) return [];
+
+    const replyOnly = Array.from(this.edges.entries())
+      .filter(([, edge]) => !edge.active)
+      .sort(([, left], [, right]) => left.createdAt - right.createdAt || left.insertionOrder - right.insertionOrder);
+    const evicted: string[] = [];
+    for (const [messageId] of replyOnly) {
+      if (this.replyOnlyCount <= this.maxReplyOnly) break;
+      this.delete(messageId);
+      evicted.push(messageId);
+    }
+    return evicted;
   }
 
   // Drops reply authorization older than `maxAgeMs`.
@@ -176,11 +213,13 @@ export class AskEdges {
     this.activeByAsker.clear();
     this.activeByPair.clear();
     this.activeCount = 0;
+    this.replyOnlyCount = 0;
   }
 
   private deactivate(edge: StoredAskEdge): void {
     edge.active = false;
     this.activeCount -= 1;
+    this.replyOnlyCount += 1;
     this.decrement(this.activeByAsker, edge.from);
     this.decrement(this.activeByPair, edge.pairKey);
   }

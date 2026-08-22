@@ -46,6 +46,7 @@ import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageC
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { OpaqueDispatchManager, writeOpaqueTo, type OpaqueEndpoint } from "./opaque-dispatch.ts";
+import { pruneDisconnectedSessions } from "./disconnected-sessions.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -66,19 +67,11 @@ const MAX_EXTENSION_STATE_BYTES = 64 * 1024;
 const MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000;
 const DISCONNECTED_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
-const TEST_CLOCK_PATH = process.env.PI_INTERCOM_TEST_CLOCK_PATH;
 const MAX_MAILBOX_MESSAGES = 256;
 const MAX_RATE_LIMITED_OPAQUE_OPERATIONS = 256;
 const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 4096;
 const BROKER_STARTED_AT = Date.now();
-
-function brokerNow(): number {
-  if (!TEST_CLOCK_PATH) return Date.now();
-  const value = Number(readFileSync(TEST_CLOCK_PATH, "utf8"));
-  if (!Number.isSafeInteger(value)) throw new Error("Invalid PI_INTERCOM_TEST_CLOCK_PATH value");
-  return value;
-}
 
 function serializedPayloadSize(payload: unknown): number | null {
   try {
@@ -205,7 +198,7 @@ class IntercomBroker {
     this.opaqueDispatch = new OpaqueDispatchManager({
       brokerEpoch: BROKER_EPOCH,
       endpoint: (sessionId) => this.opaqueEndpoint(sessionId),
-      now: brokerNow,
+      now: Date.now,
       owner: (namespace) => {
         const owner = this.namespaceOwners.get(namespace);
         return owner ? { sessionId: owner.sessionId, epoch: owner.epoch } : undefined;
@@ -725,7 +718,14 @@ class IntercomBroker {
               writeMessage(socket, deliveryFailed(message.id, "Mutual ask refused: target session is already waiting for a reply from this session.", "E_MUTUAL_ASK"));
               break;
             }
-            const capacity = this.askEdges.canAdd(currentId, message.replyTo);
+            const supersededEdge = message.supersedes ? this.askEdges.get(message.supersedes) : undefined;
+            const replacedAskIds = [
+              message.replyTo,
+              supersededEdge?.from === currentId && supersededEdge.to === target.info.id
+                ? message.supersedes
+                : undefined,
+            ].filter((messageId): messageId is string => messageId !== undefined);
+            const capacity = this.askEdges.canAdd(currentId, replacedAskIds);
             if (!capacity.ok) {
               writeMessage(socket, deliveryFailed(message.id, capacity.reason));
               break;
@@ -783,6 +783,13 @@ class IntercomBroker {
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
             this.removePendingAskRecord(message.replyTo);
+          }
+          if (message.supersedes) {
+            const supersededEdge = this.askEdges.get(message.supersedes);
+            if (supersededEdge?.from === currentId && supersededEdge.to === target.info.id) {
+              this.askEdges.delete(message.supersedes);
+              this.removePendingAskRecord(message.supersedes);
+            }
           }
           this.messageReceiptRoutes.set(message.id, { from: currentId, to: target.info.id, createdAt: brokerReceivedAt });
           this.recordDelivery(currentId, message.id, fingerprint, "socket_delivered");
@@ -1268,17 +1275,13 @@ class IntercomBroker {
     };
   }
 
-  private rememberDisconnectedSession(info: SessionInfo, now = brokerNow()): void {
+  private rememberDisconnectedSession(info: SessionInfo, now = Date.now()): void {
     this.disconnectedSessions.set(info.id, { info: { ...info }, disconnectedAt: now });
     this.pruneDisconnectedSessions(now);
   }
 
-  private pruneDisconnectedSessions(now = brokerNow()): void {
-    for (const [sessionId, session] of this.disconnectedSessions) {
-      if (now - session.disconnectedAt > DISCONNECTED_SESSION_RETENTION_MS) {
-        this.disconnectedSessions.delete(sessionId);
-      }
-    }
+  private pruneDisconnectedSessions(now = Date.now()): void {
+    pruneDisconnectedSessions(this.disconnectedSessions, now, DISCONNECTED_SESSION_RETENTION_MS);
   }
 
   private brokerSessionInfo(receiptAt: number): SessionInfo {
@@ -1404,7 +1407,9 @@ class IntercomBroker {
 
   private pruneAskEdges(now = Date.now()): void {
     this.prunePendingAskRecords(now);
-    this.askEdges.expireActiveOlderThan(this.askTimeoutMs, now);
+    for (const messageId of this.askEdges.expireActiveOlderThan(this.askTimeoutMs, now)) {
+      this.removePendingAskRecord(messageId);
+    }
     // The caller's waiter expires at askTimeoutMs, but the extension documents late replies
     // as visible for its bounded stale-ask window. Keep reply authorization for that same window.
     this.askEdges.pruneOlderThan(this.askTimeoutMs + ASK_REPLY_AUTHORIZATION_RETENTION_MS, now);
