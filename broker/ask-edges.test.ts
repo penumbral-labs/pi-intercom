@@ -123,18 +123,45 @@ test("add replaces an existing id without double-counting capacity", () => {
   assert.equal(edges.canAdd("a").ok, true);
 });
 
+test("timed-out asks retain reply authorization without blocking reverse asks", () => {
+  const edges = new AskEdges(GLOBAL_CAP);
+  const waiterTimeoutMs = 50;
+  edges.add("timed-out", "a", "b", 1000);
+
+  edges.expireActiveOlderThan(waiterTimeoutMs, 1000 + waiterTimeoutMs);
+  assert.equal(edges.has("timed-out"), true);
+  assert.equal(edges.hasReverse("b", "a"), true, "the ask remains active through its timeout boundary");
+
+  edges.expireActiveOlderThan(waiterTimeoutMs, 1001 + waiterTimeoutMs);
+  assert.equal(edges.has("timed-out"), true, "the timed-out ask remains authorized for a late reply");
+  assert.equal(edges.hasReverse("b", "a"), false, "reply-only authorization must not block a reverse ask");
+});
+
+test("timed-out asks do not consume active capacity", () => {
+  const edges = new AskEdges(GLOBAL_CAP, 1);
+  edges.add("timed-out", "a", "b", 1000);
+  assert.equal(edges.canAdd("a").ok, false);
+
+  edges.expireActiveOlderThan(50, 1051);
+  assert.equal(edges.activeSize, 0);
+  assert.equal(edges.size, 1, "reply authorization remains stored separately from active capacity");
+  assert.equal(edges.canAdd("a").ok, true);
+  assert.equal(edges.canAdd("c").ok, true);
+});
+
 test("pruneOlderThan retains reply authorization for the bounded late-reply window", () => {
   const edges = new AskEdges(GLOBAL_CAP);
   const waiterTimeoutMs = 50;
   const authorizationAgeMs = waiterTimeoutMs + ASK_REPLY_AUTHORIZATION_RETENTION_MS;
   edges.add("old", "a", "b", 1000);
   edges.add("new", "a", "c", 5000);
+  edges.expireActiveOlderThan(waiterTimeoutMs, 1001 + waiterTimeoutMs);
   edges.pruneOlderThan(authorizationAgeMs, 1000 + authorizationAgeMs);
   assert.equal(edges.has("old"), true, "the full late-reply window remains authorized after waiter timeout");
   edges.pruneOlderThan(authorizationAgeMs, 1001 + authorizationAgeMs);
   assert.equal(edges.has("old"), false);
   assert.equal(edges.has("new"), true);
-  // Counters follow the prune, so "a" is not stuck at a phantom count.
+  // Active counters follow expiration, so "a" is not stuck at a phantom count.
   assert.equal(edges.hasReverse("b", "a"), false);
   assert.equal(edges.hasReverse("c", "a"), true);
 });

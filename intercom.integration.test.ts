@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -398,10 +398,10 @@ test("production broker launch remains pinned", () => {
   assert.ok(launch.args.some((arg) => arg.endsWith(path.join("broker", "broker.ts"))));
 });
 
-async function setupClients() {
+async function setupClients(options: { brokerEnv?: NodeJS.ProcessEnv } = {}) {
   const broker = spawn(process.execPath, [getTsxCliPath(), path.join(repoDir, "broker", "broker.ts")], {
     cwd: repoDir,
-    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
+    env: { ...process.env, ...options.brokerEnv, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -1914,6 +1914,83 @@ test("opaque claim releases receiver reservation before dispose", { concurrency:
   }
 });
 
+test("opaque capability lookup prunes disconnected endpoints beyond retention", { concurrency: false }, async () => {
+  const clockPath = path.join(sharedHomeDir, "opaque-retention-capability-clock");
+  const disconnectedAt = 1_000_000;
+  writeFileSync(clockPath, String(disconnectedAt));
+  const { cleanup } = await setupClients({ brokerEnv: { PI_INTERCOM_TEST_CLOCK_PATH: clockPath } });
+  const sender = new IntercomClient();
+  const receiver = new IntercomClient();
+  const senderNamespace = "opaque/retention-capability-sender";
+  const receiverNamespace = "opaque/retention-capability-receiver";
+  try {
+    await receiver.connect({
+      name: "opaque-retention-capability-receiver", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace: receiverNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }],
+    }, "opaque-retention-capability-receiver");
+    await sender.connect({
+      name: "opaque-retention-capability-sender", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace: senderNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "opaque-retention-capability-sender");
+    await receiver.disconnect();
+
+    assert.equal((await sender.peerCapability("opaque-retention-capability-receiver", receiverNamespace)).state, "present");
+    writeFileSync(clockPath, String(disconnectedAt + 24 * 60 * 60 * 1000 + 1));
+    assert.deepEqual(
+      await sender.peerCapability("opaque-retention-capability-receiver", receiverNamespace),
+      { state: "unknown" },
+    );
+  } finally {
+    await receiver.disconnect().catch(() => undefined);
+    await sender.disconnect().catch(() => undefined);
+    await cleanup();
+    rmSync(clockPath, { force: true });
+  }
+});
+
+test("opaque send rejects a disconnected endpoint beyond retention instead of queueing custody", { concurrency: false }, async () => {
+  const clockPath = path.join(sharedHomeDir, "opaque-retention-send-clock");
+  const disconnectedAt = 2_000_000;
+  writeFileSync(clockPath, String(disconnectedAt));
+  const { cleanup } = await setupClients({ brokerEnv: { PI_INTERCOM_TEST_CLOCK_PATH: clockPath } });
+  const sender = new IntercomClient();
+  const receiver = new IntercomClient();
+  const senderNamespace = "opaque/retention-send-sender";
+  const receiverNamespace = "opaque/retention-send-receiver";
+  try {
+    await receiver.connect({
+      name: "opaque-retention-send-receiver", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace: receiverNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["receive"] } }],
+    }, "opaque-retention-send-receiver");
+    await sender.connect({
+      name: "opaque-retention-send-sender", cwd: repoDir, model: "test-model", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(),
+      extensions: [{ namespace: senderNamespace, ownerEligible: false, opaqueDispatch: { version: 1, roles: ["send"] } }],
+    }, "opaque-retention-send-sender");
+    await receiver.disconnect();
+
+    writeFileSync(clockPath, String(disconnectedAt + 24 * 60 * 60 * 1000 + 1));
+    assert.deepEqual(await sender.sendOpaqueDispatch(senderNamespace, {
+      requestId: "expired-disconnected-endpoint-request",
+      toSessionId: "opaque-retention-send-receiver",
+      recipientNamespace: receiverNamespace,
+      payload: { private: true },
+    }), {
+      accepted: false,
+      requestId: "expired-disconnected-endpoint-request",
+      code: "unknown_exact_target",
+    });
+  } finally {
+    await receiver.disconnect().catch(() => undefined);
+    await sender.disconnect().catch(() => undefined);
+    await cleanup();
+    rmSync(clockPath, { force: true });
+  }
+});
+
 test("opaque queued custody fails closed when a stable session reconnects at a new endpoint epoch", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const sender = new IntercomClient();
@@ -3329,6 +3406,73 @@ test("broker removes the durable pending record at waiter timeout but authorizes
   }
 });
 
+test("timed-out ask authorizes a late reply without blocking a reverse ask", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const originalAskId = "timed-out-reverse-original";
+
+  try {
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: originalAskId,
+      text: "Will this time out before you need me?",
+      expectsReply: true,
+    })).delivered, true);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    assert.equal((await orchestrator.send(planner.sessionId!, {
+      messageId: "timed-out-reverse-new",
+      text: "Can you answer my new question?",
+      expectsReply: true,
+    })).delivered, true, "reply-only authorization must not participate in mutual-deadlock checks");
+
+    const received = waitForReply(planner, originalAskId);
+    assert.equal((await orchestrator.send(planner.sessionId!, {
+      text: "The original answer is late.",
+      replyTo: originalAskId,
+    })).delivered, true);
+    assert.equal((await received).message.content.text, "The original answer is late.");
+  } finally {
+    if (previousTimeout === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
+    await cleanup();
+  }
+});
+
+test("timed-out asks do not consume broker active ask capacity", { concurrency: false }, async () => {
+  const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  const { planner, orchestrator, cleanup } = await setupClients();
+
+  try {
+    for (let index = 0; index < MAX_PENDING_ASK_EDGES_PER_SESSION; index += 1) {
+      assert.equal((await planner.send(orchestrator.sessionId!, {
+        messageId: `timed-out-capacity-old-${index}`,
+        text: `Old ask ${index}`,
+        expectsReply: true,
+      })).delivered, true);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId: "timed-out-capacity-new",
+      text: "New ask after the old set timed out.",
+      expectsReply: true,
+    })).delivered, true, "reply-only authorizations must not consume active ask capacity");
+
+    const received = waitForReply(planner, "timed-out-capacity-old-0");
+    assert.equal((await orchestrator.send(planner.sessionId!, {
+      text: "Late answer to an old ask.",
+      replyTo: "timed-out-capacity-old-0",
+    })).delivered, true);
+    assert.equal((await received).message.content.text, "Late answer to an old ask.");
+  } finally {
+    if (previousTimeout === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previousTimeout;
+    await cleanup();
+  }
+});
+
 test("broker refuses reverse mutual asks until the original ask is answered", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
 
@@ -4543,7 +4687,6 @@ test("subagent control intercom events wake the current orchestrator session", a
     to: "orchestrator",
     message: "subagent needs attention\n\nworker needs attention in run 78f659a3.",
   });
-  await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(harness.sentMessages.length, 1);
   assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
@@ -4566,7 +4709,6 @@ test("subagent result intercom events wake the current orchestrator session", as
     requestId: "result-1",
     message: "subagent result\n\nRun: 78f659a3\nAgent: worker\nStatus: completed",
   });
-  await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(harness.sentMessages.length, 1);
   assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");

@@ -3,8 +3,9 @@ import { STALE_ASK_RETENTION_MS } from "../config.ts";
 // Sole owner of pending ask-edge state.
 //
 // An "ask edge" records that `from` is awaiting a reply to message `id` from `to`. The broker
-// uses it for two decisions: whether a `replyTo` names a real pending ask, and whether a new ask
-// would form a mutual-ask deadlock (A waiting on B while B waits on A).
+// uses it for two decisions: whether a `replyTo` names an authorized ask, and whether an active
+// ask would form a mutual-ask deadlock (A waiting on B while B waits on A). Timed-out asks remain
+// as reply-only authorization for a bounded window, but leave the active indexes immediately.
 //
 // Extracted into a module for three reasons:
 //
@@ -26,8 +27,9 @@ export interface AskEdge {
 }
 
 interface StoredAskEdge extends AskEdge {
-  // Cached `${from}\0${to}` key so counters can be maintained without recomputing.
+  // Cached `${from}\0${to}` key so active counters can be maintained without recomputing.
   pairKey: string;
+  active: boolean;
 }
 
 export interface AskEdgeCapacityRefusal {
@@ -46,13 +48,18 @@ function pairKey(from: string, to: string): string {
 
 export class AskEdges {
   private readonly edges = new Map<string, StoredAskEdge>();
-  private readonly byAsker = new Map<string, number>();
-  private readonly byPair = new Map<string, number>();
+  private readonly activeByAsker = new Map<string, number>();
+  private readonly activeByPair = new Map<string, number>();
+  private activeCount = 0;
 
   constructor(private readonly maxGlobal: number, private readonly maxPerSession = MAX_PENDING_ASK_EDGES_PER_SESSION) {}
 
   get size(): number {
     return this.edges.size;
+  }
+
+  get activeSize(): number {
+    return this.activeCount;
   }
 
   get(messageId: string): AskEdge | undefined {
@@ -65,15 +72,17 @@ export class AskEdges {
 
   // Whether adding an edge from `from` is allowed.
   //
-  // `replacingMessageId` names an edge this add would replace. Any replacement preserves global
-  // capacity, but it preserves this asker's capacity only when the replaced edge belongs to the
-  // same asker. Replacing a peer-owned ask must not let an already-capped sender add a 17th edge.
+  // `replacingMessageId` names an edge this add would replace. Replacing an active edge preserves
+  // global capacity, but it preserves this asker's capacity only when that edge belongs to the
+  // same asker. Replacing reply-only authorization adds a new active edge and must satisfy both
+  // limits normally.
   canAdd(from: string, replacingMessageId?: string): AskEdgeCapacity {
     const replaced = replacingMessageId === undefined ? undefined : this.edges.get(replacingMessageId);
-    if (!replaced && this.edges.size >= this.maxGlobal) {
+    if ((!replaced || !replaced.active) && this.activeCount >= this.maxGlobal) {
       return { ok: false, reason: "Too many pending intercom asks" };
     }
-    const askerCountAfterReplacement = (this.byAsker.get(from) ?? 0) - (replaced?.from === from ? 1 : 0);
+    const askerCountAfterReplacement = (this.activeByAsker.get(from) ?? 0)
+      - (replaced?.active && replaced.from === from ? 1 : 0);
     if (askerCountAfterReplacement >= this.maxPerSession) {
       return { ok: false, reason: "Too many pending intercom asks from this session" };
     }
@@ -84,9 +93,10 @@ export class AskEdges {
   add(messageId: string, from: string, to: string, now = Date.now()): void {
     this.delete(messageId);
     const key = pairKey(from, to);
-    this.edges.set(messageId, { from, to, pairKey: key, createdAt: now });
-    this.increment(this.byAsker, from);
-    this.increment(this.byPair, key);
+    this.edges.set(messageId, { from, to, pairKey: key, createdAt: now, active: true });
+    this.activeCount += 1;
+    this.increment(this.activeByAsker, from);
+    this.increment(this.activeByPair, key);
   }
 
   delete(messageId: string): boolean {
@@ -95,8 +105,7 @@ export class AskEdges {
       return false;
     }
     this.edges.delete(messageId);
-    this.decrement(this.byAsker, edge.from);
-    this.decrement(this.byPair, edge.pairKey);
+    if (edge.active) this.deactivate(edge);
     return true;
   }
 
@@ -110,10 +119,10 @@ export class AskEdges {
     if (!edge || edge.to === nextTo) {
       return false;
     }
-    this.decrement(this.byPair, edge.pairKey);
+    if (edge.active) this.decrement(this.activeByPair, edge.pairKey);
     edge.to = nextTo;
     edge.pairKey = pairKey(edge.from, nextTo);
-    this.increment(this.byPair, edge.pairKey);
+    if (edge.active) this.increment(this.activeByPair, edge.pairKey);
     return true;
   }
 
@@ -123,17 +132,25 @@ export class AskEdges {
   // that same ask as the blocking reverse edge.
   hasReverse(from: string, to: string, excludingMessageId?: string): boolean {
     const reverse = pairKey(to, from);
-    let count = this.byPair.get(reverse) ?? 0;
+    let count = this.activeByPair.get(reverse) ?? 0;
     if (excludingMessageId !== undefined) {
       const excluded = this.edges.get(excludingMessageId);
-      if (excluded?.pairKey === reverse) {
+      if (excluded?.active && excluded.pairKey === reverse) {
         count -= 1;
       }
     }
     return count > 0;
   }
 
-  // Drops edges older than `maxAgeMs`.
+  // Removes timed-out asks from deadlock and capacity accounting while retaining their edges for
+  // late-reply authorization.
+  expireActiveOlderThan(maxAgeMs: number, now = Date.now()): void {
+    for (const edge of this.edges.values()) {
+      if (edge.active && now - edge.createdAt > maxAgeMs) this.deactivate(edge);
+    }
+  }
+
+  // Drops reply authorization older than `maxAgeMs`.
   pruneOlderThan(maxAgeMs: number, now = Date.now()): void {
     for (const [messageId, edge] of this.edges) {
       if (now - edge.createdAt > maxAgeMs) {
@@ -156,8 +173,16 @@ export class AskEdges {
 
   clear(): void {
     this.edges.clear();
-    this.byAsker.clear();
-    this.byPair.clear();
+    this.activeByAsker.clear();
+    this.activeByPair.clear();
+    this.activeCount = 0;
+  }
+
+  private deactivate(edge: StoredAskEdge): void {
+    edge.active = false;
+    this.activeCount -= 1;
+    this.decrement(this.activeByAsker, edge.from);
+    this.decrement(this.activeByPair, edge.pairKey);
   }
 
   private increment(map: Map<string, number>, key: string): void {
