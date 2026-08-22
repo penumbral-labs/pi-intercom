@@ -1602,24 +1602,11 @@ test("a dispatch settling across reconnect cannot release a newer attempt with t
         });
         return new Promise((resolve) => { resolveSecond = resolve; });
       }
-      const raw = this as unknown as { emit(event: string, frame: unknown): void };
-      raw.emit("opaque_dispatch", {
-        type: "opaque_dispatch_v1_receipt",
-        senderNamespace: "dispatch-marker-race/v1",
-        receipt: {
-          requestId: input.requestId,
-          messageId,
-          status: "claimed",
-          at: Date.now(),
-          attempt: 1,
-          sequence: 2,
-        },
-      });
       return {
         accepted: true as const,
         requestId: input.requestId,
         messageId,
-        brokerEpoch: "22222222-2222-4222-8222-222222222222",
+        brokerEpoch: "33333333-3333-4333-8333-333333333333",
         deliveryState: "live" as const,
       };
     };
@@ -1666,9 +1653,6 @@ test("a dispatch settling across reconnect cannot release a newer attempt with t
     });
     assert.equal((await second).accepted, true);
 
-    const third = channel!.sendOpaqueDispatch(input);
-    assert.equal((await third).accepted, true);
-
     assert.ok(secondSendClient);
     const raw = secondSendClient as unknown as { emit(event: string, frame: unknown): void };
     raw.emit("broker_message", {
@@ -1679,6 +1663,22 @@ test("a dispatch settling across reconnect cannot release a newer attempt with t
       features: ["extension-bus-v1", "opaque-dispatch-v1"],
     });
     assert.deepEqual(indeterminate, []);
+
+    const third = channel!.sendOpaqueDispatch(input);
+    assert.equal((await third).accepted, true);
+    raw.emit("broker_message", {
+      type: "registered",
+      sessionId: "dispatch-marker-race",
+      brokerEpoch: "44444444-4444-4444-8444-444444444444",
+      endpointEpoch: "final-endpoint",
+      features: ["extension-bus-v1", "opaque-dispatch-v1"],
+    });
+    assert.deepEqual(indeterminate, [{
+      requestId,
+      messageId,
+      previousBrokerEpoch: "33333333-3333-4333-8333-333333333333",
+      currentBrokerEpoch: "44444444-4444-4444-8444-444444444444",
+    }]);
   } finally {
     IntercomClient.prototype.connect = originalConnect;
     IntercomClient.prototype.sendOpaqueDispatch = originalSend;
