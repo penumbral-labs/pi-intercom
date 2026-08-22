@@ -1491,13 +1491,12 @@ test("routine rejected opaque dispatches do not retain terminal race markers", {
       terminal: "refused",
     });
 
-    const acceptedMessageId = "44444444-4444-4444-8444-444444444444";
     IntercomClient.prototype.sendOpaqueDispatch = async function (_senderNamespace, input) {
       activeClient = this;
       return {
         accepted: true as const,
         requestId: input.requestId,
-        messageId: acceptedMessageId,
+        messageId: leakedMessageId,
         brokerEpoch: "22222222-2222-4222-8222-222222222222",
         deliveryState: "live" as const,
       };
@@ -1520,7 +1519,7 @@ test("routine rejected opaque dispatches do not retain terminal race markers", {
     });
     assert.deepEqual(indeterminate, [{
       requestId: "later-accepted-request",
-      messageId: acceptedMessageId,
+      messageId: leakedMessageId,
       previousBrokerEpoch: "22222222-2222-4222-8222-222222222222",
       currentBrokerEpoch: "33333333-3333-4333-8333-333333333333",
     }]);
