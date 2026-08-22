@@ -398,10 +398,10 @@ test("production broker launch remains pinned", () => {
   assert.ok(launch.args.some((arg) => arg.endsWith(path.join("broker", "broker.ts"))));
 });
 
-async function setupClients() {
+async function setupClients(options: { brokerEnv?: NodeJS.ProcessEnv } = {}) {
   const broker = spawn(process.execPath, [getTsxCliPath(), path.join(repoDir, "broker", "broker.ts")], {
     cwd: repoDir,
-    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
+    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir, ...options.brokerEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -5299,6 +5299,40 @@ test("broker refuses replacing a peer-owned ask when the sender is at its ask ca
   } finally {
     await sink.disconnect().catch(() => undefined);
     await cleanup();
+  }
+});
+
+test("a self-superseding ask keeps its replacement edge after the delivery tombstone ages out", { concurrency: false }, async () => {
+  const clockPath = path.join(sharedHomeDir, "self-supersede-retention-clock");
+  const originalTimestamp = 1_000_000;
+  writeFileSync(clockPath, String(originalTimestamp));
+  const { planner, orchestrator, cleanup } = await setupClients({ brokerEnv: { PI_INTERCOM_TEST_DELIVERY_RECORD_CLOCK_PATH: clockPath } });
+  try {
+    const messageId = "self-superseding-ask";
+    assert.equal((await planner.send(orchestrator.sessionId!, {
+      messageId,
+      text: "Original ask",
+      expectsReply: true,
+    })).delivered, true);
+
+    writeFileSync(clockPath, String(originalTimestamp + 60 * 60 * 1000 + 1));
+    const replacement = await planner.send(orchestrator.sessionId!, {
+      messageId,
+      text: "Replacement ask",
+      supersedes: messageId,
+      expectsReply: true,
+    });
+    assert.equal(replacement.delivered, true, replacement.reason);
+
+    const reply = await orchestrator.send(planner.sessionId!, {
+      messageId: "reply-to-self-superseding-ask",
+      text: "Replacement reply",
+      replyTo: messageId,
+    });
+    assert.equal(reply.delivered, true, "self-supersession must not retire the newly added ask edge");
+  } finally {
+    await cleanup();
+    rmSync(clockPath, { force: true });
   }
 });
 

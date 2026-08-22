@@ -69,6 +69,10 @@ export class AskEdges {
     return this.activeCount;
   }
 
+  get replyOnlySize(): number {
+    return this.replyOnlyCount;
+  }
+
   get(messageId: string): AskEdge | undefined {
     return this.edges.get(messageId);
   }
@@ -129,7 +133,7 @@ export class AskEdges {
       return false;
     }
     this.edges.delete(messageId);
-    if (edge.active) this.deactivate(edge);
+    if (edge.active) this.releaseActive(edge);
     else this.replyOnlyCount -= 1;
     return true;
   }
@@ -217,9 +221,13 @@ export class AskEdges {
   }
 
   private deactivate(edge: StoredAskEdge): void {
+    this.releaseActive(edge);
     edge.active = false;
-    this.activeCount -= 1;
     this.replyOnlyCount += 1;
+  }
+
+  private releaseActive(edge: StoredAskEdge): void {
+    this.activeCount -= 1;
     this.decrement(this.activeByAsker, edge.from);
     this.decrement(this.activeByPair, edge.pairKey);
   }

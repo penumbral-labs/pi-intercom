@@ -65,13 +65,21 @@ const MAX_EXTENSIONS_PER_SESSION = 32;
 const MAX_EXTENSION_MESSAGE_BYTES = 16 * 1024;
 const MAX_EXTENSION_STATE_BYTES = 64 * 1024;
 const MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000;
+const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
+const TEST_DELIVERY_RECORD_CLOCK_PATH = process.env.PI_INTERCOM_TEST_DELIVERY_RECORD_CLOCK_PATH;
 const DISCONNECTED_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
 const MAX_RATE_LIMITED_OPAQUE_OPERATIONS = 256;
-const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 4096;
 const BROKER_STARTED_AT = Date.now();
+
+function deliveryRecordNow(): number {
+  if (!TEST_DELIVERY_RECORD_CLOCK_PATH) return Date.now();
+  const value = Number(readFileSync(TEST_DELIVERY_RECORD_CLOCK_PATH, "utf8"));
+  if (!Number.isSafeInteger(value)) throw new Error("Invalid PI_INTERCOM_TEST_DELIVERY_RECORD_CLOCK_PATH value");
+  return value;
+}
 
 function serializedPayloadSize(payload: unknown): number | null {
   try {
@@ -696,19 +704,24 @@ class IntercomBroker {
             break;
           }
           const target = targets[0];
-          if (message.expectsReply && this.askEdges.has(message.id)) {
-            writeMessage(socket, deliveryFailed(message.id, "Duplicate pending ask message ID"));
-            break;
-          }
-          const fingerprint = this.deliveryFingerprint(message, target.info.id, target.info.endpointEpoch);
-          if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
+          let ownedSupersededAskId: string | undefined;
           if (message.supersedes) {
             const supersededRoute = this.messageReceiptRoutes.get(message.supersedes);
             if (!supersededRoute || supersededRoute.from !== currentId || supersededRoute.to !== target.info.id) {
               writeMessage(socket, deliveryFailed(message.id, "Supersede target does not match a previous message from this sender to this receiver", "E_SUPERSEDE_TARGET"));
               break;
             }
+            const supersededEdge = this.askEdges.get(message.supersedes);
+            if (supersededEdge?.from === currentId && supersededEdge.to === target.info.id) {
+              ownedSupersededAskId = message.supersedes;
+            }
           }
+          if (message.expectsReply && this.askEdges.has(message.id) && ownedSupersededAskId !== message.id) {
+            writeMessage(socket, deliveryFailed(message.id, "Duplicate pending ask message ID"));
+            break;
+          }
+          const fingerprint = this.deliveryFingerprint(message, target.info.id, target.info.endpointEpoch);
+          if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.info.id)) {
             writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET"));
             break;
@@ -718,12 +731,9 @@ class IntercomBroker {
               writeMessage(socket, deliveryFailed(message.id, "Mutual ask refused: target session is already waiting for a reply from this session.", "E_MUTUAL_ASK"));
               break;
             }
-            const supersededEdge = message.supersedes ? this.askEdges.get(message.supersedes) : undefined;
             const replacedAskIds = [
               message.replyTo,
-              supersededEdge?.from === currentId && supersededEdge.to === target.info.id
-                ? message.supersedes
-                : undefined,
+              ownedSupersededAskId,
             ].filter((messageId): messageId is string => messageId !== undefined);
             const capacity = this.askEdges.canAdd(currentId, replacedAskIds);
             if (!capacity.ok) {
@@ -776,20 +786,17 @@ class IntercomBroker {
           // brokerDeliveredAt) can push a borderline message past the frame cap, and an edge
           // recorded for a message that never left would strand the asker on a reply that can
           // never arrive.
-          if (message.expectsReply) {
-            this.askEdges.add(message.id, currentId, target.info.id);
-            this.writePendingAskRecord(message, fromSession.info, target.info, brokerReceivedAt);
-          }
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
             this.removePendingAskRecord(message.replyTo);
           }
-          if (message.supersedes) {
-            const supersededEdge = this.askEdges.get(message.supersedes);
-            if (supersededEdge?.from === currentId && supersededEdge.to === target.info.id) {
-              this.askEdges.delete(message.supersedes);
-              this.removePendingAskRecord(message.supersedes);
-            }
+          if (ownedSupersededAskId) {
+            this.askEdges.delete(ownedSupersededAskId);
+            this.removePendingAskRecord(ownedSupersededAskId);
+          }
+          if (message.expectsReply) {
+            this.askEdges.add(message.id, currentId, target.info.id);
+            this.writePendingAskRecord(message, fromSession.info, target.info, brokerReceivedAt);
           }
           this.messageReceiptRoutes.set(message.id, { from: currentId, to: target.info.id, createdAt: brokerReceivedAt });
           this.recordDelivery(currentId, message.id, fingerprint, "socket_delivered");
@@ -1152,8 +1159,9 @@ class IntercomBroker {
     messageId: string,
     fingerprint: string,
     operationId?: string,
+    now = deliveryRecordNow(),
   ): boolean {
-    this.pruneDeliveryRecords();
+    this.pruneDeliveryRecords(now);
     const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
     if (!record) return false;
     if (record.fingerprint !== fingerprint) {
@@ -1202,8 +1210,9 @@ class IntercomBroker {
     reason?: string,
     code?: string,
     retryable = false,
+    now = deliveryRecordNow(),
   ): void {
-    this.pruneDeliveryRecords();
+    this.pruneDeliveryRecords(now);
     while (this.deliveryRecords.size >= MAX_DELIVERY_RECORDS) {
       const oldest = this.deliveryRecords.keys().next().value;
       if (oldest === undefined) break;
@@ -1215,7 +1224,7 @@ class IntercomBroker {
       ...(reason ? { reason } : {}),
       ...(code ? { code } : {}),
       retryable,
-      createdAt: Date.now(),
+      createdAt: now,
     });
   }
 

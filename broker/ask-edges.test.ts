@@ -176,8 +176,26 @@ test("reply-only capacity evicts the deterministic oldest authorizations without
   assert.equal(edges.has("new-by-order"), true);
   assert.equal(edges.has("newest"), true);
   assert.equal(edges.activeSize, 0);
+  assert.equal(edges.replyOnlySize, 2);
   assert.equal(edges.canAdd("a").ok, true, "reply-only eviction must not alter per-session active accounting");
   assert.equal(edges.canAdd("e").ok, true, "reply-only eviction must not alter global active accounting");
+});
+
+test("deleting more than the reply-only cap of active edges does not inflate reply-only accounting", () => {
+  const replyOnlyCap = 2;
+  const edges = new AskEdges(10, 10, replyOnlyCap);
+  for (let index = 0; index <= replyOnlyCap; index += 1) {
+    edges.add(`deleted-${index}`, "a", "b", index);
+    assert.equal(edges.delete(`deleted-${index}`), true);
+  }
+  assert.equal(edges.replyOnlySize, 0);
+
+  edges.add("oldest-valid", "a", "b", 100);
+  edges.add("newest-valid", "a", "b", 101);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 102), []);
+  assert.equal(edges.replyOnlySize, replyOnlyCap);
+  assert.equal(edges.has("oldest-valid"), true);
+  assert.equal(edges.has("newest-valid"), true);
 });
 
 test("pruneOlderThan retains reply authorization for the bounded late-reply window", () => {
