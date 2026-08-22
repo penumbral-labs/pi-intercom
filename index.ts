@@ -536,6 +536,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     generation: number;
     reservations: Map<string, { controller: AbortController; reservationId: string }>;
     acceptedDispatches: Map<string, { requestId: string; messageId: string; brokerEpoch: string }>;
+    terminalDispatches: Set<string>;
   }>();
   let nextExtensionGeneration = 1;
   let runtimeContext: ExtensionContext | null = null;
@@ -827,11 +828,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
           }
           if (result.accepted && extension?.generation === generation) {
-            extension.acceptedDispatches.set(result.messageId, {
-              requestId: result.requestId,
-              messageId: result.messageId,
-              brokerEpoch: result.brokerEpoch,
-            });
+            if (!extension.terminalDispatches.delete(result.messageId)) {
+              extension.acceptedDispatches.set(result.messageId, {
+                requestId: result.requestId,
+                messageId: result.messageId,
+                brokerEpoch: result.brokerEpoch,
+              });
+            }
           }
           return result;
         } catch (error) {
@@ -915,7 +918,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     const generation = nextExtensionGeneration++;
     const channel = createExtensionChannel(registration.namespace, generation);
-    localExtensions.set(registration.namespace, { registration, channel, generation, reservations: new Map(), acceptedDispatches: new Map() });
+    localExtensions.set(registration.namespace, {
+      registration,
+      channel,
+      generation,
+      reservations: new Map(),
+      acceptedDispatches: new Map(),
+      terminalDispatches: new Set(),
+    });
     const activeClient = client;
     const connected = Boolean(activeClient?.isConnected());
     const supported = Boolean(activeClient?.supportsFeature(EXTENSION_BUS_FEATURE));
@@ -1251,7 +1261,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       } finally {
         if (extension && extension.generation === localExtensions.get(frame.senderNamespace)?.generation) {
           if (frame.receipt.status !== "queued" && frame.receipt.status !== "reserved") {
-            extension.acceptedDispatches.delete(frame.receipt.messageId);
+            if (!extension.acceptedDispatches.delete(frame.receipt.messageId)) {
+              extension.terminalDispatches.add(frame.receipt.messageId);
+            }
           }
           try {
             nextClient.ackOpaqueReceipt(frame.senderNamespace, frame.receipt.messageId, frame.receipt.sequence);

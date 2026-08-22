@@ -1296,11 +1296,105 @@ test("disposed extension channels cannot act on a replacement registration", asy
   assert.throws(() => staleChannel!.snapshot(), /disposed/);
   assert.throws(() => staleChannel!.publish({ stale: true }), /disposed/);
   assert.throws(() => staleChannel!.commitState({ stale: true }), /disposed/);
+  assert.deepEqual(await staleChannel!.refreshState(), { ok: false, code: "connection_lost" });
+  await assert.rejects(staleChannel!.listSessions(), /not connected/);
+  assert.deepEqual(await staleChannel!.peerCapability("peer", "recipient/v1"), { state: "unknown" });
+  assert.deepEqual(await staleChannel!.sendOpaqueDispatch({
+    requestId: "stale-request", toSessionId: "peer", recipientNamespace: "recipient/v1", payload: null,
+  }), { accepted: false, requestId: "stale-request", code: "unsupported_broker" });
+  assert.deepEqual(await staleChannel!.cancelMessage("stale-message"), { cancelled: false, code: "unsupported_broker" });
+  assert.deepEqual(await staleChannel!.reconcileClaim({
+    brokerEpoch: "stale-broker", endpointEpoch: "stale-endpoint", messageId: "stale-message", reservationId: "stale-reservation",
+  }), { state: "indeterminate", code: "claim_history_unavailable" });
   assert.deepEqual(replacementChannel.snapshot(), {
     connected: false,
     capabilities: { extensionBus: false },
   });
   replacementChannel.dispose();
+});
+
+test("terminal opaque receipts arriving before send acceptance are not cached as active", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("terminal-before-acceptance-sender", { sessionId: "terminal-before-acceptance-sender" });
+  let channel: IntercomExtensionChannel | undefined;
+  const indeterminate: unknown[] = [];
+  const originalSend = IntercomClient.prototype.sendOpaqueDispatch;
+  let activeClient: InstanceType<typeof IntercomClient> | undefined;
+  const messageId = "11111111-1111-4111-8111-111111111111";
+  const brokerEpoch = "22222222-2222-4222-8222-222222222222";
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "terminal-before-acceptance/v1",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["send"],
+        onTransportIndeterminate: (event: unknown) => indeterminate.push(event),
+      },
+      onReady: (value: IntercomExtensionChannel) => { channel = value; },
+      onEvent: () => undefined,
+    });
+    IntercomClient.prototype.sendOpaqueDispatch = async function (_senderNamespace, input) {
+      activeClient = this;
+      const raw = this as unknown as { emit(event: string, frame: unknown): void };
+      raw.emit("opaque_dispatch", {
+        type: "opaque_dispatch_v1_receipt",
+        senderNamespace: "terminal-before-acceptance/v1",
+        receipt: {
+          requestId: input.requestId,
+          messageId,
+          status: "claimed",
+          at: Date.now(),
+          attempt: 1,
+          sequence: 1,
+        },
+      });
+      return {
+        accepted: true as const,
+        requestId: input.requestId,
+        messageId,
+        brokerEpoch,
+        deliveryState: "live" as const,
+      };
+    };
+    await harness.emitLifecycle("session_start");
+    const deadline = Date.now() + 2_000;
+    while (!channel?.snapshot().capabilities.opaqueDispatchVersion && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(channel?.snapshot().capabilities.opaqueDispatchVersion, 1);
+
+    assert.deepEqual(await channel?.sendOpaqueDispatch({
+      requestId: "terminal-before-acceptance-request",
+      toSessionId: "receiver",
+      recipientNamespace: "receiver/v1",
+      payload: null,
+    }), {
+      accepted: true,
+      requestId: "terminal-before-acceptance-request",
+      messageId,
+      brokerEpoch,
+      deliveryState: "live",
+    });
+    assert.ok(activeClient);
+    const raw = activeClient as unknown as { emit(event: string, frame: unknown): void };
+    raw.emit("broker_message", {
+      type: "registered",
+      sessionId: "terminal-before-acceptance-sender",
+      brokerEpoch: "33333333-3333-4333-8333-333333333333",
+      endpointEpoch: "replacement-endpoint",
+      features: ["extension-bus-v1", "opaque-dispatch-v1"],
+    });
+    assert.deepEqual(indeterminate, []);
+  } finally {
+    IntercomClient.prototype.sendOpaqueDispatch = originalSend;
+    channel?.dispose();
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
 });
 
 test("refreshing absent extension state clears the cached snapshot", { concurrency: false }, async () => {

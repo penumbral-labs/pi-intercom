@@ -98,6 +98,28 @@ test("opaque pending operations enforce the 256 global cap", async () => {
   await Promise.all(pending);
 });
 
+test("peer capability rejection settles immediately with its typed reason", async () => {
+  const client = new IntercomClient();
+  const raw = internals(client);
+  raw._sessionId = "sender";
+  raw._features = new Set([OPAQUE_DISPATCH_FEATURE]);
+  raw.socket = {
+    destroyed: false, writableEnded: false, writable: true,
+    write: (data) => {
+      const frame = decode(data);
+      queueMicrotask(() => raw.handleBrokerMessage({
+        type: "opaque_dispatch_v1_rejected", operationId: frame.operationId, code: "rate_limited",
+      }));
+      return true;
+    },
+  };
+
+  await assert.rejects(
+    client.peerCapability("receiver", "receiver/v1", { timeoutMs: 60_000 }),
+    /rate_limited/,
+  );
+});
+
 test("opaque send re-resolves one target rebound with the same request ID", async () => {
   const client = new IntercomClient();
   const raw = internals(client);

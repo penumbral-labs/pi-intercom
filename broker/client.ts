@@ -628,6 +628,14 @@ export class IntercomClient extends EventEmitter {
         if (!isOpaqueDispatchBrokerFrame(brokerMessage) || !("operationId" in brokerMessage)) {
           throw new Error("Invalid opaque dispatch result");
         }
+        if (brokerMessage.type === "opaque_dispatch_v1_rejected") {
+          const pendingQuery = this.pendingPeerQueries.get(brokerMessage.operationId);
+          if (pendingQuery) {
+            this.pendingPeerQueries.delete(brokerMessage.operationId);
+            pendingQuery.reject(new Error(brokerMessage.code));
+            break;
+          }
+        }
         const pending = this.pendingOpaque.get(brokerMessage.operationId);
         if (!pending) break;
         this.pendingOpaque.delete(brokerMessage.operationId);
