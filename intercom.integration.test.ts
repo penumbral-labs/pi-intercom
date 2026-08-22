@@ -5576,6 +5576,93 @@ test("oversized session lists reject the matching request without disconnecting 
   }
 });
 
+test("near-cap receipt and cancellation forwarding preserve healthy connections", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const sender = await connectRawRegistered("oversize-receipt-sender-id", "oversize-receipt-sender");
+  const receiver = await connectRawRegistered("oversize-receipt-receiver-id", "oversize-receipt-receiver");
+  try {
+    const { createMessageReader, MAX_FRAME_BYTES } = await import("./broker/framing.ts");
+    const senderFrames: Array<{
+      type?: string;
+      requestId?: string;
+      messageId?: string;
+      reason?: string;
+      from?: { id?: string };
+      receipt?: { messageId?: string; status?: string; detail?: string };
+    }> = [];
+    const senderReader = createMessageReader((message) => {
+      senderFrames.push(message as (typeof senderFrames)[number]);
+    }, (error) => {
+      throw error;
+    });
+    sender.socket.on("data", senderReader);
+
+    sender.writeMessage(sender.socket, {
+      type: "send",
+      to: "oversize-receipt-receiver-id",
+      message: { id: "oversize-receipt-message", timestamp: 1, content: { text: "establish receipt route" } },
+    });
+    const waitForSenderFrame = async (predicate: (frame: (typeof senderFrames)[number]) => boolean) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const frame = senderFrames.find(predicate);
+        if (frame) return frame;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error(`Timed out waiting for sender frame; saw ${JSON.stringify(senderFrames)}`);
+    };
+    await waitForSenderFrame((frame) => frame.type === "delivered" && frame.messageId === "oversize-receipt-message");
+
+    // This inbound receipt is exactly legal. Adding the receiver's SessionInfo makes the first
+    // outbound encoding too large, so the broker must reduce optional detail at this boundary.
+    const build = (detail: string) => JSON.stringify({
+      type: "message_receipt",
+      receipt: {
+        messageId: "oversize-receipt-message",
+        status: "acknowledged",
+        timestamp: 1,
+        detail,
+      },
+    });
+    const payload = build("x".repeat(MAX_FRAME_BYTES - Buffer.byteLength(build(""), "utf8")));
+    assert.equal(Buffer.byteLength(payload, "utf8"), MAX_FRAME_BYTES);
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(MAX_FRAME_BYTES, 0);
+    receiver.socket.write(Buffer.concat([header, Buffer.from(payload, "utf8")]));
+
+    const receiptFrame = await waitForSenderFrame((frame) => frame.type === "message_receipt"
+      && frame.receipt?.messageId === "oversize-receipt-message");
+    assert.equal(receiptFrame.from?.id, "oversize-receipt-receiver-id");
+    assert.equal(receiptFrame.receipt?.status, "acknowledged");
+    assert.equal(receiptFrame.receipt?.detail, "Receipt detail omitted to fit the intercom frame limit");
+
+    assert.equal(sender.socket.destroyed, false, "sender connection must survive receipt reduction");
+    assert.equal(receiver.socket.destroyed, false, "receiver connection must survive receipt reduction");
+    sender.writeMessage(sender.socket, { type: "list", requestId: "receipt-follow-up" });
+    await waitForSenderFrame((frame) => frame.type === "sessions" && frame.requestId === "receipt-follow-up");
+
+    // Cancellation is the adjacent ordinary forwarding path that also adds SessionInfo. Grow the
+    // sender's mutable status to the legal inbound limit and verify refusal stays on the sender.
+    const buildPresence = (status: string) => JSON.stringify({ type: "presence", status });
+    const presencePayload = buildPresence("x".repeat(MAX_FRAME_BYTES - Buffer.byteLength(buildPresence(""), "utf8")));
+    assert.equal(Buffer.byteLength(presencePayload, "utf8"), MAX_FRAME_BYTES);
+    sender.socket.write(Buffer.concat([header, Buffer.from(presencePayload, "utf8")]));
+    sender.writeMessage(sender.socket, { type: "cancel_message", messageId: "oversize-receipt-message" });
+    const cancelFailure = await waitForSenderFrame((frame) => frame.type === "delivery_failed"
+      && frame.messageId === "oversize-receipt-message");
+    assert.match(cancelFailure.reason ?? "", /too large after broker metadata/);
+    assert.equal(sender.socket.destroyed, false);
+    assert.equal(receiver.socket.destroyed, false);
+    sender.writeMessage(sender.socket, { type: "presence", status: "ready" });
+    sender.writeMessage(sender.socket, { type: "list", requestId: "cancel-follow-up" });
+    await waitForSenderFrame((frame) => frame.type === "sessions" && frame.requestId === "cancel-follow-up");
+  } finally {
+    sender.socket.destroy();
+    receiver.socket.destroy();
+    await cleanup();
+  }
+});
+
 test("oversize delivery is contained: sender is told, and neither connection dies", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const raw = await connectRawRegistered("oversize-sender-id", "oversize-sender");

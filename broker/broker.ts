@@ -42,7 +42,15 @@ import {
   EXTENSION_STATE_REFRESH_FEATURE,
   OPAQUE_DISPATCH_FEATURE,
 } from "../types.ts";
-import type { SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
+import type {
+  SessionInfo,
+  Message,
+  BrokerMessage,
+  ExtensionCapability,
+  MessageControl,
+  MessageReceipt,
+  MessageReceiptStatus,
+} from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { OpaqueDispatchManager, writeOpaqueTo, type OpaqueEndpoint } from "./opaque-dispatch.ts";
@@ -895,11 +903,7 @@ class IntercomBroker {
         const receiver = this.sessions.get(currentId);
         const sender = route ? this.sessions.get(route.from) : undefined;
         if (route?.to === currentId && receiver?.socket === socket && sender) {
-          writeMessage(sender.socket, {
-            type: "message_receipt",
-            from: receiver.info,
-            receipt: clientMessage.receipt,
-          });
+          this.forwardMessageReceipt(sender.socket, receiver.info, clientMessage.receipt);
         }
         break;
       }
@@ -944,15 +948,23 @@ class IntercomBroker {
           writeMessage(socket, deliveryFailed(clientMessage.messageId, "Message cannot be cancelled by this session"));
           break;
         }
-        writeMessage(receiver.socket, {
-          type: "message_control",
-          from: sender.info,
-          control: {
-            action: "cancel",
-            messageId: clientMessage.messageId,
-            timestamp: Date.now(),
-          },
-        });
+        try {
+          writeMessage(receiver.socket, {
+            type: "message_control",
+            from: sender.info,
+            control: {
+              action: "cancel",
+              messageId: clientMessage.messageId,
+              timestamp: Date.now(),
+            },
+          });
+        } catch (error) {
+          if (error instanceof IntercomFrameTooLargeError) {
+            writeMessage(socket, deliveryFailed(clientMessage.messageId, "Cancellation is too large after broker metadata was added"));
+            break;
+          }
+          throw error;
+        }
         const edge = this.askEdges.get(clientMessage.messageId);
         if (edge?.from === currentId) {
           this.askEdges.delete(clientMessage.messageId);
@@ -1310,6 +1322,46 @@ class IntercomBroker {
       status: "broker",
       trustedLocal: typeof LISTEN_TARGET === "string" && process.platform !== "win32",
     };
+  }
+
+  private forwardMessageReceipt(socket: net.Socket, from: SessionInfo, receipt: MessageReceipt): void {
+    // Rebuild from the validated schema so unrecognized inbound fields are never relayed.
+    const forwarded: MessageReceipt = {
+      messageId: receipt.messageId,
+      status: receipt.status,
+      timestamp: receipt.timestamp,
+      ...(receipt.code ? { code: receipt.code } : {}),
+      ...(receipt.detail !== undefined ? { detail: receipt.detail } : {}),
+    };
+    const frame = (nextReceipt: MessageReceipt) => ({ type: "message_receipt" as const, from, receipt: nextReceipt });
+    try {
+      writeMessage(socket, frame(forwarded));
+      return;
+    } catch (error) {
+      if (!(error instanceof IntercomFrameTooLargeError)) throw error;
+    }
+
+    const { detail: _detail, ...receiptWithoutDetail } = forwarded;
+    if (forwarded.detail !== undefined) {
+      try {
+        writeMessage(socket, frame({
+          ...receiptWithoutDetail,
+          detail: "Receipt detail omitted to fit the intercom frame limit",
+        }));
+        return;
+      } catch (error) {
+        if (!(error instanceof IntercomFrameTooLargeError)) throw error;
+      }
+    }
+
+    try {
+      writeMessage(socket, frame(receiptWithoutDetail));
+    } catch (error) {
+      // A receipt whose required identity plus receiver metadata cannot fit has no safe
+      // correlated fallback. Dropping this diagnostic is preferable to disconnecting the
+      // healthy receiver that submitted it.
+      if (!(error instanceof IntercomFrameTooLargeError)) throw error;
+    }
   }
 
   private emitBrokerReceipt(
