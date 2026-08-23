@@ -9,6 +9,7 @@ import {
   isMessageControl,
   isMessageReceipt,
   isOpaqueDispatchBrokerFrame,
+  isOpaqueDispatchReason,
   isSessionInfo,
 } from "./protocol.ts";
 import {
@@ -1045,7 +1046,7 @@ export class IntercomClient extends EventEmitter {
     if (!this.supportsFeature(OPAQUE_DISPATCH_FEATURE)) return rejected("unsupported_broker");
     const errorReason = (error: unknown): OpaqueDispatchReason => {
       const message = toError(error).message;
-      return message === "unsupported_broker" || message === "limit_exceeded" ? message : "connection_lost";
+      return isOpaqueDispatchReason(message) ? message : "connection_lost";
     };
     const resolveEpoch = async (): Promise<{ endpointEpoch?: string; code?: OpaqueDispatchReason }> => {
       try {

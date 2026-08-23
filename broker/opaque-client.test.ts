@@ -120,6 +120,27 @@ test("peer capability rejection settles immediately with its typed reason", asyn
   );
 });
 
+test("opaque send preserves a peer capability rate-limit rejection", async () => {
+  const client = new IntercomClient();
+  const raw = internals(client);
+  raw._sessionId = "sender";
+  raw._features = new Set([OPAQUE_DISPATCH_FEATURE]);
+  raw.socket = {
+    destroyed: false, writableEnded: false, writable: true,
+    write: (data) => {
+      const frame = decode(data);
+      queueMicrotask(() => raw.handleBrokerMessage({
+        type: "opaque_dispatch_v1_rejected", operationId: frame.operationId, code: "rate_limited",
+      }));
+      return true;
+    },
+  };
+
+  assert.deepEqual(await client.sendOpaqueDispatch("sender/v1", {
+    requestId: "rate-limited-request", toSessionId: "receiver", recipientNamespace: "receiver/v1", payload: null,
+  }), { accepted: false, requestId: "rate-limited-request", code: "rate_limited" });
+});
+
 test("opaque send re-resolves one target rebound with the same request ID", async () => {
   const client = new IntercomClient();
   const raw = internals(client);
