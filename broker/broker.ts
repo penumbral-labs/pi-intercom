@@ -729,12 +729,12 @@ class IntercomBroker {
               ownedSupersededAskId = message.supersedes;
             }
           }
+          const fingerprint = this.deliveryFingerprint(message, target.info.id, target.info.endpointEpoch);
+          if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
           if (message.expectsReply && this.askEdges.has(message.id) && ownedSupersededAskId !== message.id) {
             writeMessage(socket, deliveryFailed(message.id, "Duplicate pending ask message ID"));
             break;
           }
-          const fingerprint = this.deliveryFingerprint(message, target.info.id, target.info.endpointEpoch);
-          if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.info.id)) {
             writeMessage(socket, deliveryFailed(message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET"));
             break;

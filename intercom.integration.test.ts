@@ -5350,7 +5350,7 @@ test("failed delivery from an inferred reply preserves the pending ask", { concu
   }
 });
 
-test("broker refuses a duplicate pending ask ID without displacing the original edge", { concurrency: false }, async () => {
+test("broker replays an identical pending ask and rejects changed content without displacing the original edge", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   try {
     const target = await waitForSessionByName(planner, "orchestrator");
@@ -5359,9 +5359,13 @@ test("broker refuses a duplicate pending ask ID without displacing the original 
     const first = await planner.send(target.id, { messageId: askId, text: "first ask", expectsReply: true });
     assert.equal(first.delivered, true);
 
-    const second = await planner.send(target.id, { messageId: askId, text: "second ask", expectsReply: true });
-    assert.equal(second.delivered, false);
-    assert.match(second.reason ?? "", /Duplicate pending ask message ID/);
+    const replay = await planner.send(target.id, { messageId: askId, text: "first ask", expectsReply: true });
+    assert.equal(replay.delivered, true);
+    assert.equal(replay.delivery, "socket_delivered");
+
+    const changed = await planner.send(target.id, { messageId: askId, text: "second ask", expectsReply: true });
+    assert.equal(changed.delivered, false);
+    assert.equal(changed.code, "E_MESSAGE_ID_REUSE");
 
     // The original edge must survive: replying to it still resolves against a live ask.
     const reply = await orchestrator.send(
