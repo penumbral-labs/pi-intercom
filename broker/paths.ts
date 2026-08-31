@@ -20,11 +20,12 @@ export type BrokerConnectTarget = string | BrokerTcpEndpoint;
 
 /**
  * Canonical Windows spelling used for both the readable pipe segment and its collision-resistant
- * suffix. win32.normalize is used explicitly so equivalent Windows paths hash identically even
- * when tests run on another platform; drive/UNC roots remain distinct.
+ * suffix. win32.normalize is used explicitly so separator, dot-segment, and trailing-separator
+ * equivalents hash identically even when tests run on another platform. Case is retained because
+ * Windows supports per-directory case-sensitive roots.
  */
 function normalizeWindowsAgentDir(agentDir: string): string {
-  const normalized = win32.normalize(agentDir).toLowerCase();
+  const normalized = win32.normalize(agentDir);
   const root = win32.parse(normalized).root;
   return normalized.length > root.length ? normalized.replace(/[\\/]+$/, "") : normalized;
 }
