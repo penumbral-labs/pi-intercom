@@ -21,12 +21,15 @@ import { STALE_ASK_RETENTION_MS } from "../config.ts";
 // the only seam where this logic can be unit-tested.
 
 export interface AskEdge {
+  readonly from: string;
+  readonly to: string;
+  readonly createdAt: number;
+}
+
+interface StoredAskEdge {
   from: string;
   to: string;
   createdAt: number;
-}
-
-interface StoredAskEdge extends AskEdge {
   // Cached `${from}\0${to}` key so active counters can be maintained without recomputing.
   pairKey: string;
   active: boolean;
@@ -172,23 +175,27 @@ export class AskEdges {
   }
 
   // Removes timed-out asks from deadlock and active-capacity accounting while retaining a bounded
-  // set for late-reply authorization. Returns reply-only IDs evicted from oldest to newest.
+  // set for late-reply authorization. Returns newly expired and evicted IDs so durable waiter
+  // records can be removed without scanning their directory on every send.
   expireActiveOlderThan(maxAgeMs: number, now = Date.now()): string[] {
-    for (const edge of this.edges.values()) {
-      if (edge.active && now - edge.createdAt > maxAgeMs) this.deactivate(edge);
+    const expired: string[] = [];
+    for (const [messageId, edge] of this.edges) {
+      if (edge.active && now - edge.createdAt > maxAgeMs) {
+        this.deactivate(edge);
+        expired.push(messageId);
+      }
     }
-    if (this.replyOnlyCount <= this.maxReplyOnly) return [];
+    if (this.replyOnlyCount <= this.maxReplyOnly) return expired;
 
     const replyOnly = Array.from(this.edges.entries())
       .filter(([, edge]) => !edge.active)
       .sort(([, left], [, right]) => left.createdAt - right.createdAt || left.insertionOrder - right.insertionOrder);
-    const evicted: string[] = [];
     for (const [messageId] of replyOnly) {
       if (this.replyOnlyCount <= this.maxReplyOnly) break;
       this.delete(messageId);
-      evicted.push(messageId);
+      if (!expired.includes(messageId)) expired.push(messageId);
     }
-    return evicted;
+    return expired;
   }
 
   // Drops reply authorization older than `maxAgeMs`.

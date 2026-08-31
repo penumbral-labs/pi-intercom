@@ -3,8 +3,10 @@ import test from "node:test";
 import type { ExtensionCapability, OpaqueDispatchBrokerFrame, OpaqueDispatchClientFrame, SessionInfo } from "../types.ts";
 import {
   canonicalizeOpaquePayload,
+  MAX_OPAQUE_ACTIVE_RECORDS,
   MAX_OPAQUE_PRINCIPAL_RECORDS,
   MAX_OPAQUE_PRINCIPAL_TOMBSTONES,
+  MAX_OPAQUE_TARGET_RECORDS,
   OpaqueDispatchManager,
   type OpaqueEndpoint,
 } from "./opaque-dispatch.ts";
@@ -534,7 +536,10 @@ test("active expiry emits expired without a reservation-timeout reason", async (
 test("global capacity evicts an old queued record without a stale per-principal count", () => {
   const senderFrames: OpaqueDispatchBrokerFrame[] = [];
   const endpoints = new Map<string, OpaqueEndpoint>();
-  for (let index = 0; index < 9; index += 1) {
+  const recordsPerPrincipal = Math.min(MAX_OPAQUE_PRINCIPAL_RECORDS, MAX_OPAQUE_TARGET_RECORDS);
+  const fullPrincipalCount = Math.ceil(MAX_OPAQUE_ACTIVE_RECORDS / recordsPerPrincipal);
+  const fixtureCount = fullPrincipalCount + 1;
+  for (let index = 0; index < fixtureCount; index += 1) {
     const id = `sender-${index}`;
     endpoints.set(id, {
       sessionId: id,
@@ -545,21 +550,23 @@ test("global capacity evicts an old queued record without a stale per-principal 
       write: (frame) => senderFrames.push(frame),
     });
   }
-  for (let index = 0; index < 9; index += 1) {
+  for (let index = 0; index < fixtureCount; index += 1) {
     const id = `receiver-${index}`;
     endpoints.set(id, { sessionId: id, endpointEpoch: `${id}-epoch`, info: info(id), extensions: receiverExtensions, connected: false });
   }
   const manager = new OpaqueDispatchManager({ brokerEpoch: "33333333-3333-4333-8333-333333333333", endpoint: (id) => endpoints.get(id), owner: () => undefined });
-  for (let senderIndex = 0; senderIndex < 8; senderIndex += 1) {
+  for (let senderIndex = 0; senderIndex < fullPrincipalCount; senderIndex += 1) {
     const origin = endpoints.get(`sender-${senderIndex}`)!;
-    for (let recordIndex = 0; recordIndex < 32; recordIndex += 1) {
+    const recordCount = Math.min(recordsPerPrincipal, MAX_OPAQUE_ACTIVE_RECORDS - senderIndex * recordsPerPrincipal);
+    for (let recordIndex = 0; recordIndex < recordCount; recordIndex += 1) {
       manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: `op-${senderIndex}-${recordIndex}`, requestId: `request-${senderIndex}-${recordIndex}`, senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, targetEpoch: `receiver-${senderIndex}-epoch`, recipientNamespace: "receiver/v1", payload: null });
     }
   }
-  assert.equal(manager.activeCount, 256);
-  const origin = endpoints.get("sender-8")!;
-  manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: "boundary-op", requestId: "boundary-request", senderNamespace: "sender/v1", toSessionId: "receiver-8", targetEpoch: "receiver-8-epoch", recipientNamespace: "receiver/v1", payload: null });
-  assert.equal(manager.activeCount, 256);
+  assert.equal(manager.activeCount, MAX_OPAQUE_ACTIVE_RECORDS);
+  const boundaryIndex = fullPrincipalCount;
+  const origin = endpoints.get(`sender-${boundaryIndex}`)!;
+  manager.handle(origin, { type: "opaque_dispatch_v1_send", operationId: "boundary-op", requestId: "boundary-request", senderNamespace: "sender/v1", toSessionId: `receiver-${boundaryIndex}`, targetEpoch: `receiver-${boundaryIndex}-epoch`, recipientNamespace: "receiver/v1", payload: null });
+  assert.equal(manager.activeCount, MAX_OPAQUE_ACTIVE_RECORDS);
   assert.equal(senderFrames.some((frame) => frame.type === "opaque_dispatch_v1_ack" && frame.operationId === "boundary-op"), true);
   manager.shutdown();
 });
@@ -567,7 +574,10 @@ test("global capacity evicts an old queued record without a stale per-principal 
 test("capped principal cannot evict another principal at global capacity", () => {
   const senderFrames = new Map<string, OpaqueDispatchBrokerFrame[]>();
   const endpoints = new Map<string, OpaqueEndpoint>();
-  for (let index = 0; index < 9; index += 1) {
+  const recordsPerPrincipal = Math.min(MAX_OPAQUE_PRINCIPAL_RECORDS, MAX_OPAQUE_TARGET_RECORDS);
+  const fullPrincipalCount = Math.ceil(MAX_OPAQUE_ACTIVE_RECORDS / recordsPerPrincipal);
+  const fixtureCount = fullPrincipalCount + 1;
+  for (let index = 0; index < fixtureCount; index += 1) {
     const id = `sender-${index}`;
     const frames: OpaqueDispatchBrokerFrame[] = [];
     senderFrames.set(id, frames);
@@ -575,8 +585,9 @@ test("capped principal cannot evict another principal at global capacity", () =>
     endpoints.set(`receiver-${index}`, { sessionId: `receiver-${index}`, endpointEpoch: `receiver-${index}-epoch`, info: info(`receiver-${index}`), extensions: receiverExtensions, connected: false });
   }
   const manager = new OpaqueDispatchManager({ brokerEpoch: "33333333-3333-4333-8333-333333333333", endpoint: (id) => endpoints.get(id), owner: () => undefined });
-  for (let senderIndex = 0; senderIndex < 8; senderIndex += 1) {
-    for (let recordIndex = 0; recordIndex < 32; recordIndex += 1) {
+  for (let senderIndex = 0; senderIndex < fullPrincipalCount; senderIndex += 1) {
+    const recordCount = Math.min(recordsPerPrincipal, MAX_OPAQUE_ACTIVE_RECORDS - senderIndex * recordsPerPrincipal);
+    for (let recordIndex = 0; recordIndex < recordCount; recordIndex += 1) {
       manager.handle(endpoints.get(`sender-${senderIndex}`)!, {
         type: "opaque_dispatch_v1_send", operationId: `op-${senderIndex}-${recordIndex}`, requestId: `request-${senderIndex}-${recordIndex}`,
         senderNamespace: "sender/v1", toSessionId: `receiver-${senderIndex}`, targetEpoch: `receiver-${senderIndex}-epoch`, recipientNamespace: "receiver/v1", payload: null,
@@ -586,12 +597,46 @@ test("capped principal cannot evict another principal at global capacity", () =>
   const foreignBefore = senderFrames.get("sender-1")!.length;
   manager.handle(endpoints.get("sender-0")!, {
     type: "opaque_dispatch_v1_send", operationId: "capped-op", requestId: "capped-request", senderNamespace: "sender/v1",
-    toSessionId: "receiver-8", targetEpoch: "receiver-8-epoch", recipientNamespace: "receiver/v1", payload: null,
+    toSessionId: `receiver-${fullPrincipalCount}`, targetEpoch: `receiver-${fullPrincipalCount}-epoch`, recipientNamespace: "receiver/v1", payload: null,
   });
-  assert.equal(manager.activeCount, 256);
+  assert.equal(manager.activeCount, MAX_OPAQUE_ACTIVE_RECORDS);
   const rejection = senderFrames.get("sender-0")!.at(-1);
   assert.equal(rejection?.type === "opaque_dispatch_v1_rejected" ? rejection.code : undefined, "limit_exceeded");
   assert.equal(senderFrames.get("sender-1")!.length, foreignBefore);
+  manager.shutdown();
+});
+
+test("receipt acknowledgements cannot advance beyond receipts recorded so far", () => {
+  const { manager, endpoints, senderFrames, receiverFrames, send } = harness();
+  send();
+  const offered = offer(receiverFrames);
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_reservation_result",
+    endpointEpoch: "receiver-epoch",
+    reservationId: offered.reservationId,
+    messageId: offered.messageId,
+    decision: "reserved",
+  });
+  manager.handle(endpoints.get("sender")!, {
+    type: "opaque_dispatch_v1_receipt_ack",
+    senderNamespace: "sender/v1",
+    messageId: offered.messageId,
+    sequence: 20,
+  });
+  endpoints.get("sender")!.connected = false;
+  manager.handle(endpoints.get("receiver")!, {
+    type: "opaque_dispatch_v1_claim",
+    operationId: "claim",
+    endpointEpoch: "receiver-epoch",
+    reservationId: offered.reservationId,
+    messageId: offered.messageId,
+  });
+  endpoints.get("sender")!.connected = true;
+  manager.endpointAvailable("sender");
+  const claimed = senderFrames.filter((frame) =>
+    frame.type === "opaque_dispatch_v1_receipt" && frame.receipt.messageId === offered.messageId
+    && frame.receipt.status === "claimed");
+  assert.equal(claimed.length, 1, "a future receipt must replay despite an overlarge earlier acknowledgement");
   manager.shutdown();
 });
 

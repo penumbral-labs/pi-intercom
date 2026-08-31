@@ -88,7 +88,11 @@ test("opaque pending operations enforce the 256 global cap", async () => {
       }));
     }
   }
-  while (operationIds.length < 256) await new Promise((resolve) => setImmediate(resolve));
+  const deadline = Date.now() + 5_000;
+  while (operationIds.length < 256) {
+    if (Date.now() > deadline) throw new Error(`only ${operationIds.length} send frames were written`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
   assert.deepEqual(await client.sendOpaqueDispatch("sender/overflow", {
     requestId: "request-over-global-limit", toSessionId: "receiver", recipientNamespace: "receiver/v1", payload: null,
   }), { accepted: false, requestId: "request-over-global-limit", code: "limit_exceeded" });

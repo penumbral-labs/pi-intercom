@@ -4,7 +4,6 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import {
   writeMessage,
-  writeMessages,
   createMessageReader,
   IntercomFrameTooLargeError,
 } from "./framing.ts";
@@ -68,6 +67,8 @@ const MAX_UNREGISTERED_CONNECTIONS = 32;
 const REGISTRATION_TIMEOUT_MS = 1000;
 const RATE_LIMIT_CAPACITY = 512;
 const RATE_LIMIT_REFILL_PER_SECOND = 120;
+const OPAQUE_RATE_LIMIT_CAPACITY = 60;
+const OPAQUE_RATE_LIMIT_REFILL_PER_SECOND = 30;
 const PRESENCE_HEARTBEAT_MS = 1000;
 const MAX_EXTENSIONS_PER_SESSION = 32;
 const MAX_EXTENSION_MESSAGE_BYTES = 16 * 1024;
@@ -80,6 +81,7 @@ const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
 const MAX_RATE_LIMITED_OPAQUE_OPERATIONS = 256;
 const MAX_DELIVERY_RECORDS = 4096;
+const PENDING_ASK_PRUNE_INTERVAL_MS = 60 * 1000;
 const BROKER_STARTED_AT = Date.now();
 
 function deliveryRecordNow(): number {
@@ -199,6 +201,7 @@ class IntercomBroker {
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
   private shutdownTimer: NodeJS.Timeout | null = null;
+  private pendingAskPruneTimer: NodeJS.Timeout | null = null;
   private readonly askTimeoutMs = getAskTimeoutMs();
   private namespaceOwners = new Map<string, NamespaceOwner>();
   private nextOwnerOrder = 1;
@@ -210,6 +213,8 @@ class IntercomBroker {
     assertNoLiveBroker(PID_PATH);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
+    this.pendingAskPruneTimer = setInterval(() => this.prunePendingAskRecords(), PENDING_ASK_PRUNE_INTERVAL_MS);
+    this.pendingAskPruneTimer.unref?.();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
     this.opaqueDispatch = new OpaqueDispatchManager({
       brokerEpoch: BROKER_EPOCH,
@@ -295,7 +300,7 @@ class IntercomBroker {
       socket,
       tokens: RATE_LIMIT_CAPACITY,
       lastRefillAt: Date.now(),
-      opaqueTokens: 60,
+      opaqueTokens: OPAQUE_RATE_LIMIT_CAPACITY,
       opaqueLastRefillAt: Date.now(),
       rateLimitedOpaqueOperations: new Set(),
     };
@@ -369,9 +374,12 @@ class IntercomBroker {
   private consumeOpaqueToken(connection: ConnectionState, now = Date.now()): boolean {
     const elapsedMs = now - connection.opaqueLastRefillAt;
     if (elapsedMs > 0) {
-      connection.opaqueTokens = Math.min(60, connection.opaqueTokens + elapsedMs * 30 / 1000);
+      connection.opaqueTokens = Math.min(
+        OPAQUE_RATE_LIMIT_CAPACITY,
+        connection.opaqueTokens + elapsedMs * OPAQUE_RATE_LIMIT_REFILL_PER_SECOND / 1000,
+      );
       connection.opaqueLastRefillAt = now;
-      if (connection.opaqueTokens >= 60) connection.rateLimitedOpaqueOperations.clear();
+      if (connection.opaqueTokens >= OPAQUE_RATE_LIMIT_CAPACITY) connection.rateLimitedOpaqueOperations.clear();
     }
     if (connection.opaqueTokens < 1) return false;
     connection.opaqueTokens -= 1;
@@ -694,7 +702,7 @@ class IntercomBroker {
         if (hasTargetId && hasTargetEpoch) {
           const targetId = clientMessage.targetId as string;
           const targetEpoch = clientMessage.targetEpoch as string;
-          const fingerprint = this.deliveryFingerprint(message, targetId, targetEpoch);
+          const fingerprint = this.deliveryFingerprint(message, targetId);
           const exactTarget = this.sessions.get(targetId);
           if (!exactTarget || exactTarget.info.endpointEpoch !== targetEpoch) {
             if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
@@ -729,7 +737,7 @@ class IntercomBroker {
               ownedSupersededAskId = message.supersedes;
             }
           }
-          const fingerprint = this.deliveryFingerprint(message, target.info.id, target.info.endpointEpoch);
+          const fingerprint = this.deliveryFingerprint(message, target.info.id);
           if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
           if (message.expectsReply && this.askEdges.has(message.id) && ownedSupersededAskId !== message.id) {
             writeMessage(socket, deliveryFailed(message.id, "Duplicate pending ask message ID"));
@@ -772,19 +780,14 @@ class IntercomBroker {
                 supersededBy: message.id,
                 timestamp: Date.now(),
               };
-              // A supersede is two frames that mean nothing apart: the control retires the old ID
-              // and the message supplies its replacement. The sink privately encodes both before
-              // writing either, keeping them atomic with respect to the frame cap while preserving
-              // control-before-message wire order.
-              writeMessages(
-                target.socket,
-                {
-                  type: "message_control",
-                  from: fromSession.info,
-                  control,
-                },
-                deliveredEnvelope,
-              );
+              // The control and replacement mean nothing apart, so put both in one protocol frame.
+              // The receiver expands the transaction into control-before-message local events.
+              writeMessage(target.socket, {
+                type: "message",
+                from: fromSession.info,
+                control,
+                message: deliveredMessage,
+              });
             } else {
               writeMessage(target.socket, deliveredEnvelope);
             }
@@ -834,7 +837,7 @@ class IntercomBroker {
             break;
           }
           const target = disconnectedTargets[0]!.info;
-          const fingerprint = this.deliveryFingerprint(message, target.id, target.endpointEpoch);
+          const fingerprint = this.deliveryFingerprint(message, target.id);
           if (this.replayOrRejectDelivery(socket, currentId, message.id, fingerprint, operationId)) break;
           if (message.supersedes) {
             writeMessage(socket, deliveryFailed(message.id, "Supersede target is not connected", "E_SUPERSEDE_TARGET"));
@@ -1154,7 +1157,9 @@ class IntercomBroker {
     }
   }
 
-  private deliveryFingerprint(message: Message, targetId: string, _targetEpoch: string | undefined): string {
+  private deliveryFingerprint(message: Message, targetId: string): string {
+    // The target epoch is intentionally excluded so an E_TARGET_REBOUND retry can reuse the same
+    // message ID against the replacement endpoint without looking like changed authored content.
     return JSON.stringify({
       targetId,
       text: message.content.text,
@@ -1375,11 +1380,17 @@ class IntercomBroker {
     if (!socket || socket.destroyed || socket.writableEnded || !socket.writable) {
       return;
     }
-    writeMessage(socket, {
-      type: "message_receipt",
-      from: this.brokerSessionInfo(timestamp),
-      receipt: { messageId, status, timestamp, ...(code ? { code } : {}), ...(detail ? { detail } : {}) },
-    });
+    try {
+      writeMessage(socket, {
+        type: "message_receipt",
+        from: this.brokerSessionInfo(timestamp),
+        receipt: { messageId, status, timestamp, ...(code ? { code } : {}), ...(detail ? { detail } : {}) },
+      });
+    } catch (error) {
+      // Broker receipts are diagnostics. If their required identity cannot fit, dropping one is
+      // preferable to disconnecting an unrelated healthy session that triggered mailbox pruning.
+      if (!(error instanceof IntercomFrameTooLargeError)) throw error;
+    }
   }
 
   private pruneMailboxMessages(now = Date.now()): void {
@@ -1498,7 +1509,6 @@ class IntercomBroker {
   }
 
   private pruneAskEdges(now = Date.now()): void {
-    this.prunePendingAskRecords(now);
     for (const messageId of this.askEdges.expireActiveOlderThan(this.askTimeoutMs, now)) {
       this.removePendingAskRecord(messageId);
     }
@@ -1991,6 +2001,10 @@ class IntercomBroker {
 
   private shutdown(): void {
     console.log("Broker shutting down");
+    if (this.pendingAskPruneTimer) {
+      clearInterval(this.pendingAskPruneTimer);
+      this.pendingAskPruneTimer = null;
+    }
     
     for (const session of this.sessions.values()) {
       session.socket.end();

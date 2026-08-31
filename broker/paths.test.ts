@@ -196,6 +196,12 @@ test("getBrokerSocketPath preserves case-sensitive Windows path component identi
   );
 });
 
+test("getBrokerSocketPath bounds deep Windows agent directories", () => {
+  const pipePath = getBrokerSocketPath("win32", `C:\\${"deep-segment\\".repeat(40)}agent`);
+  assert.ok(pipePath.length <= 256, `named-pipe path must fit Windows limits, got ${pipePath.length}`);
+  assert.match(pipePath, /-[0-9a-f]{16}$/);
+});
+
 test("getBrokerSocketPath preserves distinct Windows paths after normalization", () => {
   assert.notEqual(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:/a/c"));
   assert.notEqual(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "D:/a/b"));

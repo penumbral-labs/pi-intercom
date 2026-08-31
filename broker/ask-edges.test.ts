@@ -137,11 +137,12 @@ test("timed-out asks retain reply authorization without blocking reverse asks", 
   const waiterTimeoutMs = 50;
   edges.add("timed-out", "a", "b", 1000);
 
-  edges.expireActiveOlderThan(waiterTimeoutMs, 1000 + waiterTimeoutMs);
+  assert.deepEqual(edges.expireActiveOlderThan(waiterTimeoutMs, 1000 + waiterTimeoutMs), []);
   assert.equal(edges.has("timed-out"), true);
   assert.equal(edges.hasReverse("b", "a"), true, "the ask remains active through its timeout boundary");
 
-  edges.expireActiveOlderThan(waiterTimeoutMs, 1001 + waiterTimeoutMs);
+  assert.deepEqual(edges.expireActiveOlderThan(waiterTimeoutMs, 1001 + waiterTimeoutMs), ["timed-out"]);
+  assert.deepEqual(edges.expireActiveOlderThan(waiterTimeoutMs, 1002 + waiterTimeoutMs), [], "expiry is reported only once");
   assert.equal(edges.has("timed-out"), true, "the timed-out ask remains authorized for a late reply");
   assert.equal(edges.hasReverse("b", "a"), false, "reply-only authorization must not block a reverse ask");
 });
@@ -165,13 +166,13 @@ test("reply-only capacity evicts the deterministic oldest authorizations without
   edges.expireActiveOlderThan(0, 1001);
 
   edges.add("new-by-order", "c", "x", 1000);
-  assert.deepEqual(edges.expireActiveOlderThan(0, 1001), ["old-by-time"]);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1001), ["new-by-order", "old-by-time"]);
   assert.equal(edges.has("old-by-time"), false);
   assert.equal(edges.has("old-by-order"), true);
   assert.equal(edges.has("new-by-order"), true);
 
   edges.add("newest", "d", "x", 1001);
-  assert.deepEqual(edges.expireActiveOlderThan(0, 1002), ["old-by-order"]);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1002), ["newest", "old-by-order"]);
   assert.equal(edges.has("old-by-order"), false, "equal timestamps are ordered by insertion");
   assert.equal(edges.has("new-by-order"), true);
   assert.equal(edges.has("newest"), true);
@@ -192,7 +193,7 @@ test("deleting more than the reply-only cap of active edges does not inflate rep
 
   edges.add("oldest-valid", "a", "b", 100);
   edges.add("newest-valid", "a", "b", 101);
-  assert.deepEqual(edges.expireActiveOlderThan(0, 102), []);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 102), ["oldest-valid", "newest-valid"]);
   assert.equal(edges.replyOnlySize, replyOnlyCap);
   assert.equal(edges.has("oldest-valid"), true);
   assert.equal(edges.has("newest-valid"), true);

@@ -144,7 +144,7 @@ export type BrokerMessage =
   | { type: "registered"; sessionId: string; features?: string[]; brokerEpoch?: string; endpointEpoch?: string }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
   | { type: "sessions_failed"; requestId: string; code: "response_too_large"; error: string }
-  | { type: "message"; from: SessionInfo; message: Message }
+  | { type: "message"; from: SessionInfo; message: Message; control?: MessageControl }
   | { type: "presence_update"; session: SessionInfo }
   | { type: "session_joined"; session: SessionInfo }
   | { type: "session_left"; sessionId: string }

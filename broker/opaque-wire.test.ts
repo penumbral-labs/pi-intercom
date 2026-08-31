@@ -329,10 +329,14 @@ test("rate-limited retired origin socket cannot acknowledge replacement receipts
 
     const replacement = await connectRawOpaque("stale-ack-origin", senderNamespace, "send");
     await waitForRawFrame(replacement.frames, (frame) => frame.type === "opaque_dispatch_v1_receipt");
+    const staleSocketClosed = once(original.socket, "close");
     writeMessage(original.socket, {
       type: "opaque_dispatch_v1_receipt_ack", senderNamespace, messageId: opaqueOffer.messageId, sequence: 1,
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    // End the stale socket after its ordered write and wait for close. Unlike a local event-loop
+    // tick, this proves the broker consumed the socket stream before the next replay connection.
+    original.socket.end();
+    await staleSocketClosed;
     const nextReplacement = await connectRawOpaque("stale-ack-origin", senderNamespace, "send");
     const replay = await waitForRawFrame(nextReplacement.frames, (frame) => frame.type === "opaque_dispatch_v1_receipt");
     assert.equal((replay.receipt as { messageId: string }).messageId, opaqueOffer.messageId);

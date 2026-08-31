@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { chmodSync, mkdirSync, readFileSync } from "fs";
+import { chmodSync, mkdirSync, readFileSync, realpathSync } from "fs";
 import { isAbsolute, join, resolve, win32 } from "path";
 import { homedir } from "os";
 
@@ -19,10 +19,19 @@ export interface BrokerTcpEndpoint {
 export type BrokerConnectTarget = string | BrokerTcpEndpoint;
 
 // Canonical Windows spelling used for both the readable pipe segment and its collision-resistant
-// suffix. Volume-root case is canonicalized, while component case is retained for directories with
-// per-directory case sensitivity. Explicit win32 semantics keep this stable on every host platform.
+// suffix. On Windows, realpath adopts the filesystem's canonical component spelling: ordinary
+// case-insensitive aliases converge while per-directory case-sensitive names remain distinct.
+// Explicit win32 lexical fallback keeps missing paths and cross-platform callers deterministic.
 function normalizeWindowsAgentDir(agentDir: string): string {
-  const normalized = win32.normalize(agentDir);
+  let canonicalInput = agentDir;
+  if (process.platform === "win32") {
+    try {
+      canonicalInput = realpathSync.native(agentDir);
+    } catch {
+      // The agent directory may not have been created yet; lexical normalization remains stable.
+    }
+  }
+  const normalized = win32.normalize(canonicalInput);
   const root = win32.parse(normalized).root;
   const canonical = root.toLowerCase() + normalized.slice(root.length);
   return canonical.length > root.length ? canonical.replace(/[\\/]+$/, "") : canonical;
@@ -83,7 +92,8 @@ export function getBrokerSocketPath(
 ): string {
   if (platform === "win32") {
     const normalizedAgentDir = normalizeWindowsAgentDir(agentDir);
-    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(normalizedAgentDir)}-${pipeAgentDirHash(normalizedAgentDir)}`;
+    const readable = sanitizePipeSegment(normalizedAgentDir).slice(0, 128).replace(/-+$/, "") || "default";
+    return `\\\\.\\pipe\\pi-intercom-${readable}-${pipeAgentDirHash(normalizedAgentDir)}`;
   }
 
   return join(getIntercomDirPath(agentDir), "broker.sock");

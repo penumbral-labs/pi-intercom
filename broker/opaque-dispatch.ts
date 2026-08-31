@@ -499,7 +499,7 @@ export class OpaqueDispatchManager {
   private receiptAck(origin: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_receipt_ack" }>): void {
     const record = this.byMessageId.get(frame.messageId);
     if (!record || record.originSessionId !== origin.sessionId || record.senderNamespace !== frame.senderNamespace) return;
-    record.ackedThrough = Math.max(record.ackedThrough, frame.sequence);
+    record.ackedThrough = Math.max(record.ackedThrough, Math.min(frame.sequence, record.receipts.length));
   }
 
   private authorizedReservation(endpoint: OpaqueEndpoint, endpointEpoch: string, messageId: string, reservationId: string): RecordState | undefined {

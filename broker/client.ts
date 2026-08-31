@@ -456,11 +456,18 @@ export class IntercomClient extends EventEmitter {
       }
 
       case "message": {
-        const { from, message } = brokerMessage;
-        if (!isSessionInfo(from) || !isMessage(message)) {
+        const { from, message, control } = brokerMessage;
+        if (!isSessionInfo(from) || !isMessage(message)
+          || (control !== undefined && (!isMessageControl(control)
+            || control.action !== "supersede" || control.supersededBy !== message.id))) {
           throw new Error("Invalid message event");
         }
-
+        if (control) {
+          // Dispatch both logical events synchronously from one wire frame. The sender is not
+          // acknowledged until this transaction has reached the receiver socket as a whole.
+          this.emit("broker_message", { type: "message_control", from, control } satisfies BrokerMessage);
+          this.emit("message_control", from, control);
+        }
         this.emit("message", from, message);
         break;
       }
@@ -862,7 +869,7 @@ export class IntercomClient extends EventEmitter {
   }
 
   async send(to: string, options: SendOptions): Promise<SendResult> {
-    const socket = this.requireActiveSocket();
+    this.requireActiveSocket();
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
@@ -882,7 +889,7 @@ export class IntercomClient extends EventEmitter {
       messageId,
       "Send",
       (operationId) => {
-        writeMessage(socket, {
+        writeMessage(this.requireActiveSocket(), {
           type: "send",
           to,
           message,

@@ -478,7 +478,7 @@ The broker:
 
 ### Opaque dispatch v1
 
-Registry-ready v2 advertises `opaque-dispatch-v1` and `extension-state-refresh-v1`. Registrations advertise `send`,
+The broker advertises `opaque-dispatch-v1` and `extension-state-refresh-v1`. Registrations advertise `send`,
 `receive`, or both; `receive` requires synchronous reservation. Addressing is exact full session ID plus namespace, with
 no ordinary name/prefix/cwd/mailbox fallback and no confirmation dialog.
 
@@ -512,9 +512,8 @@ extension events, or model context. This local same-user transport is not remote
 
 `refreshState()` returns `ExtensionStateRefreshResult` rather than a bare snapshot: successful results carry
 `{ok:true,state}`, while old-broker and disconnected paths return typed `{ok:false,code}` outcomes before any unsupported
-write. The implementation and published API use this result contract; the approved reconciliation PRD's older bare-snapshot
-signature remains unchanged as planning history. Registration rejection invokes `onUnavailable("unsupported_host")`, and
-opaque operations preserve typed `unsupported_broker`, `limit_exceeded`, and `connection_lost` results at this boundary.
+write. Registration rejection invokes `onUnavailable("unsupported_host")`, and opaque operations preserve typed
+`unsupported_broker`, `limit_exceeded`, and `connection_lost` results at this boundary.
 
 ## How It Works
 

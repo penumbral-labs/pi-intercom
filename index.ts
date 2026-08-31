@@ -1211,6 +1211,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         const generation = extension.generation;
         const controller = new AbortController();
+        const superseded = extension.reservations.get(frame.messageId);
+        if (superseded && superseded.reservationId !== frame.reservationId) {
+          superseded.controller.abort("superseded");
+        }
         extension.reservations.set(frame.messageId, { controller, reservationId: frame.reservationId });
         let reservationDecisionSent = false;
         let releaseReservationDecision: (() => void) | undefined;

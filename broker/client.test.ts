@@ -67,6 +67,27 @@ test("malformed extension broker messages are rejected", () => {
   }));
 });
 
+test("atomic supersede messages emit control before replacement", () => {
+  const client = new IntercomClient();
+  (client as any)._sessionId = "session-1";
+  const events: string[] = [];
+  client.onMessageControl(() => events.push("control"));
+  client.on("message", () => events.push("message"));
+  const from = {
+    id: "session-2", cwd: "/test", model: "test", pid: 2, startedAt: 1, lastActivity: 1,
+  };
+  const message = { id: "replacement", timestamp: 2, content: { text: "new" } };
+
+  (client as any).handleBrokerMessage({
+    type: "message",
+    from,
+    control: { action: "supersede", messageId: "original", supersededBy: "replacement", timestamp: 2 },
+    message,
+  });
+
+  assert.deepEqual(events, ["control", "message"]);
+});
+
 test("correlated operation results settle only their exact waiter", () => {
   const client = new IntercomClient();
   (client as any)._sessionId = "session-1";

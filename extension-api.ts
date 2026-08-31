@@ -1,5 +1,9 @@
 import type {
+  ExtensionStateSnapshot as ProtocolExtensionStateSnapshot,
   OpaqueDispatchReason as ProtocolOpaqueDispatchReason,
+  OpaqueDispatchReceipt as ProtocolOpaqueDispatchReceipt,
+  OpaqueDispatchRole as ProtocolOpaqueDispatchRole,
+  OpaqueDispatchSender as ProtocolOpaqueDispatchSender,
   OpaqueDispatchStatus as ProtocolOpaqueDispatchStatus,
   SessionInfo,
 } from "./types.ts";
@@ -17,34 +21,17 @@ export interface IntercomExtensionState {
   payload: unknown;
 }
 
-export type ExtensionStateSnapshot =
-  | { namespace: string; revision: 0; present: false }
-  | { namespace: string; revision: number; present: true; payload: unknown };
+export type ExtensionStateSnapshot = ProtocolExtensionStateSnapshot;
 
 export type ExtensionStateRefreshResult =
   | { ok: true; state: ExtensionStateSnapshot }
   | { ok: false; code: "unsupported_broker" | "connection_lost" };
 
-export type OpaqueDispatchRole = "send" | "receive";
+export type OpaqueDispatchRole = ProtocolOpaqueDispatchRole;
 export type OpaqueDispatchStatus = ProtocolOpaqueDispatchStatus;
 export type OpaqueDispatchReason = ProtocolOpaqueDispatchReason;
-
-export interface OpaqueDispatchSender {
-  sessionId: string;
-  namespace: string;
-  trustedLocal: boolean;
-  owner?: IntercomExtensionOwner;
-}
-
-export interface OpaqueDispatchReceipt {
-  requestId: string;
-  messageId: string;
-  status: OpaqueDispatchStatus;
-  at: number;
-  attempt: number;
-  sequence: number;
-  reason?: OpaqueDispatchReason;
-}
+export type OpaqueDispatchSender = ProtocolOpaqueDispatchSender;
+export type OpaqueDispatchReceipt = ProtocolOpaqueDispatchReceipt;
 
 export interface OpaqueDispatchEvent {
   requestId: string;

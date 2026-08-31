@@ -6031,11 +6031,9 @@ test("a supersede whose replacement exceeds the frame cap applies neither frame"
 
     await new Promise((r) => setTimeout(r, 250));
     const legal = received.slice(legalStart);
-    const controlIndex = legal.findIndex((f) => f.type === "message_control" && f.control?.messageId === "original-msg");
-    const messageIndex = legal.findIndex((f) => f.message?.id === "legal-replacement");
-    assert.ok(controlIndex >= 0, "a successful supersede still delivers the control");
-    assert.ok(messageIndex >= 0, "a successful supersede still delivers the replacement");
-    assert.ok(controlIndex < messageIndex, "wire ordering is preserved: control before message");
+    const transaction = legal.find((f) => f.type === "message"
+      && f.control?.messageId === "original-msg" && f.message?.id === "legal-replacement");
+    assert.ok(transaction, "a successful supersede delivers its control and replacement atomically");
 
     // 6. Neither connection was collateral damage.
     assert.equal(sender.socket.destroyed, false, "sender socket must stay live");
