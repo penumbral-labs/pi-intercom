@@ -4,6 +4,7 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import {
   writeMessage,
+  writeMessages,
   createMessageReader,
   IntercomFrameTooLargeError,
 } from "./framing.ts";
@@ -34,6 +35,7 @@ import {
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
 import {
+  ATOMIC_SUPERSEDE_FEATURE,
   BROKER_SESSION_ID,
   CORRELATED_OPERATIONS_FEATURE,
   EXACT_SEND_FEATURE,
@@ -81,7 +83,9 @@ const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
 const MAX_RATE_LIMITED_OPAQUE_OPERATIONS = 256;
 const MAX_DELIVERY_RECORDS = 4096;
-const PENDING_ASK_PRUNE_INTERVAL_MS = 60 * 1000;
+const PENDING_ASK_PRUNE_INTERVAL_MS = process.env.PI_INTERCOM_TEST_PENDING_ASK_PRUNE_INTERVAL_MS
+  ? Number(process.env.PI_INTERCOM_TEST_PENDING_ASK_PRUNE_INTERVAL_MS)
+  : 60 * 1000;
 const BROKER_STARTED_AT = Date.now();
 
 function deliveryRecordNow(): number {
@@ -105,6 +109,7 @@ interface ConnectedSession {
   info: SessionInfo;
   lastPresenceBroadcastAt: number;
   ownerOrder: number;
+  features: Set<string>;
   extensions?: ExtensionCapability[];
 }
 
@@ -213,7 +218,13 @@ class IntercomBroker {
     assertNoLiveBroker(PID_PATH);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
-    this.pendingAskPruneTimer = setInterval(() => this.prunePendingAskRecords(), PENDING_ASK_PRUNE_INTERVAL_MS);
+    this.pendingAskPruneTimer = setInterval(() => {
+      try {
+        this.prunePendingAskRecords();
+      } catch (error) {
+        console.error("Failed to prune pending ask records:", error);
+      }
+    }, PENDING_ASK_PRUNE_INTERVAL_MS);
     this.pendingAskPruneTimer.unref?.();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
     this.opaqueDispatch = new OpaqueDispatchManager({
@@ -473,6 +484,11 @@ class IntercomBroker {
           throw new Error("Reserved broker sessionId");
         }
         const session = clientMessage.session;
+        if (clientMessage.features !== undefined
+          && (!Array.isArray(clientMessage.features) || !clientMessage.features.every((feature) => typeof feature === "string"))) {
+          throw new Error("Invalid register features");
+        }
+        const clientFeatures = new Set((clientMessage.features as string[] | undefined) ?? []);
         const extensions = session.extensions;
         if (extensions !== undefined) {
           if (!Array.isArray(extensions) || extensions.length > MAX_EXTENSIONS_PER_SESSION) {
@@ -522,6 +538,7 @@ class IntercomBroker {
           info,
           lastPresenceBroadcastAt: Date.now(),
           ownerOrder,
+          features: clientFeatures,
           extensions,
         };
         this.sessions.set(id, connectedSession);
@@ -544,6 +561,7 @@ class IntercomBroker {
             EXACT_SEND_FEATURE,
             EXTENSION_STATE_REFRESH_FEATURE,
             OPAQUE_DISPATCH_FEATURE,
+            ATOMIC_SUPERSEDE_FEATURE,
           ],
           brokerEpoch: BROKER_EPOCH,
           endpointEpoch: info.endpointEpoch,
@@ -780,14 +798,23 @@ class IntercomBroker {
                 supersededBy: message.id,
                 timestamp: Date.now(),
               };
-              // The control and replacement mean nothing apart, so put both in one protocol frame.
-              // The receiver expands the transaction into control-before-message local events.
-              writeMessage(target.socket, {
-                type: "message",
-                from: fromSession.info,
-                control,
-                message: deliveredMessage,
-              });
+              if (target.features.has(ATOMIC_SUPERSEDE_FEATURE)) {
+                // Capable receivers expand this transaction into control-before-message local events.
+                writeMessage(target.socket, {
+                  type: "message",
+                  from: fromSession.info,
+                  control,
+                  message: deliveredMessage,
+                });
+              } else {
+                // Legacy receivers reject an embedded control field. Encode both established frame
+                // shapes before writing either so a frame-cap failure cannot emit control alone.
+                writeMessages(
+                  target.socket,
+                  { type: "message_control", from: fromSession.info, control },
+                  deliveredEnvelope,
+                );
+              }
             } else {
               writeMessage(target.socket, deliveredEnvelope);
             }
@@ -1555,11 +1582,22 @@ class IntercomBroker {
       let parsed: unknown;
       try {
         parsed = JSON.parse(readFileSync(filePath, "utf8"));
-      } catch {
-        unlinkSync(filePath);
+      } catch (error) {
+        if (isRecord(error) && error.code === "ENOENT") continue;
+        try {
+          unlinkSync(filePath);
+        } catch (unlinkError) {
+          if (!isRecord(unlinkError) || unlinkError.code !== "ENOENT") throw unlinkError;
+        }
         continue;
       }
-      if (!isPendingAskRecord(parsed) || now > parsed.expiresAt) unlinkSync(filePath);
+      if (!isPendingAskRecord(parsed) || now > parsed.expiresAt) {
+        try {
+          unlinkSync(filePath);
+        } catch (error) {
+          if (!isRecord(error) || error.code !== "ENOENT") throw error;
+        }
+      }
     }
   }
 

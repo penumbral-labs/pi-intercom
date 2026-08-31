@@ -224,7 +224,12 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
   };
 }
 
-async function connectRawRegistered(sessionId: string, name: string, sessionOverrides: Record<string, unknown> = {}) {
+async function connectRawRegistered(
+  sessionId: string,
+  name: string,
+  sessionOverrides: Record<string, unknown> = {},
+  features?: string[],
+) {
   const net = await import("node:net");
   const { getBrokerSocketPath } = await import("./broker/paths.ts");
   const { createMessageReader, writeMessage } = await import("./broker/framing.ts");
@@ -244,6 +249,7 @@ async function connectRawRegistered(sessionId: string, name: string, sessionOver
   writeMessage(socket, {
     type: "register",
     sessionId,
+    ...(features ? { features } : {}),
     session: {
       name,
       cwd: repoDir,
@@ -373,6 +379,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
         "exact-send-v1",
         "extension-state-refresh-v1",
         "opaque-dispatch-v1",
+        "atomic-supersede-v1",
       ],
       brokerEpoch: (registerMessages[0] as { brokerEpoch: string }).brokerEpoch,
       endpointEpoch: (registerMessages[0] as { endpointEpoch: string }).endpointEpoch,
@@ -428,6 +435,7 @@ async function setupClients(options: { brokerEnv?: NodeJS.ProcessEnv } = {}) {
     });
 
     return {
+      broker,
       planner,
       orchestrator,
       cleanup: async () => {
@@ -2110,6 +2118,66 @@ test("opaque consumer refusal and callback failures retain typed terminal reason
   }
 });
 
+test("a replacement offer aborts the overwritten reservation as stale", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("replacement-offer-receiver", { sessionId: "replacement-offer-receiver" });
+  const signals: AbortSignal[] = [];
+  let activeClient: InstanceType<typeof IntercomClient> | undefined;
+  const originalConnect = IntercomClient.prototype.connect;
+  try {
+    IntercomClient.prototype.connect = async function (...args: Parameters<typeof originalConnect>) {
+      await originalConnect.apply(this, args);
+      activeClient = this;
+    };
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace: "opaque/replacement-offer",
+      ownerEligible: false,
+      opaqueDispatch: {
+        version: 1,
+        roles: ["receive"],
+        onReserve: (_event: unknown, reservation: { signal: AbortSignal }) => {
+          signals.push(reservation.signal);
+          return "reserved";
+        },
+      },
+      onReady: () => undefined,
+      onEvent: () => undefined,
+    });
+    await harness.emitLifecycle("session_start");
+    const connectDeadline = Date.now() + 2_000;
+    while (!activeClient && Date.now() < connectDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(activeClient);
+    const base = {
+      type: "opaque_dispatch_v1_offer",
+      requestId: "replacement-offer-request",
+      messageId: "11111111-1111-4111-8111-111111111111",
+      attempt: 1,
+      brokerEpoch: "22222222-2222-4222-8222-222222222222",
+      endpointEpoch: activeClient.endpointEpoch!,
+      toSessionId: "replacement-offer-receiver",
+      recipientNamespace: "opaque/replacement-offer",
+      sender: { sessionId: "replacement-offer-sender", namespace: "opaque/sender", trustedLocal: true },
+      payload: null,
+      reserveBy: Date.now() + 5_000,
+    } as const;
+    activeClient.emit("opaque_dispatch", { ...base, reservationId: "first-reservation" });
+    activeClient.emit("opaque_dispatch", { ...base, reservationId: "second-reservation", attempt: 2 });
+
+    assert.equal(signals.length, 2);
+    assert.equal(signals[0]?.aborted, true);
+    assert.equal(signals[0]?.reason, "stale_reservation");
+    assert.equal(signals[1]?.aborted, false);
+  } finally {
+    IntercomClient.prototype.connect = originalConnect;
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("session restart aborts a pending receiver reservation before replacing the client", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { cleanup } = await setupClients();
@@ -3426,6 +3494,28 @@ test("regular intercom asks fail safely when started concurrently", { concurrenc
     assert.equal(results.filter((result) => /First answer/.test(result.content[0]?.text ?? "")).length, 1);
     await harness.emitLifecycle("session_shutdown");
   } finally {
+    await cleanup();
+  }
+});
+
+test("periodic pending-ask pruning logs filesystem failures without terminating the broker", { concurrency: false }, async () => {
+  const { planner, cleanup, broker } = await setupClients({
+    brokerEnv: { PI_INTERCOM_TEST_PENDING_ASK_PRUNE_INTERVAL_MS: "20" },
+  });
+  const pendingDir = path.dirname(pendingAskRecordPath("timer-probe"));
+  let stderr = "";
+  broker.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  try {
+    rmSync(pendingDir, { recursive: true, force: true });
+    writeFileSync(pendingDir, "not a directory");
+    const deadline = Date.now() + 2_000;
+    while (!stderr.includes("Failed to prune pending ask records") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(stderr, /Failed to prune pending ask records/);
+    assert.ok((await planner.listSessions()).some((session) => session.id === planner.sessionId));
+  } finally {
+    rmSync(pendingDir, { force: true });
     await cleanup();
   }
 });
@@ -5945,10 +6035,54 @@ test("oversize delivery is contained: sender is told, and neither connection die
   }
 });
 
+test("legacy clients receive supersede as established control and message frames", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const sender = await connectRawRegistered("supersede-legacy-sender-id", "supersede-legacy-sender");
+  const receiver = await connectRawRegistered("supersede-legacy-receiver-id", "supersede-legacy-receiver");
+  try {
+    const { createMessageReader } = await import("./broker/framing.ts");
+    const received: Array<{ type?: string; message?: { id?: string }; control?: { messageId?: string } }> = [];
+    const reader = createMessageReader((msg) => received.push(msg as (typeof received)[number]), () => undefined);
+    receiver.socket.on("data", reader);
+
+    sender.writeMessage(sender.socket, {
+      type: "send",
+      to: "supersede-legacy-receiver-id",
+      message: { id: "legacy-original", timestamp: 1, content: { text: "original" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    sender.writeMessage(sender.socket, {
+      type: "send",
+      to: "supersede-legacy-receiver-id",
+      message: { id: "legacy-replacement", timestamp: 2, supersedes: "legacy-original", content: { text: "replacement" } },
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (received.filter((frame) => frame.type === "message" || frame.type === "message_control").length < 3
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const supersedeFrames = received.filter((frame) => frame.type === "message_control"
+      || frame.message?.id === "legacy-replacement");
+    assert.deepEqual(supersedeFrames.map((frame) => frame.type), ["message_control", "message"]);
+    assert.equal(supersedeFrames[0]?.control?.messageId, "legacy-original");
+    assert.equal(supersedeFrames[1]?.message?.id, "legacy-replacement");
+  } finally {
+    sender.socket.destroy();
+    receiver.socket.destroy();
+    await cleanup();
+  }
+});
+
 test("a supersede whose replacement exceeds the frame cap applies neither frame", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const sender = await connectRawRegistered("supersede-atomic-sender-id", "supersede-atomic-sender");
-  const receiver = await connectRawRegistered("supersede-atomic-receiver-id", "supersede-atomic-receiver");
+  const receiver = await connectRawRegistered(
+    "supersede-atomic-receiver-id",
+    "supersede-atomic-receiver",
+    {},
+    ["atomic-supersede-v1"],
+  );
   try {
     const { createMessageReader, MAX_FRAME_BYTES } = await import("./broker/framing.ts");
 

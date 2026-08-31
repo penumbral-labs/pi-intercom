@@ -1213,7 +1213,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         const controller = new AbortController();
         const superseded = extension.reservations.get(frame.messageId);
         if (superseded && superseded.reservationId !== frame.reservationId) {
-          superseded.controller.abort("superseded");
+          // A newer attempt invalidates the previous reservation without implying that the
+          // underlying dispatch itself was superseded by another message.
+          superseded.controller.abort("stale_reservation");
         }
         extension.reservations.set(frame.messageId, { controller, reservationId: frame.reservationId });
         let reservationDecisionSent = false;

@@ -3,6 +3,7 @@ export const EXACT_SEND_FEATURE = "exact-send-v1";
 export const CORRELATED_OPERATIONS_FEATURE = "correlated-operations-v1";
 export const EXTENSION_STATE_REFRESH_FEATURE = "extension-state-refresh-v1";
 export const OPAQUE_DISPATCH_FEATURE = "opaque-dispatch-v1";
+export const ATOMIC_SUPERSEDE_FEATURE = "atomic-supersede-v1";
 export const BROKER_SESSION_ID = "__pi_intercom_broker__";
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
@@ -113,7 +114,7 @@ export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "pe
 };
 
 export type ClientMessage =
-  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string }
+  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; features?: string[] }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }

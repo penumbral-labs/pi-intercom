@@ -13,6 +13,7 @@ import {
   isSessionInfo,
 } from "./protocol.ts";
 import {
+  ATOMIC_SUPERSEDE_FEATURE,
   CORRELATED_OPERATIONS_FEATURE,
   EXACT_SEND_FEATURE,
   EXTENSION_BUS_FEATURE,
@@ -357,6 +358,7 @@ export class IntercomClient extends EventEmitter {
           type: "register",
           session,
           ...(sessionId ? { sessionId } : {}),
+          features: [ATOMIC_SUPERSEDE_FEATURE],
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
         });
       } catch (error) {
