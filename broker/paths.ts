@@ -18,16 +18,14 @@ export interface BrokerTcpEndpoint {
 
 export type BrokerConnectTarget = string | BrokerTcpEndpoint;
 
-/**
- * Canonical Windows spelling used for both the readable pipe segment and its collision-resistant
- * suffix. win32.normalize is used explicitly so separator, dot-segment, and trailing-separator
- * equivalents hash identically even when tests run on another platform. Case is retained because
- * Windows supports per-directory case-sensitive roots.
- */
+// Canonical Windows spelling used for both the readable pipe segment and its collision-resistant
+// suffix. Volume-root case is canonicalized, while component case is retained for directories with
+// per-directory case sensitivity. Explicit win32 semantics keep this stable on every host platform.
 function normalizeWindowsAgentDir(agentDir: string): string {
   const normalized = win32.normalize(agentDir);
   const root = win32.parse(normalized).root;
-  return normalized.length > root.length ? normalized.replace(/[\\/]+$/, "") : normalized;
+  const canonical = root.toLowerCase() + normalized.slice(root.length);
+  return canonical.length > root.length ? canonical.replace(/[\\/]+$/, "") : canonical;
 }
 
 function pipeAgentDirHash(normalizedAgentDir: string): string {
