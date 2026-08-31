@@ -539,6 +539,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     pendingDispatches: Map<string, Set<{ client: IntercomClient; terminalMessageId?: string }>>;
   }>();
   let nextExtensionGeneration = 1;
+  const pendingExtensionStateCommits = new WeakMap<IntercomClient, Map<string, number[]>>();
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   let currentIntercomSessionId: string | null = null;
@@ -773,13 +774,27 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (!ownerEpoch || extension.owner?.sessionId !== activeClient.sessionId) {
           throw new Error(`Current session is not the owner of ${namespace}`);
         }
-        activeClient.sendExtensionMessage({
-          type: "extension_state_commit",
-          namespace,
-          ownerEpoch,
-          expectedRevision: expectedRevision ?? extension.state?.revision ?? 0,
-          payload,
-        });
+        let pendingByNamespace = pendingExtensionStateCommits.get(activeClient);
+        if (!pendingByNamespace) {
+          pendingByNamespace = new Map();
+          pendingExtensionStateCommits.set(activeClient, pendingByNamespace);
+        }
+        const pendingGenerations = pendingByNamespace.get(namespace) ?? [];
+        pendingByNamespace.set(namespace, pendingGenerations);
+        pendingGenerations.push(generation);
+        try {
+          activeClient.sendExtensionMessage({
+            type: "extension_state_commit",
+            namespace,
+            ownerEpoch,
+            expectedRevision: expectedRevision ?? extension.state?.revision ?? 0,
+            payload,
+          });
+        } catch (error) {
+          pendingGenerations.pop();
+          if (pendingGenerations.length === 0) pendingByNamespace.delete(namespace);
+          throw error;
+        }
       },
       async refreshState() {
         const activeClient = client;
@@ -1378,7 +1393,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           emitLocalExtensionEvent(message.namespace, { type: "state", state: extension.state });
           break;
         }
-        case "extension_state_result":
+        case "extension_state_result": {
+          const pendingByNamespace = pendingExtensionStateCommits.get(nextClient);
+          const pendingGenerations = pendingByNamespace?.get(message.namespace);
+          const generation = pendingGenerations?.shift();
+          if (pendingGenerations?.length === 0) pendingByNamespace?.delete(message.namespace);
+          if (generation !== localExtensions.get(message.namespace)?.generation) break;
           emitLocalExtensionEvent(message.namespace, {
             type: "state_result",
             committed: message.committed,
@@ -1386,6 +1406,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             ...(message.reason ? { reason: message.reason } : {}),
           });
           break;
+        }
         case "message_receipt":
           latestOutboundReceipts.set(message.receipt.messageId, {
             status: message.receipt.status,

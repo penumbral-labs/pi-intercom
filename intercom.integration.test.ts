@@ -1334,6 +1334,90 @@ test("disposed extension channels cannot act on a replacement registration", asy
   replacementChannel.dispose();
 });
 
+test("state commit results are delivered only to the registration that issued them", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("state-commit-generation", { sessionId: "state-commit-generation" });
+  const namespace = "state-commit-generation/v1";
+  const staleEvents: unknown[] = [];
+  const replacementEvents: unknown[] = [];
+  let staleChannel: IntercomExtensionChannel | undefined;
+  let replacementChannel: IntercomExtensionChannel | undefined;
+  const originalSend = IntercomClient.prototype.sendExtensionMessage;
+  let deferredCommit: Parameters<typeof originalSend>[0] | undefined;
+  let activeClient: InstanceType<typeof IntercomClient> | undefined;
+  const brokerMessages: BrokerMessage[] = [];
+
+  try {
+    IntercomClient.prototype.sendExtensionMessage = function (message) {
+      activeClient = this;
+      if (message.type === "extension_state_commit") {
+        deferredCommit = message;
+        return;
+      }
+      return originalSend.call(this, message);
+    };
+    piIntercomExtension(harness.pi as never);
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace,
+      ownerEligible: true,
+      onReady: (value: IntercomExtensionChannel) => { staleChannel = value; },
+      onEvent: (event: unknown) => staleEvents.push(event),
+    });
+    await harness.emitLifecycle("session_start");
+    const deadline = Date.now() + 2_000;
+    while (!staleChannel?.snapshot().owner && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(staleChannel?.snapshot().owner?.sessionId, "state-commit-generation");
+
+    staleChannel!.commitState({ generation: "stale" });
+    assert.equal(deferredCommit?.type, "extension_state_commit");
+    staleChannel!.dispose();
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+      namespace,
+      ownerEligible: true,
+      onReady: (value: IntercomExtensionChannel) => { replacementChannel = value; },
+      onEvent: (event: unknown) => replacementEvents.push(event),
+    });
+    assert.ok(replacementChannel);
+    assert.ok(activeClient);
+
+    activeClient.onBrokerMessage((message) => brokerMessages.push(message));
+    originalSend.call(activeClient, deferredCommit!);
+    const resultDeadline = Date.now() + 2_000;
+    while (!brokerMessages.some((message) => message.type === "extension_state_result") && Date.now() < resultDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(brokerMessages.some((message) => message.type === "extension_state_result"), true);
+    assert.equal(staleEvents.some((event) => (event as { type?: string }).type === "state_result"), false);
+    assert.equal(replacementEvents.some((event) => (event as { type?: string }).type === "state_result"), false);
+
+    const replacementDeadline = Date.now() + 2_000;
+    while (!replacementChannel.snapshot().owner && Date.now() < replacementDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    IntercomClient.prototype.sendExtensionMessage = originalSend;
+    replacementChannel.commitState({ generation: "replacement" }, 0);
+    const replacementResultDeadline = Date.now() + 2_000;
+    while (!replacementEvents.some((event) => (event as { type?: string }).type === "state_result")
+      && Date.now() < replacementResultDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(replacementEvents.find((event) => (event as { type?: string }).type === "state_result"), {
+      type: "state_result",
+      committed: true,
+      revision: 1,
+    });
+  } finally {
+    IntercomClient.prototype.sendExtensionMessage = originalSend;
+    replacementChannel?.dispose();
+    staleChannel?.dispose();
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("disconnected extension opaque operations return connection_lost", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness();

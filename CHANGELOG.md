@@ -18,6 +18,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Oversized session-list responses now reject only their correlated request through `sessions_failed` without disconnecting a healthy client or failing unrelated requests and liveness probes.
 - Mailbox deliveries that exceed the frame limit after broker metadata is added now terminalize with `E_DELIVERY_TOO_LARGE` instead of lingering for replay.
 - Oversized forwarded receipt details are replaced with a non-sensitive omission notice, or omitted entirely when needed, without leaking the original detail or disconnecting either peer.
+- Extension state commit outcomes are now fenced to the local registration generation that issued them, so a replacement registration cannot receive a disposed predecessor's result.
 - Lexically equivalent Windows agent-directory spellings now canonicalize to the same broker named-pipe path while agent directories that differ in component case remain isolated.
 
 ## [0.11.0] - 2026-08-19
