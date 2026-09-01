@@ -22,9 +22,9 @@ export type BrokerConnectTarget = string | BrokerTcpEndpoint;
 // suffix. On Windows, realpath adopts the filesystem's canonical component spelling: ordinary
 // case-insensitive aliases converge while per-directory case-sensitive names remain distinct.
 // Explicit win32 lexical fallback keeps missing paths and cross-platform callers deterministic.
-function normalizeWindowsAgentDir(agentDir: string): string {
+function normalizeWindowsAgentDir(agentDir: string, platform: NodeJS.Platform = process.platform): string {
   let canonicalInput = agentDir;
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     try {
       canonicalInput = realpathSync.native(agentDir);
     } catch {
@@ -92,7 +92,7 @@ export function getBrokerSocketPath(
   agentDir: string = getAgentDirPath(),
 ): string {
   if (platform === "win32") {
-    const normalizedAgentDir = normalizeWindowsAgentDir(agentDir);
+    const normalizedAgentDir = normalizeWindowsAgentDir(agentDir, platform);
     const readable = sanitizePipeSegment(normalizedAgentDir).slice(0, 128).replace(/-+$/, "") || "default";
     return `\\\\.\\pipe\\pi-intercom-${readable}-${pipeAgentDirHash(normalizedAgentDir)}`;
   }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -186,15 +186,34 @@ test("getBrokerSocketPath canonicalizes UNC server and share case", () => {
   );
 });
 
+test("getBrokerSocketPath uses filesystem-canonical component case on Windows", () => {
+  const originalNative = realpathSync.native;
+  realpathSync.native = ((path: Parameters<typeof realpathSync.native>[0]) => String(path).toLowerCase()) as typeof realpathSync.native;
+  try {
+    assert.equal(
+      getBrokerSocketPath("win32", "C:\\work\\Agent"),
+      getBrokerSocketPath("win32", "c:\\WORK\\agent"),
+    );
+  } finally {
+    realpathSync.native = originalNative;
+  }
+});
+
 test("getBrokerSocketPath preserves case-sensitive Windows path component identity", () => {
-  assert.notEqual(
-    getBrokerSocketPath("win32", "C:\\work\\Agent"),
-    getBrokerSocketPath("win32", "C:\\work\\agent"),
-  );
-  assert.notEqual(
-    getBrokerSocketPath("win32", "\\\\server\\share\\work\\Agent"),
-    getBrokerSocketPath("win32", "\\\\server\\share\\work\\agent"),
-  );
+  const originalNative = realpathSync.native;
+  realpathSync.native = ((path: Parameters<typeof realpathSync.native>[0]) => String(path)) as typeof realpathSync.native;
+  try {
+    assert.notEqual(
+      getBrokerSocketPath("win32", "C:\\work\\Agent"),
+      getBrokerSocketPath("win32", "C:\\work\\agent"),
+    );
+    assert.notEqual(
+      getBrokerSocketPath("win32", "\\\\server\\share\\work\\Agent"),
+      getBrokerSocketPath("win32", "\\\\server\\share\\work\\agent"),
+    );
+  } finally {
+    realpathSync.native = originalNative;
+  }
 });
 
 test("getBrokerSocketPath bounds deep Windows agent directories", () => {
