@@ -3814,6 +3814,105 @@ test("regular intercom ask timeout reports message id and delivery state", { con
   }
 });
 
+test("reply waiters resolve names case-insensitively but match the resolved session ID exactly", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const target = new IntercomClient();
+  const harness = createExtensionHarness("exact-reply-waiter", { sessionId: "session-exact-reply-waiter", hasUI: true });
+  const originalOn = EventEmitter.prototype.on;
+  let inboundMessageHandler: ((from: SessionInfo, message: Message) => void) | undefined;
+  EventEmitter.prototype.on = function (eventName: string | symbol, listener: (...args: any[]) => void) {
+    if (eventName === "message") inboundMessageHandler = listener;
+    return originalOn.call(this, eventName, listener);
+  };
+
+  try {
+    await target.connect({
+      name: "Reply-Target",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "Session-A");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(target, "exact-reply-waiter");
+    EventEmitter.prototype.on = originalOn;
+    assert.ok(inboundMessageHandler);
+
+    const questionReceived = once(target, "message") as Promise<[SessionInfo, Message]>;
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const askResultPromise = intercomTool.execute("exact-reply-waiter", {
+      action: "ask",
+      to: "rEpLy-TaRgEt",
+      message: "Who should answer?",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [askFrom, question] = await questionReceived;
+
+    inboundMessageHandler!({
+      id: "Other-Session",
+      name: "reply-target",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      status: "idle",
+    }, {
+      id: "case-folded-name-reply",
+      timestamp: Date.now(),
+      replyTo: question.id,
+      content: { text: "Name-matched sender." },
+    });
+    const askResult = await askResultPromise;
+    assert.notEqual(askResult.details?.error, true);
+    assert.match(askResult.content[0]?.text ?? "", /Name-matched sender/);
+    assert.equal(harness.sentMessages.length, 0);
+
+    const exactIdQuestionReceived = once(target, "message") as Promise<[SessionInfo, Message]>;
+    const exactIdAskResultPromise = intercomTool.execute("exact-id-reply-waiter", {
+      action: "ask",
+      to: "Session-A",
+      message: "Which exact ID should answer?",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, exactIdQuestion] = await exactIdQuestionReceived;
+    inboundMessageHandler!({
+      id: "session-a",
+      name: "Reply-Target",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      status: "idle",
+    }, {
+      id: "wrong-case-id-reply",
+      timestamp: Date.now(),
+      replyTo: exactIdQuestion.id,
+      content: { text: "Wrong sender." },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 1, "a case-folded session ID must not settle an ID waiter");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Wrong sender/);
+
+    assert.equal((await target.send(askFrom.id, {
+      messageId: "exact-id-reply",
+      text: "Exact sender.",
+      replyTo: exactIdQuestion.id,
+    })).delivered, true);
+    const exactIdAskResult = await exactIdAskResultPromise;
+    assert.notEqual(exactIdAskResult.details?.error, true);
+    assert.match(exactIdAskResult.content[0]?.text ?? "", /Exact sender/);
+    assert.doesNotMatch(exactIdAskResult.content[0]?.text ?? "", /Wrong sender/);
+  } finally {
+    EventEmitter.prototype.on = originalOn;
+    await harness.emitLifecycle("session_shutdown");
+    await target.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
 test("extension applies cancelled, superseded, and timed-out stale-reply tiers", { concurrency: false }, async () => {
   const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
   process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
@@ -3854,9 +3953,19 @@ test("extension applies cancelled, superseded, and timed-out stale-reply tiers",
     const [, cancelledQuestion] = await cancelledMessage;
     cancelledController.abort();
     assert.equal((await cancelledAsk).details?.error, true);
+    inboundMessageHandler!({ ...plannerSession, id: plannerSession.id.toUpperCase() }, {
+      id: "case-variant-late-cancelled-reply",
+      timestamp: Date.now(),
+      replyTo: cancelledQuestion.id,
+      content: { text: "Visible from a different case-sensitive session ID." },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.sentMessages.length, 1, "a case-variant session ID must not inherit stale classification");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Visible from a different case-sensitive session ID/);
+
     emitLateReply("late-cancelled-reply", cancelledQuestion.id, "Too late after cancellation.");
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(harness.sentMessages.length, 0, "cancelled late reply must be dropped");
+    assert.equal(harness.sentMessages.length, 1, "cancelled late reply from the exact session ID must be dropped");
 
     const timedOutMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
     const timedOutAsk = intercomTool.execute("stale-timed-out", {
@@ -3872,9 +3981,9 @@ test("extension applies cancelled, superseded, and timed-out stale-reply tiers",
       replyTo: timedOutQuestion.id,
     })).delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(harness.sentMessages.length, 1);
-    assert.match(harness.sentMessages[0]?.message.content ?? "", /Late reply to abandoned ask/);
-    assert.match(harness.sentMessages[0]?.message.content ?? "", /Visible after timeout/);
+    assert.equal(harness.sentMessages.length, 2);
+    assert.match(harness.sentMessages[1]?.message.content ?? "", /Late reply to abandoned ask/);
+    assert.match(harness.sentMessages[1]?.message.content ?? "", /Visible after timeout/);
 
     const supersededMessage = once(planner, "message") as Promise<[SessionInfo, Message]>;
     const supersededAsk = intercomTool.execute("stale-before-supersede", {
@@ -3896,7 +4005,7 @@ test("extension applies cancelled, superseded, and timed-out stale-reply tiers",
     await new Promise((resolve) => setTimeout(resolve, 20));
     emitLateReply("late-superseded-reply", supersededQuestion.id, "Too late after supersession.");
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(harness.sentMessages.length, 1, "superseded late reply must be dropped");
+    assert.equal(harness.sentMessages.length, 2, "superseded late reply must be dropped");
 
     emitLateReply("replacement-reply", replacementQuestion.id, "Current answer.");
     const replacementResult = await replacementAsk;
