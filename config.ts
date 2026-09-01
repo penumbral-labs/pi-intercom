@@ -3,6 +3,24 @@ import { join } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_PENDING_ASK_PRUNE_INTERVAL_MS = 60 * 1000;
+export const STALE_ASK_RETENTION_MS = 60 * 60 * 1000;
+
+/**
+ * Largest delay setTimeout can represent. Above this Node coerces the delay to 1ms, so an
+ * "infinite" ask timeout would fire immediately — the opposite of what the operator asked for.
+ */
+export const MAX_ASK_TIMEOUT_MS = 2 ** 31 - 1;
+
+export function getPendingAskPruneIntervalMs(
+  raw: string | undefined = process.env.PI_INTERCOM_TEST_PENDING_ASK_PRUNE_INTERVAL_MS,
+): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_PENDING_ASK_PRUNE_INTERVAL_MS;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_ASK_TIMEOUT_MS
+    ? value
+    : DEFAULT_PENDING_ASK_PRUNE_INTERVAL_MS;
+}
 
 export function getAskTimeoutMs(): number {
   const raw = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
@@ -13,6 +31,9 @@ export function getAskTimeoutMs(): number {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error("PI_INTERCOM_ASK_TIMEOUT_MS must be a positive integer number of milliseconds");
+  }
+  if (value > MAX_ASK_TIMEOUT_MS) {
+    throw new Error(`PI_INTERCOM_ASK_TIMEOUT_MS must not exceed ${MAX_ASK_TIMEOUT_MS} milliseconds`);
   }
   return value;
 }

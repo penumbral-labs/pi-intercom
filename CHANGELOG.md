@@ -4,6 +4,30 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+
+- Added bounded opaque dispatch with exact session/namespace routing, synchronous reservation, durable claim reconciliation, typed receipts, and broker-mediated payload custody.
+- Exposed broker-owned endpoint epochs to registered clients, opaque offers, and peer capability results.
+
+### Changed
+
+- Clients now advertise atomic supersede support. The broker sends one combined control-and-message frame to capable clients and preserves the established two-frame wire shape for older clients.
+- The documented 1 MiB message ceiling now explicitly covers the full broker-enriched wire frame, so authored content must leave room for routing, timestamp, and supersede metadata.
+- Late replies now follow the ask's abandonment reason: replies after cancellation or successful supersession by either `ask` or plain `send` are dropped, while replies after a plain timeout remain visible with a stale-reply warning. Timed-out asks no longer block reverse asks or consume active ask capacity, reply-only authorization is globally bounded with oldest-first eviction, and a rejected superseding delivery leaves the earlier ask live.
+- Opaque dispatch now retains temporary disconnected custody only long enough to report `mailbox_queued` followed by a deterministic `endpoint_epoch_changed` receipt on reconnect; every reconnect rotates the endpoint epoch and never transfers queued custody. Expired disconnected endpoints are pruned before capability lookup or send admission.
+- Opaque sends resolve endpoint epochs through the opaque capability channel and retry one admission-time `target_rebound` with the same idempotent request ID. A terminal endpoint-rotation result remains bound to that request ID for the tombstone lifetime, so sending work to the replacement endpoint requires a new request ID.
+- Opaque receipt acknowledgements are cumulative by sequence; reconnect replay includes only unacknowledged receipts. At global capacity, admission may evict the oldest queued record across principals with an `expired` / `limit_exceeded` receipt.
+
+### Fixed
+
+- Periodic pending-ask cleanup failures are contained and logged instead of terminating the broker, including benign per-entry disappearance races.
+- Replacement opaque offers abort the overwritten reservation with the neutral `stale_reservation` reason rather than implying that the dispatch was superseded.
+- Oversized session-list responses now reject only their correlated request through `sessions_failed` without disconnecting a healthy client or failing unrelated requests and liveness probes.
+- Mailbox deliveries that exceed the frame limit after broker metadata is added now terminalize with `E_DELIVERY_TOO_LARGE` instead of lingering for replay.
+- Oversized forwarded receipt details are replaced with a non-sensitive omission notice, or omitted entirely when needed, without leaking the original detail or disconnecting either peer.
+- Extension state commit outcomes are now fenced to the local registration generation that issued them, so a replacement registration cannot receive a disposed predecessor's result.
+- Lexically equivalent Windows agent-directory spellings now canonicalize to the same broker named-pipe path while agent directories that differ in component case remain isolated.
+
 ## [0.11.0] - 2026-08-19
 
 ### Highlights

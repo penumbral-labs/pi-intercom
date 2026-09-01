@@ -1,4 +1,12 @@
-import type { SessionInfo } from "./types.ts";
+import type {
+  ExtensionStateSnapshot as ProtocolExtensionStateSnapshot,
+  OpaqueDispatchReason as ProtocolOpaqueDispatchReason,
+  OpaqueDispatchReceipt as ProtocolOpaqueDispatchReceipt,
+  OpaqueDispatchRole as ProtocolOpaqueDispatchRole,
+  OpaqueDispatchSender as ProtocolOpaqueDispatchSender,
+  OpaqueDispatchStatus as ProtocolOpaqueDispatchStatus,
+  SessionInfo,
+} from "./types.ts";
 
 export const INTERCOM_EXTENSION_REGISTER_EVENT = "intercom:extension-register";
 export const INTERCOM_EXTENSION_REGISTRY_READY_EVENT = "intercom:extension-registry-ready";
@@ -13,6 +21,61 @@ export interface IntercomExtensionState {
   payload: unknown;
 }
 
+export type ExtensionStateSnapshot = ProtocolExtensionStateSnapshot;
+
+export type ExtensionStateRefreshResult =
+  | { ok: true; state: ExtensionStateSnapshot }
+  | { ok: false; code: "unsupported_broker" | "connection_lost" };
+
+export type OpaqueDispatchRole = ProtocolOpaqueDispatchRole;
+export type OpaqueDispatchStatus = ProtocolOpaqueDispatchStatus;
+export type OpaqueDispatchReason = ProtocolOpaqueDispatchReason;
+export type OpaqueDispatchSender = ProtocolOpaqueDispatchSender;
+export type OpaqueDispatchReceipt = ProtocolOpaqueDispatchReceipt;
+
+export interface OpaqueDispatchEvent {
+  requestId: string;
+  messageId: string;
+  attempt: number;
+  brokerEpoch: string;
+  endpointEpoch: string;
+  toSessionId: string;
+  recipientNamespace: string;
+  sender: OpaqueDispatchSender;
+  payload: unknown;
+  receivedAt: number;
+  reserveBy: number;
+}
+
+export interface OpaqueDispatchReservation {
+  readonly messageId: string;
+  readonly reservationId: string;
+  readonly attempt: number;
+  readonly signal: AbortSignal;
+  claim(): Promise<{ claimed: true } | { claimed: false; code: OpaqueDispatchReason }>;
+  fail(): Promise<{ failedClosed: true } | { failedClosed: false; code: OpaqueDispatchReason }>;
+}
+
+export interface OpaqueDispatchTransportIndeterminateEvent {
+  requestId: string;
+  messageId: string;
+  previousBrokerEpoch: string;
+  /** Absent when the replacement connection does not advertise opaque dispatch or an epoch. */
+  currentBrokerEpoch?: string;
+}
+
+export interface OpaqueDispatchRegistration {
+  version: 1;
+  roles: OpaqueDispatchRole[];
+  onReserve?(event: OpaqueDispatchEvent, reservation: OpaqueDispatchReservation): "reserved" | "refused";
+  onReceipt?(receipt: OpaqueDispatchReceipt): void;
+  onTransportIndeterminate?(event: OpaqueDispatchTransportIndeterminateEvent): void;
+}
+
+export type SendOpaqueResult =
+  | { accepted: true; requestId: string; messageId: string; brokerEpoch: string; deliveryState: "live" | "mailbox_queued" }
+  | { accepted: false; requestId: string; messageId?: string; code: OpaqueDispatchReason; terminal?: "refused" | "failed_closed" };
+
 export type IntercomExtensionEvent =
   | { type: "connection"; connected: boolean; supported: boolean }
   | { type: "owner"; owner?: IntercomExtensionOwner }
@@ -23,22 +86,51 @@ export type IntercomExtensionEvent =
   | { type: "session_left"; sessionId: string }
   | { type: "presence_update"; session: SessionInfo };
 
+export interface ExtensionChannelSnapshot {
+  connected: boolean;
+  supported: boolean;
+  brokerEpoch?: string;
+  capabilities: {
+    extensionBus: boolean;
+    extensionStateRefreshVersion?: 1;
+    opaqueDispatchVersion?: 1;
+  };
+  owner?: IntercomExtensionOwner;
+  state?: IntercomExtensionState;
+}
+
 export interface IntercomExtensionChannel {
   readonly namespace: string;
-  snapshot(): {
-    connected: boolean;
-    supported: boolean;
-    owner?: IntercomExtensionOwner;
-    state?: IntercomExtensionState;
-  };
+  snapshot(): ExtensionChannelSnapshot;
   publish(payload: unknown, options?: { audience?: "owner" | "capable"; ownerOnly?: boolean }): void;
   commitState(payload: unknown, expectedRevision?: number): void;
+  refreshState(): Promise<ExtensionStateRefreshResult>;
   listSessions(): Promise<SessionInfo[]>;
+  peerCapability(sessionId: string, recipientNamespace: string): Promise<
+    { state: "present"; version: 1; endpointEpoch: string }
+    | { state: "absent"; endpointEpoch: string }
+    | { state: "unknown" }
+  >;
+  sendOpaqueDispatch(input: {
+    requestId: string;
+    toSessionId: string;
+    recipientNamespace: string;
+    payload: unknown;
+    supersedesMessageId?: string;
+  }): Promise<SendOpaqueResult>;
+  cancelMessage(messageId: string): Promise<{ cancelled: true } | { cancelled: false; code: OpaqueDispatchReason }>;
+  reconcileClaim(input: { brokerEpoch: string; endpointEpoch: string; messageId: string; reservationId: string }): Promise<
+    { state: "claimed" } | { state: "reserved" } | { state: "stale"; code: "stale_reservation" }
+    | { state: "indeterminate"; code: "broker_epoch_changed" | "claim_history_unavailable" }
+  >;
+  dispose(): void;
 }
 
 export interface IntercomExtensionRegistration {
   namespace: string;
   ownerEligible: boolean;
+  opaqueDispatch?: OpaqueDispatchRegistration;
   onEvent(event: IntercomExtensionEvent): void;
   onReady(channel: IntercomExtensionChannel): void;
+  onUnavailable?(reason: "unsupported_host"): void;
 }

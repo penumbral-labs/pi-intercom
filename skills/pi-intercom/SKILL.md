@@ -17,6 +17,18 @@ When you are supervising `pi-subagents`, delegated child agents can escalate to
 you via `contact_supervisor` if `pi-subagents` supplied child bridge metadata.
 This skill covers how to handle those orchestrator-side escalations.
 
+## Opaque extension transport
+
+Opaque consumers require registry-ready v2 and `opaque-dispatch-v1` version 1. Reserve synchronously, persist and fsync the
+broker epoch, endpoint epoch, message/reservation IDs, and payload, then claim. Reconcile only against the same broker and
+endpoint epochs. Inject only after accepted claim; never convert opaque work to an ordinary message or automatically resend
+an indeterminate outcome. Treat `mailbox_queued` as temporary disconnected custody only: every reconnect rotates the
+endpoint epoch, produces a terminal `endpoint_epoch_changed` receipt, and never offers the queued payload. Senders may retry
+one admission-time `target_rebound` after resolving the new epoch with the same request ID. After a terminal endpoint
+rotation, use a new request ID for work intended for the replacement endpoint; the old ID replays its terminal result.
+Receipt acknowledgements are cumulative by sequence, and reconnect replay includes only unacknowledged receipts. There is no
+confirmation or detach path.
+
 ## When to Use
 
 - **Task delegation**: Split work between a planner session and worker sessions
@@ -227,6 +239,10 @@ it as a `contact_supervisor` escalation. A subagent may use regular `intercom` f
 peer coordination, including peers in other directories, but owner decisions and
 new visible project panes should go through the supervisor.
 
+## Delivery and stale-reply behavior
+
+The broker reports ordinary queued, expired, and cancelled mailbox outcomes. If an ask is explicitly cancelled or superseded, a late reply is discarded; a late reply after a plain waiter timeout remains visible and is marked as a late reply to an abandoned ask. Busy non-interactive sessions send their automatic unavailable response only for asks. Pi-intercom does not provide a detach mechanism.
+
 ## Key Differences
 
 | Action | Behavior | Use When |
@@ -349,6 +365,10 @@ Replies to recently disconnected explicitly named senders can be queued by the b
 // Override: set PI_INTERCOM_ASK_TIMEOUT_MS to a positive millisecond value
 // For longer tasks, use send + follow-up ask pattern
 ```
+
+## Contributor verification
+
+When changing the extension, run both `npm run typecheck` and `npm test`. The strict compiler/toolchain versions are pinned in the package lockfile.
 
 ## Troubleshooting
 

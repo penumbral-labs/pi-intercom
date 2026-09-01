@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "strict": true
+  },
+  "include": [
+    "index.ts",
+    "types.ts",
+    "config.ts",
+    "cwd.ts",
+    "extension-api.ts",
+    "format-context.ts",
+    "project-agent.ts",
+    "reply-tracker.ts",
+    "stale-asks.ts",
+    "broker/**/*.ts",
+    "ui/**/*.ts",
+    "test/**/*.ts",
+    "*.test.ts"
+  ]
+}

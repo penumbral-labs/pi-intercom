@@ -9,7 +9,7 @@ import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
-import { EXTENSION_BUS_FEATURE } from "./types.ts";
+import { EXTENSION_BUS_FEATURE, EXTENSION_STATE_REFRESH_FEATURE, OPAQUE_DISPATCH_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
@@ -19,8 +19,11 @@ import {
   type IntercomExtensionOwner,
   type IntercomExtensionRegistration,
   type IntercomExtensionState,
+  type OpaqueDispatchReason,
+  type OpaqueDispatchReservation,
 } from "./extension-api.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
+import { StaleAsks, type StaleAskTier } from "./stale-asks.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
@@ -59,8 +62,13 @@ interface InboundMessageEntry {
   bodyText: string;
 }
 
-interface DeliveryTarget {
+interface ResolvedSessionTarget {
   id: string;
+  matchedBy: "id" | "name";
+  name?: string;
+}
+
+interface DeliveryTarget extends ResolvedSessionTarget {
   label: string;
   projectPane?: ProjectPaneLaunch;
 }
@@ -102,6 +110,13 @@ function deliveryDetails(result: SendResult): Record<string, unknown> {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function opaqueErrorReason(error: unknown, fallback: OpaqueDispatchReason): OpaqueDispatchReason {
+  const message = getErrorMessage(error);
+  return message === "unsupported_broker" || message === "limit_exceeded" || message === "connection_lost"
+    ? message
+    : fallback;
 }
 
 function formatAttachments(attachments: Attachment[]): string {
@@ -523,7 +538,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     channel: IntercomExtensionChannel;
     owner?: IntercomExtensionOwner;
     state?: IntercomExtensionState;
+    generation: number;
+    reservations: Map<string, { controller: AbortController; reservationId: string }>;
+    acceptedDispatches: Map<string, { requestId: string; messageId: string; brokerEpoch: string }>;
+    pendingDispatches: Map<string, Set<{ client: IntercomClient; terminalMessageId?: string }>>;
   }>();
+  let nextExtensionGeneration = 1;
+  const pendingExtensionStateCommits = new WeakMap<IntercomClient, Map<string, number[]>>();
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   let currentIntercomSessionId: string | null = null;
@@ -545,8 +566,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let agentRunning = false;
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
+  const staleAsks = new StaleAsks();
   const seenInboundMessages = new Map<string, number>();
-  const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; detail?: string }>();
+  const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; code?: "E_DELIVERY_TOO_LARGE"; detail?: string }>();
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
   }
@@ -597,11 +619,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   let replyWaiter: {
     from: string;
+    fromType: "id" | "name";
     replyTo: string;
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
   } | null = null;
-  function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
+  function classifyAbandonedAsk(replyTo: string, sessionId: string, tier: StaleAskTier): void {
+    staleAsks.record(replyTo, sessionId, tier);
+  }
+  function waitForReply(target: ResolvedSessionTarget, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
+    const from = target.matchedBy === "name" ? target.name! : target.id;
     if (replyWaiter) {
       return Promise.reject(new Error("Already waiting for a reply"));
     }
@@ -610,6 +637,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        classifyAbandonedAsk(replyTo, target.id, "timed_out");
         const timeoutDescription = askTimeoutMs % 60000 === 0 ? `${askTimeoutMs / 60000} minutes` : `${askTimeoutMs}ms`;
         rejectReplyWaiter(new Error(`No reply from "${from}" for message ${replyTo} within ${timeoutDescription}. Last known delivery state: ${getDeliveryState()}. This waiter timeout is not cancellation; the delivered message may still be queued or actionable in the recipient session.`));
       }, askTimeoutMs);
@@ -621,6 +649,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
       };
       const onAbort = () => {
+        classifyAbandonedAsk(replyTo, target.id, "cancelled");
         cancelOnAbort?.();
         cleanup();
         reject(new Error("Cancelled"));
@@ -628,6 +657,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       signal?.addEventListener("abort", onAbort, { once: true });
       replyWaiter = {
         from,
+        fromType: target.matchedBy,
         replyTo,
         resolve: (message) => {
           cleanup();
@@ -706,22 +736,33 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       // One local extension must not break intercom or other extension channels.
     }
   }
-  function createExtensionChannel(namespace: string): IntercomExtensionChannel {
+  function createExtensionChannel(namespace: string, generation: number): IntercomExtensionChannel {
+    const current = () => localExtensions.get(namespace)?.generation === generation;
+    const requireCurrent = () => {
+      if (!current()) throw new Error(`Extension channel ${namespace} is disposed`);
+      return localExtensions.get(namespace)!;
+    };
     return {
       namespace,
       snapshot() {
-        const extension = localExtensions.get(namespace);
+        const extension = requireCurrent();
         return {
           connected: Boolean(client?.isConnected()),
           supported: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
+          ...(client?.brokerEpoch ? { brokerEpoch: client.brokerEpoch } : {}),
+          capabilities: {
+            extensionBus: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
+            ...(client?.supportsFeature(EXTENSION_STATE_REFRESH_FEATURE) ? { extensionStateRefreshVersion: 1 as const } : {}),
+            ...(client?.supportsFeature(OPAQUE_DISPATCH_FEATURE) ? { opaqueDispatchVersion: 1 as const } : {}),
+          },
           ...(extension?.owner ? { owner: extension.owner } : {}),
           ...(extension?.state ? { state: extension.state } : {}),
         };
       },
       publish(payload, options = {}) {
+        const extension = requireCurrent();
         const activeClient = client;
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        const extension = localExtensions.get(namespace);
         const ownerOnly = options.ownerOnly ?? false;
         const ownerEpoch = ownerOnly ? extension?.owner?.epoch : undefined;
         if (ownerOnly && !ownerEpoch) throw new Error(`No owner is available for ${namespace}`);
@@ -734,25 +775,159 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         });
       },
       commitState(payload, expectedRevision) {
+        const extension = requireCurrent();
         const activeClient = client;
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        const extension = localExtensions.get(namespace);
         const ownerEpoch = extension?.owner?.epoch;
         if (!ownerEpoch || extension.owner?.sessionId !== activeClient.sessionId) {
           throw new Error(`Current session is not the owner of ${namespace}`);
         }
-        activeClient.sendExtensionMessage({
-          type: "extension_state_commit",
-          namespace,
-          ownerEpoch,
-          expectedRevision: expectedRevision ?? extension.state?.revision ?? 0,
-          payload,
-        });
+        let pendingByNamespace = pendingExtensionStateCommits.get(activeClient);
+        if (!pendingByNamespace) {
+          pendingByNamespace = new Map();
+          pendingExtensionStateCommits.set(activeClient, pendingByNamespace);
+        }
+        const pendingGenerations = pendingByNamespace.get(namespace) ?? [];
+        pendingByNamespace.set(namespace, pendingGenerations);
+        pendingGenerations.push(generation);
+        try {
+          activeClient.sendExtensionMessage({
+            type: "extension_state_commit",
+            namespace,
+            ownerEpoch,
+            expectedRevision: expectedRevision ?? extension.state?.revision ?? 0,
+            payload,
+          });
+        } catch (error) {
+          pendingGenerations.pop();
+          if (pendingGenerations.length === 0) pendingByNamespace.delete(namespace);
+          throw error;
+        }
+      },
+      async refreshState() {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected()) return { ok: false as const, code: "connection_lost" as const };
+        if (!activeClient.supportsFeature(EXTENSION_STATE_REFRESH_FEATURE)) {
+          return { ok: false as const, code: "unsupported_broker" as const };
+        }
+        try {
+          const state = await activeClient.refreshExtensionState(namespace);
+          if (!current()) return { ok: false as const, code: "connection_lost" as const };
+          const extension = localExtensions.get(namespace);
+          if (extension) {
+            if (state.present) extension.state = { revision: state.revision, payload: state.payload };
+            else delete extension.state;
+          }
+          return { ok: true as const, state };
+        } catch {
+          return { ok: false as const, code: "connection_lost" as const };
+        }
       },
       async listSessions() {
         const activeClient = client;
-        if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        return activeClient.listSessions();
+        if (!current() || !activeClient?.isConnected()) throw new Error("Intercom is not connected");
+        const sessions = await activeClient.listSessions();
+        if (!current()) throw new Error(`Extension channel ${namespace} is disposed`);
+        return sessions;
+      },
+      async peerCapability(sessionId, recipientNamespace) {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+          return { state: "unknown" as const };
+        }
+        try {
+          const result = await activeClient.peerCapability(sessionId, recipientNamespace);
+          return current() ? result : { state: "unknown" as const };
+        } catch { return { state: "unknown" as const }; }
+      },
+      async sendOpaqueDispatch(input) {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected()) {
+          return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+        }
+        if (!activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+          return { accepted: false as const, requestId: input.requestId, code: "unsupported_broker" as const };
+        }
+        const extension = localExtensions.get(namespace);
+        if (!extension || extension.generation !== generation) {
+          return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+        }
+        const dispatchAttempt: { client: IntercomClient; terminalMessageId?: string } = { client: activeClient };
+        const pendingAttempts = extension.pendingDispatches.get(input.requestId) ?? new Set();
+        pendingAttempts.add(dispatchAttempt);
+        extension.pendingDispatches.set(input.requestId, pendingAttempts);
+        try {
+          const result = await activeClient.sendOpaqueDispatch(namespace, input);
+          if (!current() || client !== activeClient) {
+            return { accepted: false as const, requestId: input.requestId, code: "connection_lost" as const };
+          }
+          if (result.accepted && extension.generation === generation) {
+            if (dispatchAttempt.terminalMessageId === undefined) {
+              extension.acceptedDispatches.set(result.messageId, {
+                requestId: result.requestId,
+                messageId: result.messageId,
+                brokerEpoch: result.brokerEpoch,
+              });
+            } else if (dispatchAttempt.terminalMessageId !== result.messageId) {
+              return { accepted: false as const, requestId: input.requestId, code: "invalid_frame" as const };
+            }
+          }
+          return result;
+        } catch (error) {
+          return { accepted: false as const, requestId: input.requestId, code: opaqueErrorReason(error, "connection_lost") };
+        } finally {
+          const activeAttempts = extension.pendingDispatches.get(input.requestId);
+          if (activeAttempts?.delete(dispatchAttempt) && activeAttempts.size === 0) {
+            extension.pendingDispatches.delete(input.requestId);
+          }
+        }
+      },
+      async cancelMessage(messageId) {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected()) {
+          return { cancelled: false as const, code: "connection_lost" as const };
+        }
+        if (!activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+          return { cancelled: false as const, code: "unsupported_broker" as const };
+        }
+        try {
+          const result = await activeClient.cancelOpaqueDispatch(namespace, messageId);
+          return current() && client === activeClient ? result : { cancelled: false as const, code: "connection_lost" as const };
+        } catch (error) { return { cancelled: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
+      },
+      async reconcileClaim(input) {
+        const activeClient = client;
+        if (!current() || !activeClient?.isConnected() || !activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+          return { state: "indeterminate" as const, code: "claim_history_unavailable" as const };
+        }
+        try {
+          const result = await activeClient.reconcileOpaqueClaim(namespace, input);
+          return current() ? result : { state: "indeterminate" as const, code: "claim_history_unavailable" as const };
+        } catch { return { state: "indeterminate" as const, code: "claim_history_unavailable" as const }; }
+      },
+      dispose() {
+        if (!current()) return;
+        const extension = localExtensions.get(namespace);
+        const activeClient = client;
+        if (extension) {
+          for (const [messageId, reservation] of extension.reservations) {
+            if (activeClient?.isConnected() && activeClient.supportsFeature(OPAQUE_DISPATCH_FEATURE)) {
+              try {
+                activeClient.sendOpaqueReservationResult(messageId, reservation.reservationId, "failed_closed", "consumer_unloaded");
+              } catch {
+                // Capability removal still makes the broker fail closed if the write cannot be queued.
+              }
+            }
+            reservation.controller.abort("consumer_unloaded");
+          }
+          extension.reservations.clear();
+          extension.acceptedDispatches.clear();
+          extension.pendingDispatches.clear();
+        }
+        localExtensions.delete(namespace);
+        if (activeClient?.isConnected() && activeClient.supportsFeature(EXTENSION_BUS_FEATURE)) {
+          activeClient.updateExtensionCapabilities(currentExtensionCapabilities());
+        }
       },
     };
   }
@@ -760,17 +935,43 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return [...localExtensions.values()].map(({ registration }) => ({
       namespace: registration.namespace,
       ownerEligible: registration.ownerEligible,
+      ...(registration.opaqueDispatch ? {
+        opaqueDispatch: { version: 1 as const, roles: [...registration.opaqueDispatch.roles] },
+      } : {}),
     }));
   }
   function registerLocalExtension(registration: IntercomExtensionRegistration): void {
+    const unavailable = () => {
+      try { registration.onUnavailable?.("unsupported_host"); }
+      catch { /* A rejected consumer callback cannot break intercom registration. */ }
+    };
     if (!/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(registration.namespace)) {
-      throw new Error(`Invalid intercom extension namespace: ${registration.namespace}`);
+      unavailable();
+      return;
     }
     if (localExtensions.has(registration.namespace)) {
-      throw new Error(`Intercom extension namespace already registered: ${registration.namespace}`);
+      unavailable();
+      return;
     }
-    const channel = createExtensionChannel(registration.namespace);
-    localExtensions.set(registration.namespace, { registration, channel });
+    const roles = registration.opaqueDispatch?.roles;
+    if (registration.opaqueDispatch) {
+      if (registration.opaqueDispatch.version !== 1 || !Array.isArray(roles) || roles.length === 0
+        || roles.some((role) => role !== "send" && role !== "receive") || new Set(roles).size !== roles.length
+        || (roles.includes("receive") && typeof registration.opaqueDispatch.onReserve !== "function")) {
+        unavailable();
+        return;
+      }
+    }
+    const generation = nextExtensionGeneration++;
+    const channel = createExtensionChannel(registration.namespace, generation);
+    localExtensions.set(registration.namespace, {
+      registration,
+      channel,
+      generation,
+      reservations: new Map(),
+      acceptedDispatches: new Map(),
+      pendingDispatches: new Map(),
+    });
     const activeClient = client;
     const connected = Boolean(activeClient?.isConnected());
     const supported = Boolean(activeClient?.supportsFeature(EXTENSION_BUS_FEATURE));
@@ -935,10 +1136,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     const receivedMessage = { ...message, receiverReceivedAt };
     emitMessageReceipt(receivedMessage.id, "receiver_received");
+    if (receivedMessage.replyTo) {
+      const tier = staleAsks.classify(receivedMessage.replyTo, from.id);
+      if (tier === "cancelled" || tier === "superseded") {
+        emitMessageReceipt(receivedMessage.id, "acknowledged", `late reply dropped after ${tier}`);
+        return;
+      }
+      if (tier === "timed_out") {
+        receivedMessage.content = {
+          ...receivedMessage.content,
+          text: `[Late reply to abandoned ask ${receivedMessage.replyTo}]\n\n${receivedMessage.content.text}`,
+        };
+        staleAsks.delete(receivedMessage.replyTo);
+      }
+    }
     if (replyWaiter) {
-      const senderTarget = from.name || from.id;
-      const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase()
-        || from.id === replyWaiter.from;
+      const fromMatches = replyWaiter.fromType === "id"
+        ? from.id === replyWaiter.from
+        : from.name?.toLowerCase() === replyWaiter.from.toLowerCase();
       const replyMatches = receivedMessage.replyTo === replyWaiter.replyTo;
       if (fromMatches && replyMatches) {
         emitMessageReceipt(receivedMessage.id, "acknowledged", "matched reply waiter");
@@ -964,7 +1179,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       if (!activeContext.isIdle()) {
         if (!activeContext.hasUI) {
           const activeClient = client;
-          if (!message.replyTo && activeClient?.isConnected()) {
+          if (message.expectsReply && activeClient?.isConnected()) {
             try {
               const result = await activeClient.send(from.id, {
                 text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
@@ -988,6 +1203,148 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     })();
   }
   function attachClientHandlers(nextClient: IntercomClient): void {
+    nextClient.onOpaqueDispatch((frame) => {
+      if (client !== nextClient) return;
+      if (frame.type === "opaque_dispatch_v1_offer") {
+        const extension = localExtensions.get(frame.recipientNamespace);
+        const registration = extension?.registration.opaqueDispatch;
+        if (!extension || !registration?.roles.includes("receive") || !registration.onReserve) {
+          try {
+            nextClient.sendOpaqueReservationResult(frame.messageId, frame.reservationId, "failed_closed", "consumer_missing");
+          } catch {
+            // A private consumer failure must not break the conversational connection.
+          }
+          return;
+        }
+        const generation = extension.generation;
+        const controller = new AbortController();
+        const superseded = extension.reservations.get(frame.messageId);
+        if (superseded && superseded.reservationId !== frame.reservationId) {
+          // A newer attempt invalidates the previous reservation without implying that the
+          // underlying dispatch itself was superseded by another message.
+          superseded.controller.abort("stale_reservation");
+        }
+        extension.reservations.set(frame.messageId, { controller, reservationId: frame.reservationId });
+        let reservationDecisionSent = false;
+        let releaseReservationDecision: (() => void) | undefined;
+        const reservationDecisionSentPromise = new Promise<void>((resolve) => {
+          releaseReservationDecision = resolve;
+        });
+        const afterReservationDecision = async <T>(action: () => Promise<T>): Promise<T> => {
+          if (!reservationDecisionSent) await reservationDecisionSentPromise;
+          return action();
+        };
+        const reservation: OpaqueDispatchReservation = {
+          messageId: frame.messageId,
+          reservationId: frame.reservationId,
+          attempt: frame.attempt,
+          signal: controller.signal,
+          async claim() {
+            return afterReservationDecision(async () => {
+              if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
+                return { claimed: false as const, code: "stale_reservation" as const };
+              }
+              try { return await nextClient.claimOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
+              catch (error) { return { claimed: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
+              finally {
+                const active = localExtensions.get(frame.recipientNamespace);
+                if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
+                  active.reservations.delete(frame.messageId);
+                }
+              }
+            });
+          },
+          async fail() {
+            return afterReservationDecision(async () => {
+              if (localExtensions.get(frame.recipientNamespace)?.generation !== generation || controller.signal.aborted) {
+                return { failedClosed: false as const, code: "stale_reservation" as const };
+              }
+              try { return await nextClient.failOpaqueDispatch(frame.recipientNamespace, frame.messageId, frame.reservationId); }
+              catch (error) { return { failedClosed: false as const, code: opaqueErrorReason(error, "connection_lost") }; }
+              finally {
+                const active = localExtensions.get(frame.recipientNamespace);
+                if (active?.generation === generation && active.reservations.get(frame.messageId)?.reservationId === frame.reservationId) {
+                  active.reservations.delete(frame.messageId);
+                }
+              }
+            });
+          },
+        };
+        let decision: unknown;
+        try {
+          decision = registration.onReserve({
+            requestId: frame.requestId,
+            messageId: frame.messageId,
+            attempt: frame.attempt,
+            brokerEpoch: frame.brokerEpoch,
+            endpointEpoch: frame.endpointEpoch,
+            toSessionId: frame.toSessionId,
+            recipientNamespace: frame.recipientNamespace,
+            sender: frame.sender,
+            payload: frame.payload,
+            receivedAt: Date.now(),
+            reserveBy: frame.reserveBy,
+          }, reservation);
+        } catch {
+          decision = "consumer_threw" satisfies OpaqueDispatchReason;
+        }
+        if (decision === "reserved" || decision === "refused") {
+          try {
+            nextClient.sendOpaqueReservationResult(frame.messageId, frame.reservationId, decision);
+            reservationDecisionSent = true;
+            releaseReservationDecision?.();
+          } catch {
+            controller.abort("connection_lost");
+            extension.reservations.delete(frame.messageId);
+            reservationDecisionSent = true;
+            releaseReservationDecision?.();
+          }
+        } else {
+          const reason: OpaqueDispatchReason = decision === "consumer_threw" ? "consumer_threw" : "malformed_consumer_result";
+          try {
+            nextClient.sendOpaqueReservationResult(frame.messageId, frame.reservationId, "failed_closed", reason);
+          } catch {
+            // Local abort below is the fail-closed fence when the result cannot be queued.
+          }
+          controller.abort(reason);
+          extension.reservations.delete(frame.messageId);
+          reservationDecisionSent = true;
+          releaseReservationDecision?.();
+        }
+        return;
+      }
+      if (frame.type === "opaque_dispatch_v1_reservation_ended") {
+        for (const extension of localExtensions.values()) {
+          const active = extension.reservations.get(frame.messageId);
+          if (active?.reservationId !== frame.reservationId) continue;
+          active.controller.abort(frame.reason ?? frame.outcome);
+          extension.reservations.delete(frame.messageId);
+          break;
+        }
+        return;
+      }
+      const extension = localExtensions.get(frame.senderNamespace);
+      try {
+        extension?.registration.opaqueDispatch?.onReceipt?.(frame.receipt);
+      } catch {
+        // Consumer callbacks are private and cannot tear down the shared socket.
+      } finally {
+        if (extension && extension.generation === localExtensions.get(frame.senderNamespace)?.generation) {
+          if (frame.receipt.status !== "queued" && frame.receipt.status !== "reserved") {
+            if (!extension.acceptedDispatches.delete(frame.receipt.messageId)) {
+              for (const attempt of extension.pendingDispatches.get(frame.receipt.requestId) ?? []) {
+                if (attempt.client === nextClient) attempt.terminalMessageId = frame.receipt.messageId;
+              }
+            }
+          }
+          try {
+            nextClient.ackOpaqueReceipt(frame.senderNamespace, frame.receipt.messageId, frame.receipt.sequence);
+          } catch {
+            // The broker will replay an unacknowledged receipt after reconnect.
+          }
+        }
+      }
+    });
     nextClient.onBrokerMessage((message: BrokerMessage) => {
       if (client !== nextClient) return;
       switch (message.type) {
@@ -995,6 +1352,25 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           const supported = message.features?.includes(EXTENSION_BUS_FEATURE) ?? false;
           if (supported && localExtensions.size > 0) {
             nextClient.updateExtensionCapabilities(currentExtensionCapabilities());
+          }
+          for (const extension of localExtensions.values()) {
+            delete extension.state;
+            extension.pendingDispatches.clear();
+            const opaqueSupported = message.features?.includes(OPAQUE_DISPATCH_FEATURE) ?? false;
+            for (const dispatch of [...extension.acceptedDispatches.values()]) {
+              if (opaqueSupported && message.brokerEpoch === dispatch.brokerEpoch) continue;
+              try {
+                extension.registration.opaqueDispatch?.onTransportIndeterminate?.({
+                  requestId: dispatch.requestId,
+                  messageId: dispatch.messageId,
+                  previousBrokerEpoch: dispatch.brokerEpoch,
+                  ...(opaqueSupported && message.brokerEpoch ? { currentBrokerEpoch: message.brokerEpoch } : {}),
+                });
+              } catch {
+                // One extension callback cannot break intercom or another namespace.
+              }
+              extension.acceptedDispatches.delete(dispatch.messageId);
+            }
           }
           for (const namespace of localExtensions.keys()) {
             emitLocalExtensionEvent(namespace, { type: "connection", connected: true, supported });
@@ -1030,7 +1406,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           emitLocalExtensionEvent(message.namespace, { type: "state", state: extension.state });
           break;
         }
-        case "extension_state_result":
+        case "extension_state_result": {
+          const pendingByNamespace = pendingExtensionStateCommits.get(nextClient);
+          const pendingGenerations = pendingByNamespace?.get(message.namespace);
+          const generation = pendingGenerations?.shift();
+          if (pendingGenerations?.length === 0) pendingByNamespace?.delete(message.namespace);
+          if (generation !== localExtensions.get(message.namespace)?.generation) break;
           emitLocalExtensionEvent(message.namespace, {
             type: "state_result",
             committed: message.committed,
@@ -1038,10 +1419,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             ...(message.reason ? { reason: message.reason } : {}),
           });
           break;
+        }
         case "message_receipt":
           latestOutboundReceipts.set(message.receipt.messageId, {
             status: message.receipt.status,
             timestamp: message.receipt.timestamp,
+            ...(message.receipt.code ? { code: message.receipt.code } : {}),
             ...(message.receipt.detail ? { detail: message.receipt.detail } : {}),
           });
           break;
@@ -1079,6 +1462,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       rejectReplyWaiter(new Error(`Disconnected while waiting for reply: ${error.message}`, { cause: error }));
       for (const [namespace, extension] of localExtensions) {
         extension.owner = undefined;
+        for (const reservation of extension.reservations.values()) reservation.controller.abort("receiver_disconnected");
+        extension.reservations.clear();
+        extension.pendingDispatches.clear();
         emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
         emitLocalExtensionEvent(namespace, { type: "owner" });
       }
@@ -1127,7 +1513,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (reconnectPromise && reconnectPromiseGeneration === generationAtStart) {
       return reconnectPromise;
     }
-    const nextReconnectPromise = (async () => {
+    // Declared before the IIFE so the `finally` below can compare identity without TS treating
+    // the binding as read-before-assignment. The `finally` cannot run before assignment completes,
+    // because the first statement inside the IIFE that can suspend is the `await` further down.
+    let nextReconnectPromise: Promise<IntercomClient> | null = null;
+    nextReconnectPromise = (async () => {
       const nextClient = new IntercomClient();
       client = nextClient;
       attachClientHandlers(nextClient);
@@ -1160,11 +1550,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
+  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<ResolvedSessionTarget | null> {
     const sessions = await activeClient.listSessions();
     const byId = sessions.find(s => s.id === nameOrId);
     if (byId) {
-      return byId.id;
+      return { id: byId.id, matchedBy: "id" };
     }
     const lowerName = nameOrId.toLowerCase();
     const byName = sessions.filter(s => s.name?.toLowerCase() === lowerName);
@@ -1174,19 +1564,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       throw new Error(`Multiple sessions named "${nameOrId}" are connected. Address one by the id shown in parentheses by "list" (${ids}).`);
     }
     if (byName.length === 1) {
-      return byName[0]!.id;
+      return { id: byName[0]!.id, matchedBy: "name", name: byName[0]!.name! };
     }
 
     const byIdPrefix = sessions.filter(s => s.id.startsWith(nameOrId));
     if (byIdPrefix.length === 1) {
-      return byIdPrefix[0]!.id;
+      return { id: byIdPrefix[0]!.id, matchedBy: "id" };
     }
     if (byIdPrefix.length > 1) {
       throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
     }
     return null;
   }
-  async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
+  async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<ResolvedSessionTarget | null> {
     if (metadata.orchestratorSessionId) {
       const bySessionId = await resolveSessionTarget(activeClient, metadata.orchestratorSessionId);
       if (bySessionId) {
@@ -1222,7 +1612,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ...(options.to ? { to: options.to } : {}),
     });
     if (existing.kind === "found" && existing.session) {
-      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
+      const matchedBy = options.to && existing.session.name?.toLowerCase() === options.to.toLowerCase() ? "name" : "id";
+      return { id: existing.session.id, matchedBy, ...(matchedBy === "name" ? { name: existing.session.name! } : {}), label: options.to || existing.session.name || existing.session.id };
     }
     if (!options.openProjectPaneIfMissing) {
       throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to open a Herdr project pane and start Pi there.`);
@@ -1237,7 +1628,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ...(options.to ? { to: options.to } : {}),
       signal: options.signal,
     });
-    return { id: session.id, label: session.name || session.id, projectPane };
+    const matchedBy = options.to && session.name?.toLowerCase() === options.to.toLowerCase() ? "name" : "id";
+    return { id: session.id, matchedBy, ...(matchedBy === "name" ? { name: session.name! } : {}), label: session.name || session.id, projectPane };
   }
   function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
     const liveContext = getLiveContext();
@@ -1271,6 +1663,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function startSessionRuntime(ctx: ExtensionContext): void {
     const previousClient = client;
+    for (const extension of localExtensions.values()) {
+      for (const reservation of extension.reservations.values()) {
+        reservation.controller.abort("receiver_disconnected");
+      }
+      extension.reservations.clear();
+      for (const [requestId, attempts] of extension.pendingDispatches) {
+        for (const attempt of attempts) {
+          if (attempt.client === previousClient) attempts.delete(attempt);
+        }
+        if (attempts.size === 0) extension.pendingDispatches.delete(requestId);
+      }
+    }
     shuttingDown = false;
     disposed = false;
     runtimeStarted = true;
@@ -1330,11 +1734,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!parsed) return;
 
     const relayGeneration = runtimeGeneration;
-    void (async () => {
-      const relayStillLive = () => !runtimeStarted || Boolean(getLiveContext(runtimeContext, relayGeneration));
-      if (!relayStillLive()) {
-        return;
+    const relayStillLive = () => config.enabled && Boolean(getLiveContext(runtimeContext, relayGeneration));
+    if (!relayStillLive()) {
+      if (options.acknowledge) {
+        emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
       }
+      return;
+    }
+
+    void (async () => {
       if (currentSessionTargetMatches(parsed.to)) {
         deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
@@ -1345,15 +1753,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       let target: string;
       try {
         activeClient = await ensureConnected("background");
-        target = await resolveSessionTarget(activeClient, parsed.to) ?? parsed.to;
+        target = (await resolveSessionTarget(activeClient, parsed.to))?.id ?? parsed.to;
       } catch (error) {
-        if (!relayStillLive()) return;
+        if (!relayStillLive()) {
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+          return;
+        }
         recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, false, error);
         return;
       }
 
       if (!relayStillLive()) {
+        if (options.acknowledge) {
+          emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+        }
         return;
       }
       if (currentSessionTargetMatches(parsed.to, target, activeClient)) {
@@ -1364,7 +1778,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
       try {
         const result = await activeClient.send(target, { text: parsed.message });
-        if (!relayStillLive()) return;
+        if (!relayStillLive()) {
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+          return;
+        }
         if (!result.delivered) {
           const error = new Error(result.reason ?? "Session may not exist or has disconnected.");
           recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
@@ -1373,7 +1790,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
       } catch (error) {
-        if (!relayStillLive()) return;
+        if (!relayStillLive()) {
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, new Error("Intercom runtime is not active"));
+          return;
+        }
         recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, false, error);
       }
@@ -1388,11 +1808,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       || typeof registration.onEvent !== "function"
       || typeof registration.onReady !== "function"
     ) {
+      try { registration.onUnavailable?.("unsupported_host"); }
+      catch { /* A rejected consumer callback cannot break the host event bus. */ }
       return;
     }
     registerLocalExtension(registration as IntercomExtensionRegistration);
   });
-  pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, { version: 1 });
+  pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, {
+    version: 2,
+    capabilities: { extensionBus: 1, extensionStateRefresh: 1, opaqueDispatch: 1 },
+  });
   const unsubscribeSubagentControlIntercom = pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
     relaySubagentIntercomPayload(payload, {
       sender: "subagent-control",
@@ -1428,6 +1853,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
+    staleAsks.clear();
+    for (const extension of localExtensions.values()) {
+      for (const reservation of extension.reservations.values()) {
+        reservation.controller.abort("receiver_disconnected");
+      }
+      extension.reservations.clear();
+      extension.acceptedDispatches.clear();
+      extension.pendingDispatches.clear();
+    }
     agentRunning = false;
     activeTools.clear();
     if (client) {
@@ -1605,7 +2039,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
 
         const metadata = childOrchestratorMetadata;
-        let resolvedSupervisor: string | null;
+        let resolvedSupervisor: ResolvedSessionTarget | null;
         try {
           resolvedSupervisor = await resolveSupervisorTarget(connectedClient, metadata);
         } catch (error) {
@@ -1620,7 +2054,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             details: { error: true },
           };
         }
-        const sendTo = resolvedSupervisor ?? metadata.orchestratorTarget;
+        const supervisorTarget = resolvedSupervisor ?? { id: metadata.orchestratorTarget, matchedBy: "name" as const, name: metadata.orchestratorTarget };
+        const sendTo = supervisorTarget.id;
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
@@ -1678,7 +2113,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         let questionId: string | null = null;
         try {
           questionId = randomUUID();
-          replyPromise = waitForReply(sendTo, questionId, signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
+          replyPromise = waitForReply(supervisorTarget, questionId, signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
           replyPromise.catch(() => undefined);
           if (signal?.aborted) {
             rejectReplyWaiter(new Error("Cancelled"));
@@ -2020,9 +2455,20 @@ Usage:
                 };
               }
             }
-            const target: DeliveryTarget = cwd
-              ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal })
-              : { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
+            let target: DeliveryTarget;
+            if (cwd) {
+              target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
+            } else if (to) {
+              const resolved = await resolveSessionTarget(connectedClient, to);
+              target = resolved ? { ...resolved, label: to } : { id: to, matchedBy: "id", label: to };
+            } else {
+              // Unreachable given the guard above, which returns when both `to` and `cwd` are absent.
+              // Kept as a typed exit so `to` narrows to string in the branch that needs it.
+              return {
+                content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
+                details: { error: true },
+              };
+            }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
             if (sendTo === connectedClient.sessionId) {
@@ -2058,6 +2504,9 @@ Usage:
                 content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
                 details: deliveryDetails(result),
               };
+            }
+            if (supersedes) {
+              classifyAbandonedAsk(supersedes, sendTo, "superseded");
             }
             pi.appendEntry("intercom_sent", {
               to: targetDisplay,
@@ -2124,7 +2573,7 @@ Usage:
             let target: DeliveryTarget;
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
-            } else {
+            } else if (to) {
               const resolved = await resolveSessionTarget(connectedClient, to);
               if (!resolved) {
                 return {
@@ -2132,7 +2581,13 @@ Usage:
                   details: { error: true },
                 };
               }
-              target = { id: resolved, label: to };
+              target = { ...resolved, label: to };
+            } else {
+              // Unreachable given the guard above; kept as a typed exit so `to` narrows to string.
+              return {
+                content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
+                details: { error: true },
+              };
             }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
@@ -2155,7 +2610,7 @@ Usage:
               };
             }
             questionId = randomUUID();
-            replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
+            replyPromise = waitForReply(target, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
             replyPromise.catch(() => undefined);
             const sendResult = await connectedClient.send(sendTo, {
               messageId: questionId,
@@ -2182,6 +2637,9 @@ Usage:
                 content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
                 details: { error: true, ...deliveryDetails(sendResult) },
               };
+            }
+            if (supersedes) {
+              classifyAbandonedAsk(supersedes, sendTo, "superseded");
             }
             pi.appendEntry("intercom_sent", {
               to: targetDisplay,
