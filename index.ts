@@ -618,8 +618,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
   } | null = null;
-  function classifyAbandonedAsk(replyTo: string, principal: string, tier: StaleAskTier): void {
-    staleAsks.record(replyTo, principal, tier);
+  function classifyAbandonedAsk(replyTo: string, sessionId: string, tier: StaleAskTier): void {
+    staleAsks.record(replyTo, { type: "session_id", value: sessionId }, tier);
   }
   function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
     if (replyWaiter) {
@@ -1129,8 +1129,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const receivedMessage = { ...message, receiverReceivedAt };
     emitMessageReceipt(receivedMessage.id, "receiver_received");
     if (receivedMessage.replyTo) {
-      const tier = staleAsks.classify(receivedMessage.replyTo, from.id)
-        ?? (from.name ? staleAsks.classify(receivedMessage.replyTo, from.name) : undefined);
+      const tier = staleAsks.classify(receivedMessage.replyTo, { type: "session_id", value: from.id })
+        ?? (from.name ? staleAsks.classify(receivedMessage.replyTo, { type: "session_name", value: from.name }) : undefined);
       if (tier === "cancelled" || tier === "superseded") {
         emitMessageReceipt(receivedMessage.id, "acknowledged", `late reply dropped after ${tier}`);
         return;
