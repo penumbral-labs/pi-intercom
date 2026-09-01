@@ -38,6 +38,7 @@ function normalizeWindowsAgentDir(agentDir: string): string {
 }
 
 function pipeAgentDirHash(normalizedAgentDir: string): string {
+  // Hex is a Windows-valid pipe token; do not expose the drive-letter colon in the identity suffix.
   return createHash("sha256").update(normalizedAgentDir).digest("hex").slice(0, 16);
 }
 

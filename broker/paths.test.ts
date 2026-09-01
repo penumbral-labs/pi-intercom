@@ -38,9 +38,10 @@ test("getIntercomDirPath points at the intercom runtime directory under the agen
   assert.equal(getIntercomDirPath("/tmp/pi-agent"), join("/tmp/pi-agent", "intercom"));
 });
 
-test("getBrokerSocketPath uses named pipe on Windows", () => {
+test("getBrokerSocketPath uses a Windows-safe named-pipe token", () => {
   const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh/.pi/agent");
   assert.match(pipePath, /^\\\\\.\\pipe\\pi-intercom-/);
+  assert.doesNotMatch(pipePath.slice("\\\\.\\pipe\\".length), /[<>:"/\\|?*]/);
   assert.doesNotMatch(pipePath, /broker\.sock$/);
 });
 
@@ -151,7 +152,7 @@ test("runtime permission helpers skip chmod on Windows paths", () => {
   }
 });
 
-test("getBrokerSocketPath suffixes the Windows pipe with a 16-hex normalized-input hash", () => {
+test("getBrokerSocketPath suffixes the Windows pipe with a safe normalized-input token", () => {
   const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh/.pi/agent");
   assert.match(pipePath, /^\\\\\.\\pipe\\pi-intercom-.*-[0-9a-f]{16}$/);
 });

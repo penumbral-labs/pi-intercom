@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getAskTimeoutMs, getConfigPath, loadConfig, MAX_ASK_TIMEOUT_MS } from "./config.ts";
+import {
+  getAskTimeoutMs,
+  getConfigPath,
+  getPendingAskPruneIntervalMs,
+  loadConfig,
+  MAX_ASK_TIMEOUT_MS,
+} from "./config.ts";
 
 async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -87,6 +93,14 @@ test("loadConfig rejects invalid inboundTrigger values", async () => {
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("getPendingAskPruneIntervalMs preserves valid delays and defaults unsafe timer values", () => {
+  assert.equal(getPendingAskPruneIntervalMs("1"), 1);
+  assert.equal(getPendingAskPruneIntervalMs(String(MAX_ASK_TIMEOUT_MS)), MAX_ASK_TIMEOUT_MS);
+  for (const raw of [undefined, "", "NaN", "0", "-1", String(MAX_ASK_TIMEOUT_MS + 1)]) {
+    assert.equal(getPendingAskPruneIntervalMs(raw), 60_000);
   }
 });
 

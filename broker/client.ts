@@ -461,7 +461,9 @@ export class IntercomClient extends EventEmitter {
         const { from, message, control } = brokerMessage;
         if (!isSessionInfo(from) || !isMessage(message)
           || (control !== undefined && (!isMessageControl(control)
-            || control.action !== "supersede" || control.supersededBy !== message.id))) {
+            || control.action !== "supersede"
+            || control.supersededBy !== message.id
+            || message.supersedes !== control.messageId))) {
           throw new Error("Invalid message event");
         }
         if (control) {

@@ -32,7 +32,7 @@ import {
   restrictIntercomRuntimeFile,
   type BrokerConnectTarget,
 } from "./paths.ts";
-import { getAskTimeoutMs } from "../config.ts";
+import { getAskTimeoutMs, getPendingAskPruneIntervalMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
 import {
   ATOMIC_SUPERSEDE_FEATURE,
@@ -58,6 +58,9 @@ import { OpaqueDispatchManager, writeOpaqueTo, type OpaqueEndpoint } from "./opa
 import { pruneDisconnectedSessions } from "./disconnected-sessions.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
+// Resolve the Windows pipe only after the directory exists, so direct broker starts and clients
+// both hash the filesystem-canonical agent path. Its digest suffix is a Windows-valid safe token.
+ensureIntercomRuntimeDir(INTERCOM_DIR);
 const LISTEN_TARGET = getBrokerListenTarget();
 const PID_PATH = join(INTERCOM_DIR, "broker.pid");
 const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
@@ -83,9 +86,7 @@ const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
 const MAX_RATE_LIMITED_OPAQUE_OPERATIONS = 256;
 const MAX_DELIVERY_RECORDS = 4096;
-const PENDING_ASK_PRUNE_INTERVAL_MS = process.env.PI_INTERCOM_TEST_PENDING_ASK_PRUNE_INTERVAL_MS
-  ? Number(process.env.PI_INTERCOM_TEST_PENDING_ASK_PRUNE_INTERVAL_MS)
-  : 60 * 1000;
+const PENDING_ASK_PRUNE_INTERVAL_MS = getPendingAskPruneIntervalMs();
 const BROKER_STARTED_AT = Date.now();
 
 function deliveryRecordNow(): number {
