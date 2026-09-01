@@ -86,15 +86,17 @@ test("atomic supersede messages emit control before replacement", () => {
   });
 
   assert.deepEqual(events, ["control", "message"]);
-  assert.throws(
-    () => (client as any).handleBrokerMessage({
-      type: "message",
-      from,
-      control: { action: "supersede", messageId: "different-original", supersededBy: "replacement", timestamp: 2 },
-      message,
-    }),
-    /Invalid message event/,
-  );
+  for (const control of [
+    { action: "supersede", messageId: "different-original", supersededBy: "replacement", timestamp: 2 },
+    { action: "supersede", messageId: "original", supersededBy: "different-replacement", timestamp: 2 },
+    { action: "cancel", messageId: "original", timestamp: 2 },
+  ]) {
+    assert.throws(
+      () => (client as any).handleBrokerMessage({ type: "message", from, control, message }),
+      /Invalid message event/,
+    );
+  }
+  assert.deepEqual(events, ["control", "message"], "invalid transactions must not emit either event");
 });
 
 test("correlated operation results settle only their exact waiter", () => {

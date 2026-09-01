@@ -17,7 +17,7 @@ export function getPendingAskPruneIntervalMs(
 ): number {
   if (raw === undefined || raw.trim() === "") return DEFAULT_PENDING_ASK_PRUNE_INTERVAL_MS;
   const value = Number(raw);
-  return Number.isFinite(value) && value >= 1 && value <= MAX_ASK_TIMEOUT_MS
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_ASK_TIMEOUT_MS
     ? value
     : DEFAULT_PENDING_ASK_PRUNE_INTERVAL_MS;
 }

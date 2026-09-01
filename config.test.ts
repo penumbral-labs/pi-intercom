@@ -99,7 +99,7 @@ test("loadConfig rejects invalid inboundTrigger values", async () => {
 test("getPendingAskPruneIntervalMs preserves valid delays and defaults unsafe timer values", () => {
   assert.equal(getPendingAskPruneIntervalMs("1"), 1);
   assert.equal(getPendingAskPruneIntervalMs(String(MAX_ASK_TIMEOUT_MS)), MAX_ASK_TIMEOUT_MS);
-  for (const raw of [undefined, "", "NaN", "0", "-1", String(MAX_ASK_TIMEOUT_MS + 1)]) {
+  for (const raw of [undefined, "", "NaN", "0", "-1", "1.5", String(MAX_ASK_TIMEOUT_MS + 1)]) {
     assert.equal(getPendingAskPruneIntervalMs(raw), 60_000);
   }
 });

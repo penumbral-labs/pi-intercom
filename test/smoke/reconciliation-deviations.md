@@ -36,6 +36,14 @@ The nine repeated findings map to these adjudications:
 
 The final repo-consistency diff check reported all 38 selected files `ok` with zero findings.
 
+A later fresh baseline check at `5d52d09` reported duplicate function bodies in `broker/broker.ts` and
+`broker/client.ts`, plus block-comment style in `config.ts`. The normalized baseline itself classified all six files it
+considered for semantic duplication as duplicates (`0 of 6` unique), so it did not establish a dominant unique-body
+pattern. The `3aa605b..5d52d09` diff adds no function body to `broker/broker.ts` and only strengthens a predicate in the
+existing `IntercomClient.handleBrokerMessage` body. It also leaves the pre-existing `MAX_ASK_TIMEOUT_MS` JSDoc in
+`config.ts` unchanged and adds no block comment. These unlocated, file-level findings therefore do not identify drift
+introduced by that diff.
+
 ## True-Pi dogfood
 
 The hermetic production-broker dogfood uses two independent socket clients, not two loaded Pi runtimes. The host
