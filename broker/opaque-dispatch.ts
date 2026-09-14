@@ -22,6 +22,12 @@ const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
 
 export interface OpaqueEndpoint {
   sessionId: string;
+  /**
+   * Routing scope the endpoint registered under (`PI_INTERCOM_SCOPE_ID`), absent for the default
+   * unscoped space. Session IDs are only unique within a scope — a stable ID reused in two scopes
+   * yields the same ID — so every dispatch identity comparison pairs the ID with this scope.
+   */
+  scopeId?: string;
   endpointEpoch: string;
   info: SessionInfo;
   extensions?: ExtensionCapability[];
@@ -53,8 +59,8 @@ export function writeOpaqueTo(
 
 interface OpaqueDispatchHooks {
   brokerEpoch: string;
-  endpoint(sessionId: string): OpaqueEndpoint | undefined;
-  owner(namespace: string): { sessionId: string; epoch: string } | undefined;
+  endpoint(sessionId: string, scopeId: string | undefined): OpaqueEndpoint | undefined;
+  owner(namespace: string, scopeId: string | undefined): { sessionId: string; epoch: string } | undefined;
   now?: () => number;
   activeTtlMs?: number;
   tombstoneTtlMs?: number;
@@ -77,6 +83,8 @@ interface Reservation {
 interface RecordState {
   key: string;
   digest: string;
+  /** Scope shared by origin and target; a dispatch never crosses a scope boundary. */
+  scopeId?: string;
   originSessionId: string;
   senderNamespace: string;
   requestId: string;
@@ -168,12 +176,24 @@ function hasRole(endpoint: OpaqueEndpoint | undefined, namespace: string, role: 
     && extension.opaqueDispatch?.version === 1 && extension.opaqueDispatch.roles.includes(role)));
 }
 
-function principalKey(sessionId: string, namespace: string): string {
-  return `${sessionId}\0${namespace}`;
+function scopedSessionId(scopeId: string | undefined, sessionId: string): string {
+  return JSON.stringify([scopeId ?? null, sessionId]);
 }
 
-function targetKey(sessionId: string, namespace: string): string {
-  return `${sessionId}\0${namespace}`;
+function principalKey(scopeId: string | undefined, sessionId: string, namespace: string): string {
+  return `${scopedSessionId(scopeId, sessionId)}\0${namespace}`;
+}
+
+function targetKey(scopeId: string | undefined, sessionId: string, namespace: string): string {
+  return `${scopedSessionId(scopeId, sessionId)}\0${namespace}`;
+}
+
+function isRecordOrigin(record: RecordState, endpoint: OpaqueEndpoint): boolean {
+  return record.originSessionId === endpoint.sessionId && record.scopeId === endpoint.scopeId;
+}
+
+function isRecordTarget(record: RecordState, endpoint: OpaqueEndpoint): boolean {
+  return record.targetSessionId === endpoint.sessionId && record.scopeId === endpoint.scopeId;
 }
 
 export class OpaqueDispatchManager {
@@ -237,9 +257,10 @@ export class OpaqueDispatchManager {
     });
   }
 
-  endpointAvailable(sessionId: string): void {
-    const endpoint = this.hooks.endpoint(sessionId);
+  endpointAvailable(sessionId: string, scopeId?: string): void {
+    const endpoint = this.hooks.endpoint(sessionId, scopeId);
     for (const record of this.records.values()) {
+      if (record.scopeId !== scopeId) continue;
       if (record.status === "queued" && record.targetSessionId === sessionId && endpoint?.connected) {
         this.terminalize(record, "failed_closed", "endpoint_epoch_changed");
       }
@@ -247,8 +268,9 @@ export class OpaqueDispatchManager {
     }
   }
 
-  endpointDisconnected(sessionId: string): void {
+  endpointDisconnected(sessionId: string, scopeId?: string): void {
     for (const record of this.records.values()) {
+      if (record.scopeId !== scopeId) continue;
       const reservation = record.reservation;
       if (!reservation || reservation.targetSessionId !== sessionId) continue;
       clearTimeout(reservation.timer);
@@ -264,12 +286,13 @@ export class OpaqueDispatchManager {
     }
   }
 
-  capabilityChanged(sessionId: string): void {
+  capabilityChanged(sessionId: string, scopeId?: string): void {
     const pendingInvalidation: RecordState[] = [];
     for (const record of this.records.values()) {
+      if (record.scopeId !== scopeId) continue;
       if (record.originSessionId === sessionId) this.replayReceipts(record);
       if (record.targetSessionId !== sessionId) continue;
-      const endpoint = this.hooks.endpoint(sessionId);
+      const endpoint = this.hooks.endpoint(sessionId, scopeId);
       if (hasRole(endpoint, record.recipientNamespace, "receive")) continue;
       if (record.status === "offered" || record.status === "reserved") pendingInvalidation.push(record);
     }
@@ -277,7 +300,7 @@ export class OpaqueDispatchManager {
     setImmediate(() => {
       for (const record of pendingInvalidation) {
         if (record.status !== "offered" && record.status !== "reserved") continue;
-        const endpoint = this.hooks.endpoint(sessionId);
+        const endpoint = this.hooks.endpoint(sessionId, scopeId);
         if (hasRole(endpoint, record.recipientNamespace, "receive")) continue;
         if (record.reservation) this.endReservation(record, "failed_closed", "capability_invalidated");
         this.terminalize(record, "failed_closed", "capability_invalidated");
@@ -310,7 +333,7 @@ export class OpaqueDispatchManager {
     if (origin.sessionId === frame.toSessionId) return void reject("self_dispatch_unsupported");
     const canonical = canonicalizeOpaquePayload(frame.payload);
     if (!canonical.ok) return void reject(canonical.code);
-    const key = `${origin.sessionId}\0${frame.senderNamespace}\0${frame.requestId}`;
+    const key = `${scopedSessionId(origin.scopeId, origin.sessionId)}\0${frame.senderNamespace}\0${frame.requestId}`;
     const digest = fingerprint(canonical.json, frame.toSessionId, frame.recipientNamespace, frame.supersedesMessageId);
     const existing = this.records.get(key);
     if (existing) {
@@ -322,27 +345,28 @@ export class OpaqueDispatchManager {
       }
       return this.replayResult(existing, frame.operationId);
     }
-    const target = this.hooks.endpoint(frame.toSessionId);
+    const target = this.hooks.endpoint(frame.toSessionId, origin.scopeId);
     if (!target) return void reject("unknown_exact_target");
     if (target.endpointEpoch !== frame.targetEpoch) return void reject("target_rebound");
     if (!hasRole(target, frame.recipientNamespace, "receive")) return void reject("unsupported_target");
     let prior: RecordState | undefined;
     if (frame.supersedesMessageId) {
       prior = this.byMessageId.get(frame.supersedesMessageId);
-      if (!prior || prior.originSessionId !== origin.sessionId || prior.senderNamespace !== frame.senderNamespace
+      if (!prior || !isRecordOrigin(prior, origin) || prior.senderNamespace !== frame.senderNamespace
         || prior.targetSessionId !== frame.toSessionId || prior.recipientNamespace !== frame.recipientNamespace) return void reject("not_origin");
       if (prior.status === "queued") return void reject("queued_supersede_unsupported");
       if (prior.status === "claimed") return void reject("already_claimed");
       if (prior.status === "terminal") return void reject("already_terminal");
     }
-    if (!this.hasCapacity(origin.sessionId, frame.senderNamespace, frame.toSessionId, frame.recipientNamespace, prior)) return void reject("limit_exceeded");
+    if (!this.hasCapacity(origin.scopeId, origin.sessionId, frame.senderNamespace, frame.toSessionId, frame.recipientNamespace, prior)) return void reject("limit_exceeded");
     if (prior) {
       this.endReservation(prior, "superseded");
       this.terminalize(prior, "superseded");
     }
     const now = this.now();
     const record: RecordState = {
-      key, digest, originSessionId: origin.sessionId, senderNamespace: frame.senderNamespace,
+      key, digest, ...(origin.scopeId ? { scopeId: origin.scopeId } : {}),
+      originSessionId: origin.sessionId, senderNamespace: frame.senderNamespace,
       requestId: frame.requestId, messageId: randomUUID(), targetSessionId: frame.toSessionId,
       targetEpoch: frame.targetEpoch, recipientNamespace: frame.recipientNamespace, createdAt: now, payload: canonical.normalized,
       status: "queued", attempt: 0,
@@ -359,10 +383,10 @@ export class OpaqueDispatchManager {
     }
   }
 
-  private hasCapacity(originId: string, senderNamespace: string, targetId: string, recipientNamespace: string, replacing?: RecordState): boolean {
+  private hasCapacity(scopeId: string | undefined, originId: string, senderNamespace: string, targetId: string, recipientNamespace: string, replacing?: RecordState): boolean {
     let active = [...this.records.values()].filter((record) => record.status !== "terminal" && record.status !== "claimed" && record !== replacing);
-    if (active.filter((record) => principalKey(record.originSessionId, record.senderNamespace) === principalKey(originId, senderNamespace)).length >= MAX_OPAQUE_PRINCIPAL_RECORDS) return false;
-    if (active.filter((record) => targetKey(record.targetSessionId, record.recipientNamespace) === targetKey(targetId, recipientNamespace)).length >= MAX_OPAQUE_TARGET_RECORDS) return false;
+    if (active.filter((record) => principalKey(record.scopeId, record.originSessionId, record.senderNamespace) === principalKey(scopeId, originId, senderNamespace)).length >= MAX_OPAQUE_PRINCIPAL_RECORDS) return false;
+    if (active.filter((record) => targetKey(record.scopeId, record.targetSessionId, record.recipientNamespace) === targetKey(scopeId, targetId, recipientNamespace)).length >= MAX_OPAQUE_TARGET_RECORDS) return false;
     if (active.length >= MAX_OPAQUE_ACTIVE_RECORDS) {
       const oldestQueued = active.filter((record) => record.status === "queued").sort((a, b) => a.createdAt - b.createdAt)[0];
       if (!oldestQueued) return false;
@@ -373,7 +397,7 @@ export class OpaqueDispatchManager {
   }
 
   private offer(record: RecordState): void {
-    const target = this.hooks.endpoint(record.targetSessionId);
+    const target = this.hooks.endpoint(record.targetSessionId, record.scopeId);
     if (target && target.endpointEpoch !== record.targetEpoch) return this.terminalize(record, "failed_closed", "endpoint_epoch_changed");
     if (!target?.connected || !target.write || !hasRole(target, record.recipientNamespace, "receive") || record.payload === undefined) return;
     if (record.attempt >= MAX_OPAQUE_ATTEMPTS) return this.terminalize(record, "failed_closed", "attempt_limit");
@@ -388,7 +412,7 @@ export class OpaqueDispatchManager {
     timer.unref?.();
     record.reservation = { id: reservationId, targetSessionId: record.targetSessionId, recipientNamespace: record.recipientNamespace, timer };
     record.status = "offered";
-    const origin = this.hooks.endpoint(record.originSessionId);
+    const origin = this.hooks.endpoint(record.originSessionId, record.scopeId);
     const offered = writeOpaqueTo(target, { namespace: record.recipientNamespace, role: "receive" }, {
       type: "opaque_dispatch_v1_offer", reservationId, requestId: record.requestId, messageId: record.messageId,
       attempt: record.attempt, brokerEpoch: this.hooks.brokerEpoch, endpointEpoch: record.targetEpoch, toSessionId: record.targetSessionId,
@@ -396,7 +420,7 @@ export class OpaqueDispatchManager {
       sender: {
         sessionId: record.originSessionId, namespace: record.senderNamespace,
         trustedLocal: origin?.info.trustedLocal === true,
-        ...(this.hooks.owner(record.senderNamespace) ? { owner: this.hooks.owner(record.senderNamespace)! } : {}),
+        ...(this.hooks.owner(record.senderNamespace, record.scopeId) ? { owner: this.hooks.owner(record.senderNamespace, record.scopeId)! } : {}),
       },
       payload: record.payload,
       reserveBy,
@@ -411,8 +435,8 @@ export class OpaqueDispatchManager {
   private reservationResult(endpoint: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_reservation_result" }>): void {
     const record = this.byMessageId.get(frame.messageId);
     const reservation = record?.reservation;
-    if (!record || !reservation || reservation.id !== frame.reservationId || reservation.targetSessionId !== endpoint.sessionId
-      || record.targetEpoch !== endpoint.endpointEpoch || frame.endpointEpoch !== record.targetEpoch
+    if (!record || !reservation || reservation.id !== frame.reservationId || !isRecordTarget(record, endpoint)
+      || reservation.targetSessionId !== endpoint.sessionId || record.targetEpoch !== endpoint.endpointEpoch || frame.endpointEpoch !== record.targetEpoch
       || (frame.decision === "reserved" ? record.status !== "offered" : (record.status !== "offered" && record.status !== "reserved"))) return;
     // An exact current receiver may fail closed after its capability-removal frame
     // has been read; accepting only the negative settlement preserves dispose order.
@@ -439,7 +463,7 @@ export class OpaqueDispatchManager {
   private claim(endpoint: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_claim" }>): void {
     const known = this.byMessageId.get(frame.messageId);
     if (known?.status === "claimed" && known.lastReservationId === frame.reservationId
-      && known.targetSessionId === endpoint.sessionId && known.targetEpoch === endpoint.endpointEpoch
+      && isRecordTarget(known, endpoint) && known.targetEpoch === endpoint.endpointEpoch
       && frame.endpointEpoch === known.targetEpoch && hasRole(endpoint, known.recipientNamespace, "receive")) {
       writeOpaqueTo(endpoint, { namespace: known.recipientNamespace, role: "receive" }, { type: "opaque_dispatch_v1_claim_result", operationId: frame.operationId, reservationId: frame.reservationId, messageId: frame.messageId, claimed: true });
       return;
@@ -474,7 +498,7 @@ export class OpaqueDispatchManager {
   private cancel(origin: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_cancel" }>): void {
     const record = this.byMessageId.get(frame.messageId);
     const response = (cancelled: boolean, code?: OpaqueDispatchReason) => writeOpaqueTo(origin, { namespace: frame.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_cancel_result", operationId: frame.operationId, messageId: frame.messageId, cancelled, ...(code ? { code } : {}) });
-    if (!record || record.originSessionId !== origin.sessionId || record.senderNamespace !== frame.senderNamespace) return void response(false, "not_origin");
+    if (!record || !isRecordOrigin(record, origin) || record.senderNamespace !== frame.senderNamespace) return void response(false, "not_origin");
     if (record.status === "claimed") return void response(false, "already_claimed");
     if (record.status === "terminal") return void response(false, "already_terminal");
     this.endReservation(record, "cancelled");
@@ -487,7 +511,7 @@ export class OpaqueDispatchManager {
     let result: Extract<OpaqueDispatchBrokerFrame, { type: "opaque_dispatch_v1_claim_status_result" }>["result"];
     if (frame.brokerEpoch !== this.hooks.brokerEpoch) result = { state: "indeterminate", code: "broker_epoch_changed" };
     else if (!record) result = { state: "indeterminate", code: "claim_history_unavailable" };
-    else if (record.targetSessionId !== endpoint.sessionId || record.recipientNamespace !== frame.recipientNamespace
+    else if (!isRecordTarget(record, endpoint) || record.recipientNamespace !== frame.recipientNamespace
       || record.targetEpoch !== endpoint.endpointEpoch || frame.endpointEpoch !== record.targetEpoch
       || !hasRole(endpoint, frame.recipientNamespace, "receive")) result = { state: "indeterminate", code: "claim_history_unavailable" };
     else if (record.status === "claimed" && record.lastReservationId === frame.reservationId) result = { state: "claimed" };
@@ -498,29 +522,29 @@ export class OpaqueDispatchManager {
 
   private receiptAck(origin: OpaqueEndpoint, frame: Extract<OpaqueDispatchClientFrame, { type: "opaque_dispatch_v1_receipt_ack" }>): void {
     const record = this.byMessageId.get(frame.messageId);
-    if (!record || record.originSessionId !== origin.sessionId || record.senderNamespace !== frame.senderNamespace) return;
+    if (!record || !isRecordOrigin(record, origin) || record.senderNamespace !== frame.senderNamespace) return;
     record.ackedThrough = Math.max(record.ackedThrough, Math.min(frame.sequence, record.receipts.length));
   }
 
   private authorizedReservation(endpoint: OpaqueEndpoint, endpointEpoch: string, messageId: string, reservationId: string): RecordState | undefined {
     const record = this.byMessageId.get(messageId);
-    return record?.reservation?.id === reservationId && record.targetSessionId === endpoint.sessionId
+    return record?.reservation?.id === reservationId && isRecordTarget(record, endpoint)
       && record.targetEpoch === endpoint.endpointEpoch && record.targetEpoch === endpointEpoch
       && hasRole(endpoint, record.recipientNamespace, "receive") ? record : undefined;
   }
 
   private ackWaiters(record: RecordState, deliveryState: "live" | "mailbox_queued"): void {
-    const origin = this.hooks.endpoint(record.originSessionId);
+    const origin = this.hooks.endpoint(record.originSessionId, record.scopeId);
     for (const waiter of record.waiters.splice(0)) writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_ack", operationId: waiter.operationId, requestId: waiter.requestId, messageId: record.messageId, brokerEpoch: this.hooks.brokerEpoch, deliveryState });
   }
 
   private rejectWaiters(record: RecordState, code: OpaqueDispatchReason, terminal: "refused" | "failed_closed"): void {
-    const origin = this.hooks.endpoint(record.originSessionId);
+    const origin = this.hooks.endpoint(record.originSessionId, record.scopeId);
     for (const waiter of record.waiters.splice(0)) writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_rejected", operationId: waiter.operationId, requestId: waiter.requestId, messageId: record.messageId, code, terminal });
   }
 
   private replayResult(record: RecordState, operationId: string): void {
-    const origin = this.hooks.endpoint(record.originSessionId);
+    const origin = this.hooks.endpoint(record.originSessionId, record.scopeId);
     if (record.status === "queued") writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_ack", operationId, requestId: record.requestId, messageId: record.messageId, brokerEpoch: this.hooks.brokerEpoch, deliveryState: "mailbox_queued" });
     else if (record.status === "reserved" || record.status === "claimed") writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_ack", operationId, requestId: record.requestId, messageId: record.messageId, brokerEpoch: this.hooks.brokerEpoch, deliveryState: "live" });
     else if (record.status === "terminal") writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_rejected", operationId, requestId: record.requestId, messageId: record.messageId, code: record.terminalReason ?? "already_terminal", terminal: record.terminalStatus === "refused" ? "refused" : "failed_closed" });
@@ -536,12 +560,12 @@ export class OpaqueDispatchManager {
     }
     const receipt: OpaqueDispatchReceipt = { requestId: record.requestId, messageId: record.messageId, status, at: this.now(), attempt: Math.max(1, record.attempt), sequence: record.receipts.length + 1, ...(reason ? { reason } : {}) };
     record.receipts.push(receipt);
-    const origin = this.hooks.endpoint(record.originSessionId);
+    const origin = this.hooks.endpoint(record.originSessionId, record.scopeId);
     writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_receipt", senderNamespace: record.senderNamespace, receipt });
   }
 
   private replayReceipts(record: RecordState): void {
-    const origin = this.hooks.endpoint(record.originSessionId);
+    const origin = this.hooks.endpoint(record.originSessionId, record.scopeId);
     if (!origin?.connected || !hasRole(origin, record.senderNamespace, "send")) return;
     for (const receipt of record.receipts) if (receipt.sequence > record.ackedThrough) writeOpaqueTo(origin, { namespace: record.senderNamespace, role: "send" }, { type: "opaque_dispatch_v1_receipt", senderNamespace: record.senderNamespace, receipt });
   }
@@ -550,7 +574,7 @@ export class OpaqueDispatchManager {
     const reservation = record.reservation;
     if (!reservation) return;
     clearTimeout(reservation.timer);
-    const target = this.hooks.endpoint(record.targetSessionId);
+    const target = this.hooks.endpoint(record.targetSessionId, record.scopeId);
     if (target?.endpointEpoch === record.targetEpoch) {
       writeOpaqueTo(target, { namespace: record.recipientNamespace, role: "receive" }, { type: "opaque_dispatch_v1_reservation_ended", messageId: record.messageId, reservationId: reservation.id, outcome, ...(reason ? { reason } : {}) });
     }
@@ -596,18 +620,18 @@ export class OpaqueDispatchManager {
       if (index >= 0) tombstones.splice(index, 1);
       this.deleteRecord(record);
     };
-    for (const key of new Set(tombstones.map((record) => principalKey(record.originSessionId, record.senderNamespace)))) {
-      let matching = tombstones.filter((record) => principalKey(record.originSessionId, record.senderNamespace) === key);
+    for (const key of new Set(tombstones.map((record) => principalKey(record.scopeId, record.originSessionId, record.senderNamespace)))) {
+      let matching = tombstones.filter((record) => principalKey(record.scopeId, record.originSessionId, record.senderNamespace) === key);
       while (matching.length > MAX_OPAQUE_PRINCIPAL_TOMBSTONES) {
         evict(matching);
-        matching = tombstones.filter((record) => principalKey(record.originSessionId, record.senderNamespace) === key);
+        matching = tombstones.filter((record) => principalKey(record.scopeId, record.originSessionId, record.senderNamespace) === key);
       }
     }
-    for (const key of new Set(tombstones.map((record) => targetKey(record.targetSessionId, record.recipientNamespace)))) {
-      let matching = tombstones.filter((record) => targetKey(record.targetSessionId, record.recipientNamespace) === key);
+    for (const key of new Set(tombstones.map((record) => targetKey(record.scopeId, record.targetSessionId, record.recipientNamespace)))) {
+      let matching = tombstones.filter((record) => targetKey(record.scopeId, record.targetSessionId, record.recipientNamespace) === key);
       while (matching.length > MAX_OPAQUE_TARGET_TOMBSTONES) {
         evict(matching);
-        matching = tombstones.filter((record) => targetKey(record.targetSessionId, record.recipientNamespace) === key);
+        matching = tombstones.filter((record) => targetKey(record.scopeId, record.targetSessionId, record.recipientNamespace) === key);
       }
     }
     while (tombstones.length > MAX_OPAQUE_TOMBSTONES) evict(tombstones);

@@ -4,6 +4,7 @@ import { getIntercomDirPath } from "./broker/paths.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PENDING_ASK_PRUNE_INTERVAL_MS = 60 * 1000;
+const INTERCOM_SCOPE_ID_ENV = "PI_INTERCOM_SCOPE_ID";
 export const STALE_ASK_RETENTION_MS = 60 * 60 * 1000;
 
 /**
@@ -36,6 +37,11 @@ export function getAskTimeoutMs(): number {
     throw new Error(`PI_INTERCOM_ASK_TIMEOUT_MS must not exceed ${MAX_ASK_TIMEOUT_MS} milliseconds`);
   }
   return value;
+}
+
+export function getIntercomScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const scopeId = env[INTERCOM_SCOPE_ID_ENV]?.trim();
+  return scopeId ? scopeId : undefined;
 }
 
 export type InboundTriggerPolicy = "always" | "replies" | "never";

@@ -55,10 +55,18 @@ export interface Message {
   retryOf?: string;
   replyTo?: string;
   expectsReply?: boolean;
+  provenance?: MessageProvenance;
   content: {
     text: string;
     attachments?: Attachment[];
   };
+}
+
+export interface MessageProvenance {
+  type: "extension_outbox";
+  extensionId: string;
+  extensionName: string;
+  requestId: string;
 }
 
 export interface Attachment {
@@ -114,7 +122,7 @@ export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "pe
 };
 
 export type ClientMessage =
-  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; features?: string[] }
+  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; features?: string[]; scopeId?: string }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }

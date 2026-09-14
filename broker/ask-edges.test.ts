@@ -141,7 +141,7 @@ test("timed-out asks retain reply authorization without blocking reverse asks", 
   assert.equal(edges.has("timed-out"), true);
   assert.equal(edges.hasReverse("b", "a"), true, "the ask remains active through its timeout boundary");
 
-  assert.deepEqual(edges.expireActiveOlderThan(waiterTimeoutMs, 1001 + waiterTimeoutMs), ["timed-out"]);
+  assert.deepEqual(edges.expireActiveOlderThan(waiterTimeoutMs, 1001 + waiterTimeoutMs), [{ messageId: "timed-out" }]);
   assert.deepEqual(edges.expireActiveOlderThan(waiterTimeoutMs, 1002 + waiterTimeoutMs), [], "expiry is reported only once");
   assert.equal(edges.has("timed-out"), true, "the timed-out ask remains authorized for a late reply");
   assert.equal(edges.hasReverse("b", "a"), false, "reply-only authorization must not block a reverse ask");
@@ -166,13 +166,13 @@ test("reply-only capacity evicts the deterministic oldest authorizations without
   edges.expireActiveOlderThan(0, 1001);
 
   edges.add("new-by-order", "c", "x", 1000);
-  assert.deepEqual(edges.expireActiveOlderThan(0, 1001), ["new-by-order", "old-by-time"]);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1001), [{ messageId: "new-by-order" }, { messageId: "old-by-time" }]);
   assert.equal(edges.has("old-by-time"), false);
   assert.equal(edges.has("old-by-order"), true);
   assert.equal(edges.has("new-by-order"), true);
 
   edges.add("newest", "d", "x", 1001);
-  assert.deepEqual(edges.expireActiveOlderThan(0, 1002), ["newest", "old-by-order"]);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1002), [{ messageId: "newest" }, { messageId: "old-by-order" }]);
   assert.equal(edges.has("old-by-order"), false, "equal timestamps are ordered by insertion");
   assert.equal(edges.has("new-by-order"), true);
   assert.equal(edges.has("newest"), true);
@@ -193,7 +193,7 @@ test("deleting more than the reply-only cap of active edges does not inflate rep
 
   edges.add("oldest-valid", "a", "b", 100);
   edges.add("newest-valid", "a", "b", 101);
-  assert.deepEqual(edges.expireActiveOlderThan(0, 102), ["oldest-valid", "newest-valid"]);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 102), [{ messageId: "oldest-valid" }, { messageId: "newest-valid" }]);
   assert.equal(edges.replyOnlySize, replyOnlyCap);
   assert.equal(edges.has("oldest-valid"), true);
   assert.equal(edges.has("newest-valid"), true);
@@ -221,7 +221,7 @@ test("deleteForSession removes edges where the session is either party", () => {
   edges.add("m1", "a", "b");
   edges.add("m2", "c", "a");
   edges.add("m3", "c", "d");
-  assert.deepEqual(edges.deleteForSession("a"), ["m1", "m2"]);
+  assert.deepEqual(edges.deleteForSession("a"), [{ messageId: "m1" }, { messageId: "m2" }]);
   assert.equal(edges.has("m1"), false);
   assert.equal(edges.has("m2"), false);
   assert.equal(edges.has("m3"), true);
@@ -237,4 +237,27 @@ test("clear empties edges and both indexes", () => {
   assert.equal(edges.hasReverse("a", "b"), false);
   assert.equal(edges.hasReverse("b", "a"), false);
   assert.equal(edges.canAdd("a").ok, true);
+});
+
+test("removals report the scope that owns the edge's durable ask record", () => {
+  const edges = new AskEdges(GLOBAL_CAP);
+  edges.add("scoped", "scoped-a", "scoped-b", 1000, "team-1");
+  edges.add("unscoped", "plain-a", "plain-b", 1000);
+  assert.equal(edges.get("scoped")?.scopeId, "team-1");
+  assert.equal(edges.get("unscoped")?.scopeId, undefined);
+
+  assert.deepEqual(edges.deleteForSession("scoped-a"), [{ messageId: "scoped", scopeId: "team-1" }]);
+  assert.deepEqual(edges.expireActiveOlderThan(0, 1001), [{ messageId: "unscoped" }]);
+});
+
+test("reply-only eviction reports the evicted edge's scope", () => {
+  const edges = new AskEdges(2, 2, 1);
+  edges.add("first", "a", "x", 1000, "team-1");
+  edges.add("second", "b", "x", 1001, "team-2");
+  assert.deepEqual(
+    edges.expireActiveOlderThan(0, 1002),
+    [{ messageId: "first", scopeId: "team-1" }, { messageId: "second", scopeId: "team-2" }],
+  );
+  assert.equal(edges.has("first"), false, "the oldest reply-only authorization is evicted at capacity");
+  assert.equal(edges.has("second"), true);
 });

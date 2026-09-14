@@ -5,6 +5,7 @@ import type {
   ExtensionStateSnapshot,
   Message,
   MessageControl,
+  MessageProvenance,
   MessageReceipt,
   MessageReceiptStatus,
   OpaqueDispatchBrokerFrame,
@@ -72,6 +73,16 @@ function isAttachment(value: unknown): value is Attachment {
   return value.language === undefined || typeof value.language === "string";
 }
 
+function isMessageProvenance(value: unknown): value is MessageProvenance {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return value.type === "extension_outbox"
+    && typeof value.extensionId === "string"
+    && typeof value.extensionName === "string"
+    && typeof value.requestId === "string";
+}
+
 export function isMessage(value: unknown): value is Message {
   if (!isRecord(value)) return false;
   if (typeof value.id !== "string" || typeof value.timestamp !== "number") return false;
@@ -82,6 +93,7 @@ export function isMessage(value: unknown): value is Message {
     if (value[key] !== undefined && typeof value[key] !== "string") return false;
   }
   if (value.expectsReply !== undefined && typeof value.expectsReply !== "boolean") return false;
+  if (value.provenance !== undefined && !isMessageProvenance(value.provenance)) return false;
   if (!isRecord(value.content) || typeof value.content.text !== "string") return false;
   return value.content.attachments === undefined
     || (Array.isArray(value.content.attachments) && value.content.attachments.every(isAttachment));

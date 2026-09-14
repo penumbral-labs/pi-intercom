@@ -66,6 +66,19 @@ test("loadConfig accepts inboundTrigger replies policy", async () => {
   }
 });
 
+test("loadConfig ignores obsolete toolVisibility values", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ toolVisibility: "lazy", replyHint: false }));
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().replyHint, false);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig accepts a restart-stable intercom id", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
   try {

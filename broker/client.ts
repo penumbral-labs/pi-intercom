@@ -20,12 +20,14 @@ import {
   EXTENSION_STATE_REFRESH_FEATURE,
   OPAQUE_DISPATCH_FEATURE,
 } from "../types.ts";
+import { getIntercomScopeId } from "../config.ts";
 import type {
   Attachment,
   BrokerMessage,
   ClientMessage,
   Message,
   MessageControl,
+  MessageProvenance,
   MessageReceipt,
   ExtensionStateSnapshot,
   OpaqueDispatchBrokerFrame,
@@ -44,6 +46,7 @@ interface SendOptions {
   messageId?: string;
   supersedes?: string;
   retryOf?: string;
+  provenance?: MessageProvenance;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -354,11 +357,13 @@ export class IntercomClient extends EventEmitter {
       this.once("_registered", onRegistered);
       
       try {
+        const scopeId = getIntercomScopeId();
         writeMessage(socket, {
           type: "register",
           session,
           ...(sessionId ? { sessionId } : {}),
           features: [ATOMIC_SUPERSEDE_FEATURE],
+          ...(scopeId ? { scopeId } : {}),
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
         });
       } catch (error) {
@@ -883,6 +888,7 @@ export class IntercomClient extends EventEmitter {
       retryOf: options.retryOf,
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
+      provenance: options.provenance,
       content: {
         text: options.text,
         attachments: options.attachments,

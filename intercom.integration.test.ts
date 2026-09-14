@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -8,7 +8,13 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { MAX_PENDING_ASK_EDGES_PER_SESSION } from "./broker/ask-edges.ts";
 import { BROKER_SESSION_ID, type BrokerMessage, type Message, type SessionInfo } from "./types.ts";
-import { INTERCOM_EXTENSION_REGISTER_EVENT, type IntercomExtensionChannel } from "./extension-api.ts";
+import {
+  INTERCOM_EXTENSION_REGISTER_EVENT,
+  INTERCOM_OUTBOX_REQUEST_EVENT,
+  INTERCOM_OUTBOX_RESULT_EVENT,
+  type IntercomExtensionChannel,
+  type IntercomOutboxResultV1,
+} from "./extension-api.ts";
 
 const repoDir = process.cwd();
 const childEnvKeys = [
@@ -35,7 +41,7 @@ const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
 const { IntercomClient, IntercomListSessionsError } = await import("./broker/client.ts");
-const { getAskTimeoutMs } = await import("./config.ts");
+const { getAskTimeoutMs, getConfigPath } = await import("./config.ts");
 const { getBrokerLaunchSpec, getTsxCliPath } = await import("./broker/spawn.ts");
 test.after(() => {
   for (const key of Object.keys(process.env)) {
@@ -46,6 +52,31 @@ test.after(() => {
   process.env.USERPROFILE = previousUserProfile;
   rmSync(sharedHomeDir, { recursive: true, force: true });
 });
+
+async function withIntercomConfig<T>(config: Record<string, unknown>, fn: () => T | Promise<T>): Promise<T> {
+  const configPath = getConfigPath();
+  const previous = existsSync(configPath) ? readFileSync(configPath, "utf-8") : undefined;
+  mkdirSync(path.dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config));
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) rmSync(configPath, { force: true });
+    else writeFileSync(configPath, previous);
+  }
+}
+
+async function withIntercomScope<T>(scopeId: string | undefined, fn: () => T | Promise<T>): Promise<T> {
+  const previous = process.env.PI_INTERCOM_SCOPE_ID;
+  if (scopeId === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
+  else process.env.PI_INTERCOM_SCOPE_ID = scopeId;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
+    else process.env.PI_INTERCOM_SCOPE_ID = previous;
+  }
+}
 
 async function waitForBrokerReady(broker: ChildProcess): Promise<void> {
   const stdout = broker.stdout;
@@ -158,15 +189,19 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
   mode?: "tui" | "rpc" | "json" | "print";
   ui?: unknown;
   sessionId?: string | (() => string);
+  activeTools?: string[];
 } = {}) {
   const events = new EventEmitter();
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const tools: CapturedTool[] = [];
+  let currentSessionName = typeof sessionName === "function" ? sessionName() : sessionName;
+  let activeToolNames = [...(options.activeTools ?? [])];
   const entries: Array<{ type: string; data: unknown }> = [];
-  const sentMessages: Array<{ message: { customType?: string; content?: string; details?: unknown }; options?: { triggerTurn?: boolean; deliverAs?: string } }> = [];
+  const sentMessages: Array<{ message: { customType?: string; content?: string; details?: unknown }; options?: { triggerTurn?: boolean; deliverAs?: string }; activeTools: string[] }> = [];
   const pi = {
-    getSessionName: () => typeof sessionName === "function" ? sessionName() : sessionName,
+    getSessionName: () => typeof sessionName === "function" ? sessionName() : currentSessionName,
+    setSessionName: (name: string) => { currentSessionName = name; },
     events: {
       on: (channel: string, handler: (payload: unknown) => void) => {
         events.on(channel, handler);
@@ -182,13 +217,16 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     registerMessageRenderer: () => undefined,
     registerTool: (tool: CapturedTool) => {
       tools.push(tool);
+      if (!activeToolNames.includes(tool.name)) activeToolNames.push(tool.name);
     },
+    getActiveTools: () => [...activeToolNames],
+    setActiveTools: (names: string[]) => { activeToolNames = [...names]; },
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => unknown }) => {
       commands.set(name, command.handler);
     },
     registerShortcut: () => undefined,
     sendMessage: (message: { customType?: string; content?: string; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: string }) => {
-      sentMessages.push({ message, options });
+      sentMessages.push({ message, options, activeTools: [...activeToolNames] });
     },
     appendEntry: (type: string, data: unknown) => entries.push({ type, data }),
   };
@@ -209,6 +247,7 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     commands,
     entries,
     sentMessages,
+    getActiveTools: () => pi.getActiveTools(),
     async emitLifecycle(event: string, payload: unknown = {}, eventContext: unknown = ctx) {
       for (const handler of lifecycleHandlers.get(event) ?? []) {
         await handler(payload, eventContext);
@@ -452,6 +491,17 @@ async function setupClients(options: { brokerEnv?: NodeJS.ProcessEnv } = {}) {
   }
 }
 
+async function connectClientWithScope(client: InstanceType<typeof IntercomClient>, scopeId: string | undefined, sessionId: string, name: string): Promise<void> {
+  await withIntercomScope(scopeId, () => client.connect({
+    name,
+    cwd: repoDir,
+    model: "test-model",
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+  }, sessionId));
+}
+
 function waitForReply(client: InstanceType<typeof IntercomClient>, replyTo: string, timeoutMs = 5000): Promise<{ from: SessionInfo; message: Message; }> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -468,6 +518,34 @@ function waitForReply(client: InstanceType<typeof IntercomClient>, replyTo: stri
     };
     client.on("message", handler);
   });
+}
+
+function waitForOutboxResults(results: IntercomOutboxResultV1[], count: number, timeoutMs = 3000): Promise<IntercomOutboxResultV1[]> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = () => {
+      if (results.length >= count) {
+        resolve(results.slice(0, count));
+        return;
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error(`Timed out waiting for ${count} outbox result(s); saw ${JSON.stringify(results)}`));
+        return;
+      }
+      setTimeout(check, 10);
+    };
+    check();
+  });
+}
+
+async function waitForReplyMessage(messages: Message[], messageId: string, timeoutMs = 3000): Promise<Message> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const message = messages.find((candidate) => candidate.id === messageId);
+    if (message) return message;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for message ${messageId}`);
 }
 
 function pendingAskRecordPath(messageId: string): string {
@@ -647,6 +725,85 @@ test("broker rejects unknown replyTo values instead of delivering forged replies
     assert.match(result.reason ?? "", /pending ask/i);
   } finally {
     await cleanup();
+  }
+});
+
+test("broker scopes discovery, routing, mailbox, and presence", { concurrency: false }, async () => {
+  const broker = spawn(process.execPath, [getTsxCliPath(), path.join(repoDir, "broker", "broker.ts")], {
+    cwd: repoDir,
+    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const clients: Array<InstanceType<typeof IntercomClient>> = [];
+  try {
+    await waitForBrokerReady(broker);
+    const unscopedA = new IntercomClient();
+    const unscopedB = new IntercomClient();
+    const alphaSender = new IntercomClient();
+    const alphaTarget = new IntercomClient();
+    const betaTarget = new IntercomClient();
+    clients.push(unscopedA, unscopedB, alphaSender, alphaTarget, betaTarget);
+
+    const alphaEvents: BrokerMessage[] = [];
+    const alphaMessages: Message[] = [];
+    const betaMessages: Message[] = [];
+    alphaSender.onBrokerMessage((message) => alphaEvents.push(message));
+    alphaTarget.on("message", (_from: SessionInfo, message: Message) => alphaMessages.push(message));
+    betaTarget.on("message", (_from: SessionInfo, message: Message) => betaMessages.push(message));
+
+    await connectClientWithScope(unscopedA, undefined, "unscoped-a", "unscoped-a");
+    await connectClientWithScope(unscopedB, undefined, "unscoped-b", "unscoped-b");
+    await connectClientWithScope(alphaSender, "  alpha-scope  ", "alpha-sender", "alpha-sender");
+    await connectClientWithScope(betaTarget, "beta-scope", "shared-target-id", "shared-target");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(alphaEvents.some((message) => message.type === "session_joined" && message.session.id === "shared-target-id"), false);
+
+    await connectClientWithScope(alphaTarget, "alpha-scope", "shared-target-id", "shared-target");
+    await waitForSessionByName(alphaSender, "shared-target");
+    assert.equal((await unscopedA.listSessions()).some((session) => session.id === "shared-target-id"), false);
+    assert.equal((await alphaSender.listSessions()).some((session) => session.id === "unscoped-b"), false);
+    assert.equal((await unscopedA.listSessions()).some((session) => session.id === "unscoped-b"), true);
+    assert.equal((await alphaSender.listSessions()).filter((session) => session.cwd === repoDir && session.name === "shared-target").length, 1);
+
+    betaTarget.updatePresence({ status: "beta-only" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(alphaEvents.some((message) => message.type === "presence_update" && message.session.status === "beta-only"), false);
+    alphaTarget.updatePresence({ status: "alpha-visible" });
+    await waitForSessionStatus(alphaSender, "shared-target", "alpha-visible");
+
+    assert.equal((await unscopedA.send("shared-target-id", { text: "full id must not cross" })).delivered, false);
+    assert.equal((await alphaSender.send("unscoped-b", { text: "unscoped id must not cross" })).delivered, false);
+    assert.equal((await alphaSender.send("shared-target", { messageId: "alpha-name-scope", text: "name stays in scope" })).delivered, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(alphaMessages.some((message) => message.id === "alpha-name-scope"), true);
+    assert.equal(betaMessages.some((message) => message.id === "alpha-name-scope"), false);
+
+    await alphaTarget.disconnect();
+    const crossScopeDisconnected = await unscopedA.send("shared-target-id", {
+      messageId: "unscoped-to-scoped-disconnected",
+      text: "must not queue across scope",
+    });
+    assert.equal(crossScopeDisconnected.delivered, false);
+    assert.match(crossScopeDisconnected.reason ?? "", /Session not found/);
+
+    const queued = await alphaSender.send("shared-target-id", {
+      messageId: "alpha-scoped-mailbox",
+      text: "queued only for alpha",
+    });
+    assert.equal(queued.delivery, "queued");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(betaMessages.some((message) => message.id === "alpha-scoped-mailbox"), false);
+
+    const alphaReplacement = new IntercomClient();
+    clients.push(alphaReplacement);
+    const recovered: Message[] = [];
+    alphaReplacement.on("message", (_from: SessionInfo, message: Message) => recovered.push(message));
+    await connectClientWithScope(alphaReplacement, "alpha-scope", "shared-target-id", "shared-target");
+    await waitForReplyMessage(recovered, "alpha-scoped-mailbox");
+  } finally {
+    await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    if (broker.exitCode === null && broker.signalCode === null) broker.kill("SIGTERM");
+    await once(broker, "exit").catch(() => undefined);
   }
 });
 
@@ -1214,6 +1371,123 @@ test("intercom-id inserts a stable handoff snippet into the editor", { concurren
     assert.match(notifications.at(-1) ?? "", /Inserted intercom contact target: session-child-test/);
     await harness.emitLifecycle("session_shutdown");
   } finally {
+    await cleanup();
+  }
+});
+
+test("alias names the current session, opens the local input menu, and appears in intercom displays", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const inputCalls: Array<[string, string | undefined]> = [];
+  const inputValues = ["menu-worker", "no-arg-worker"];
+  const harness = createExtensionHarness("alias-worker", {
+    hasUI: true,
+    ui: {
+      input: async (title: string, placeholder?: string) => {
+        inputCalls.push([title, placeholder]);
+        return inputValues.shift();
+      },
+      notify: () => undefined,
+    },
+  });
+
+  try {
+    // Disable the background name poll for this test so the broker update
+    // proves that /alias synchronizes presence directly.
+    await withChildOrchestratorEnv({ namePollMs: "60000" }, async () => {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const initial = await waitForSessionByName(planner, "alias-worker");
+      const aliasCommand = harness.commands.get("alias")!;
+
+      await aliasCommand("direct-worker", harness.ctx);
+      const direct = await waitForSessionByName(planner, "direct-worker");
+      assert.equal(direct.id, initial.id);
+      assert.equal(harness.pi.getSessionName(), "direct-worker");
+      assert.equal(inputCalls.length, 0);
+
+      await aliasCommand("menu", harness.ctx);
+      await waitForSessionByName(planner, "menu-worker");
+      await aliasCommand("", harness.ctx);
+      const current = await waitForSessionByName(planner, "no-arg-worker");
+      assert.equal(current.id, initial.id);
+      assert.deepEqual(inputCalls, [
+        ["Set session alias", "Current alias: direct-worker"],
+        ["Set session alias", "Current alias: menu-worker"],
+      ]);
+
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const listed = await intercomTool.execute("alias-list", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(listed.content[0]?.text ?? "", /no-arg-worker/);
+
+      orchestrator.updatePresence({ name: "alias-orchestrator" });
+      await waitForSessionByName(planner, "alias-orchestrator");
+      const outgoing = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const sendResult = await intercomTool.execute("alias-send", {
+        action: "send",
+        to: "alias-orchestrator",
+        message: "Alias display check.",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(sendResult.content[0]?.text, "Message sent to alias-orchestrator");
+      assert.equal((await outgoing)[1].content.text, "Alias display check.");
+
+      const askId = "alias-reply-ask";
+      assert.equal((await orchestrator.send(initial.id, {
+        messageId: askId,
+        text: "Reply using the alias.",
+        expectsReply: true,
+      })).delivered, true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const replyReceived = waitForReply(orchestrator, askId);
+      const replyResult = await intercomTool.execute("alias-reply", {
+        action: "reply",
+        replyTo: askId,
+        message: "Alias reply display check.",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(replyResult.content[0]?.text, "Reply sent to alias-orchestrator");
+      assert.equal((await replyReceived).message.content.text, "Alias reply display check.");
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("alias reports no-UI usage and current alias without hanging", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const output: string[] = [];
+  const previousConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    output.push(args.map((value) => String(value)).join(" "));
+  };
+  const harness = createExtensionHarness("no-ui-worker");
+
+  try {
+    await withChildOrchestratorEnv({ namePollMs: "60000" }, async () => {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const initial = await waitForSessionByName(planner, "no-ui-worker");
+      const aliasCommand = harness.commands.get("alias")!;
+
+      await aliasCommand("no-ui-renamed", harness.ctx);
+      const renamed = await waitForSessionByName(planner, "no-ui-renamed");
+      assert.equal(renamed.id, initial.id);
+      assert.equal(harness.pi.getSessionName(), "no-ui-renamed");
+      assert.deepEqual(output, ["Session alias set: no-ui-renamed"]);
+
+      output.length = 0;
+      await aliasCommand("", harness.ctx);
+      assert.deepEqual(output, ["Session alias: no-ui-renamed"]);
+
+      output.length = 0;
+      await aliasCommand("menu", harness.ctx);
+      assert.deepEqual(output, ["The alias menu requires an interactive UI; use /alias <name>."]);
+      assert.equal(harness.pi.getSessionName(), "no-ui-renamed");
+    });
+  } finally {
+    console.error = previousConsoleError;
+    await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
 });
@@ -2425,6 +2699,161 @@ test("late extension registration advertises before an onReady publish", { concu
   }
 });
 
+test("extension outbox sends notify-only messages with trace and provenance", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("outbox-worker");
+  const results: IntercomOutboxResultV1[] = [];
+
+  try {
+    harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => results.push(payload as IntercomOutboxResultV1));
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const delivered = once(planner, "message") as Promise<[SessionInfo, Message]>;
+
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+      version: 1,
+      requestId: "outbox-success-1",
+      extensionId: "example-extension",
+      extensionName: "Example Extension",
+      to: "planner",
+      message: "Outbox hello.",
+    });
+
+    const [result] = await waitForOutboxResults(results, 1);
+    assert.equal(result?.status, "sent");
+    assert.equal(result?.messageId, "outbox-success-1");
+    const [, message] = await Promise.race([
+      delivered,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for outbox delivery")), 3000)),
+    ]);
+    assert.equal(message.id, "outbox-success-1");
+    assert.equal(message.content.text, "Outbox hello.");
+    assert.deepEqual(message.provenance, {
+      type: "extension_outbox",
+      extensionId: "example-extension",
+      extensionName: "Example Extension",
+      requestId: "outbox-success-1",
+    });
+    assert.equal(harness.entries.some((entry) => entry.type === "intercom_sent"
+      && (entry.data as { extension?: { requestId?: string } }).extension?.requestId === "outbox-success-1"), true);
+    assert.equal(harness.entries.some((entry) => entry.type === "intercom_outbox_result"
+      && (entry.data as { requestId?: string; status?: string }).requestId === "outbox-success-1"
+      && (entry.data as { requestId?: string; status?: string }).status === "sent"), true);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("extension outbox rejects duplicate request ids without duplicate delivery", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("outbox-duplicate-worker");
+  const results: IntercomOutboxResultV1[] = [];
+  const deliveredMessages: Message[] = [];
+
+  try {
+    planner.on("message", (_from: SessionInfo, message: Message) => deliveredMessages.push(message));
+    harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => results.push(payload as IntercomOutboxResultV1));
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const request = {
+      version: 1,
+      requestId: "outbox-duplicate-1",
+      extensionId: "example-extension",
+      extensionName: "Example Extension",
+      to: "planner",
+      message: "Deliver once.",
+    };
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, request);
+    await waitForOutboxResults(results, 1);
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, request);
+
+    const [, duplicate] = await waitForOutboxResults(results, 2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(duplicate?.status, "rejected");
+    assert.equal(duplicate?.code, "duplicate_request");
+    assert.equal(deliveredMessages.filter((message) => message.id === "outbox-duplicate-1").length, 1);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("extension outbox fails closed when confirmation needs unavailable UI", async () => {
+  await withConfirmSendEnabled(async () => {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const harness = createExtensionHarness("outbox-no-ui", { hasUI: false });
+    const results: IntercomOutboxResultV1[] = [];
+
+    harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => results.push(payload as IntercomOutboxResultV1));
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+      version: 1,
+      requestId: "outbox-no-ui-1",
+      extensionId: "example-extension",
+      extensionName: "Example Extension",
+      to: "planner",
+      message: "Needs confirmation.",
+    });
+
+    const [result] = await waitForOutboxResults(results, 1);
+    assert.equal(result?.status, "blocked");
+    assert.equal(result?.code, "confirmation_unavailable");
+    assert.equal(harness.entries.some((entry) => entry.type === "intercom_outbox_result"
+      && (entry.data as { code?: string }).code === "confirmation_unavailable"), true);
+    await harness.emitLifecycle("session_shutdown");
+  });
+});
+
+test("extension outbox settles pending confirmation on session shutdown", async () => {
+  await withConfirmSendEnabled(async () => {
+    const { cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const confirmCalls: string[] = [];
+    const harness = createExtensionHarness("outbox-shutdown", {
+      hasUI: true,
+      ui: {
+        confirm: (title: string) => {
+          confirmCalls.push(title);
+          return new Promise<boolean>(() => undefined);
+        },
+      },
+    });
+    const results: IntercomOutboxResultV1[] = [];
+
+    try {
+      harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => results.push(payload as IntercomOutboxResultV1));
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+        version: 1,
+        requestId: "outbox-shutdown-1",
+        extensionId: "example-extension",
+        extensionName: "Example Extension",
+        to: "planner",
+        message: "Will shut down.",
+      });
+      const deadline = Date.now() + 3000;
+      while (confirmCalls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(confirmCalls.length, 1);
+      await harness.emitLifecycle("session_shutdown");
+
+      const [result] = await waitForOutboxResults(results, 1);
+      assert.equal(result?.status, "failed");
+      assert.equal(result?.code, "session_ended");
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+});
+
 test("intercom tool renders compact call and result rows", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness();
@@ -2477,6 +2906,70 @@ test("intercom tool result hook marks failed details as errors", async () => {
     details: { delivered: true },
   });
   assert.deepEqual(okResults.filter(Boolean), []);
+});
+
+test("obsolete toolVisibility config never hides or reveals the intercom tool", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+
+  await withIntercomConfig({ toolVisibility: "after-first-use" }, async () => {
+    const { planner, cleanup } = await setupClients();
+    let selectedSession: SessionInfo | undefined;
+    let overlayStep = 0;
+    const overlayHarness = createExtensionHarness("lazy-overlay-worker", {
+      hasUI: true,
+      activeTools: ["read"],
+      ui: {
+        notify: () => undefined,
+        custom: async () => {
+          overlayStep += 1;
+          return overlayStep === 1
+            ? selectedSession
+            : { sent: true, messageId: "overlay-message", text: "Hello from the overlay" };
+        },
+      },
+    });
+    const inboundHarness = createExtensionHarness("lazy-inbound-worker", {
+      hasUI: true,
+      activeTools: ["read"],
+    });
+
+    try {
+      piIntercomExtension(overlayHarness.pi as never);
+      piIntercomExtension(inboundHarness.pi as never);
+      await overlayHarness.emitLifecycle("session_start");
+      await inboundHarness.emitLifecycle("session_start");
+      assert.equal(overlayHarness.getActiveTools().includes("intercom"), true);
+      assert.equal(inboundHarness.getActiveTools().includes("intercom"), true);
+
+      selectedSession = await waitForSessionByName(planner, "planner");
+      const inboundSession = await waitForSessionByName(planner, "lazy-inbound-worker");
+      const delivered = await planner.send(inboundSession.id, {
+        messageId: "stable-inbound-message",
+        text: "Keep intercom active before injecting this message.",
+      });
+      assert.equal(delivered.delivered, true);
+      const deadline = Date.now() + 1000;
+      while (inboundHarness.sentMessages.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(inboundHarness.sentMessages[0]?.activeTools.includes("intercom"), true);
+
+      await inboundHarness.emitLifecycle("tool_result", {
+        toolName: "read",
+        input: { path: path.join(repoDir, "skills", "pi-intercom", "SKILL.md") },
+        isError: false,
+      });
+      assert.equal(inboundHarness.getActiveTools().includes("intercom"), true);
+
+      await overlayHarness.commands.get("intercom")!("", overlayHarness.ctx);
+      assert.equal(overlayStep, 2);
+      assert.equal(overlayHarness.getActiveTools().includes("intercom"), true);
+    } finally {
+      await overlayHarness.emitLifecycle("session_shutdown");
+      await inboundHarness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
 });
 
 test("contact supervisor tool renders reason and reply state", async () => {
@@ -4415,6 +4908,43 @@ test("intercom reply sends attachments", { concurrency: false }, async () => {
 
     const sentEntry = harness.entries.find((entry) => entry.type === "intercom_sent");
     assert.deepEqual((sentEntry?.data as { message?: { attachments?: unknown } }).message?.attachments, attachments);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("intercom send refuses a different target during an active inbound ask turn", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("cwd-reply-worker");
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "cwd-reply-worker");
+
+    assert.equal((await planner.send(worker.id, {
+      messageId: "cwd-hierarchy-ask",
+      text: "Please answer me, not the repo-root session.",
+      expectsReply: true,
+    })).delivered, true);
+    const deadline = Date.now() + 1000;
+    while (harness.sentMessages.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await harness.emitLifecycle("turn_start");
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("misdirected-send", {
+      action: "send",
+      to: "orchestrator",
+      message: "This was meant as the ask answer.",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    assert.equal(result.details?.error, true);
+    assert.equal(result.details?.replyTo, "cwd-hierarchy-ask");
+    assert.match(result.content[0]?.text ?? "", /Refusing non-reply send to "orchestrator"/);
   } finally {
     await harness.emitLifecycle("session_shutdown");
     await cleanup();

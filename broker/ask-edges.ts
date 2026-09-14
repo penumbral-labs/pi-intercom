@@ -23,12 +23,24 @@ import { STALE_ASK_RETENTION_MS } from "../config.ts";
 export interface AskEdge {
   readonly from: string;
   readonly to: string;
+  /** Routing scope both parties registered under, absent for the default unscoped routing space. */
+  readonly scopeId?: string;
   readonly createdAt: number;
+}
+
+/**
+ * An edge that left the map, with the scope needed to locate its durable pending-ask record.
+ * Bulk removals can span scopes, so the scope cannot be supplied by the caller.
+ */
+export interface AskEdgeRemoval {
+  readonly messageId: string;
+  readonly scopeId?: string;
 }
 
 interface StoredAskEdge {
   from: string;
   to: string;
+  scopeId?: string;
   createdAt: number;
   // Cached `${from}\0${to}` key so active counters can be maintained without recomputing.
   pairKey: string;
@@ -114,12 +126,13 @@ export class AskEdges {
   }
 
   // Adds an edge, replacing any edge already stored under the same message id.
-  add(messageId: string, from: string, to: string, now = Date.now()): void {
+  add(messageId: string, from: string, to: string, now = Date.now(), scopeId?: string): void {
     this.delete(messageId);
     const key = pairKey(from, to);
     this.edges.set(messageId, {
       from,
       to,
+      ...(scopeId ? { scopeId } : {}),
       pairKey: key,
       createdAt: now,
       active: true,
@@ -177,12 +190,12 @@ export class AskEdges {
   // Removes timed-out asks from deadlock and active-capacity accounting while retaining a bounded
   // set for late-reply authorization. Returns newly expired and evicted IDs so durable waiter
   // records can be removed without scanning their directory on every send.
-  expireActiveOlderThan(maxAgeMs: number, now = Date.now()): string[] {
-    const expired: string[] = [];
+  expireActiveOlderThan(maxAgeMs: number, now = Date.now()): AskEdgeRemoval[] {
+    const expired: AskEdgeRemoval[] = [];
     for (const [messageId, edge] of this.edges) {
       if (edge.active && now - edge.createdAt > maxAgeMs) {
         this.deactivate(edge);
-        expired.push(messageId);
+        expired.push({ messageId, ...(edge.scopeId ? { scopeId: edge.scopeId } : {}) });
       }
     }
     if (this.replyOnlyCount <= this.maxReplyOnly) return expired;
@@ -190,10 +203,13 @@ export class AskEdges {
     const replyOnly = Array.from(this.edges.entries())
       .filter(([, edge]) => !edge.active)
       .sort(([, left], [, right]) => left.createdAt - right.createdAt || left.insertionOrder - right.insertionOrder);
-    for (const [messageId] of replyOnly) {
+    for (const [messageId, edge] of replyOnly) {
       if (this.replyOnlyCount <= this.maxReplyOnly) break;
+      const scopeId = edge.scopeId;
       this.delete(messageId);
-      if (!expired.includes(messageId)) expired.push(messageId);
+      if (!expired.some((entry) => entry.messageId === messageId)) {
+        expired.push({ messageId, ...(scopeId ? { scopeId } : {}) });
+      }
     }
     return expired;
   }
@@ -207,13 +223,14 @@ export class AskEdges {
     }
   }
 
-  // Drops every edge where `sessionId` is either party and returns their message IDs.
-  deleteForSession(sessionId: string): string[] {
-    const deleted: string[] = [];
+  // Drops every edge where `sessionKey` is either party and returns their message IDs.
+  deleteForSession(sessionKey: string): AskEdgeRemoval[] {
+    const deleted: AskEdgeRemoval[] = [];
     for (const [messageId, edge] of this.edges) {
-      if (edge.from === sessionId || edge.to === sessionId) {
+      if (edge.from === sessionKey || edge.to === sessionKey) {
+        const scopeId = edge.scopeId;
         this.delete(messageId);
-        deleted.push(messageId);
+        deleted.push({ messageId, ...(scopeId ? { scopeId } : {}) });
       }
     }
     return deleted;
