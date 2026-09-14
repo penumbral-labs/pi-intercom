@@ -269,6 +269,7 @@ async function connectRawRegistered(
   name: string,
   sessionOverrides: Record<string, unknown> = {},
   features?: string[],
+  scopeId?: string,
 ) {
   const net = await import("node:net");
   const { getBrokerSocketPath } = await import("./broker/paths.ts");
@@ -289,6 +290,7 @@ async function connectRawRegistered(
   writeMessage(socket, {
     type: "register",
     sessionId,
+    ...(scopeId ? { scopeId } : {}),
     ...(features ? { features } : {}),
     session: {
       name,
@@ -963,6 +965,61 @@ test("broker cancels a same-id message only for the sender's own scope", { concu
     assert.deepEqual(alphaCancellations, ["cancel-alpha-sender"]);
   } finally {
     await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    await cleanup();
+  }
+});
+
+test("broker fails an exact send to a target outside the sender's scope as terminal", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  // The client resolves targets from its own scoped session list, so only a raw send can carry an
+  // exact target that the sender's scope cannot see.
+  const raw = await connectRawRegistered("exact-scope-sender", "exact-scope-sender", {}, undefined, "exact-scope");
+  const outsideTarget = new IntercomClient();
+  const { createMessageReader } = await import("./broker/framing.ts");
+
+  try {
+    await outsideTarget.connect({
+      name: "exact-outside-target",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "exact-outside-target-id");
+    const target = await waitForSessionId(planner, "exact-outside-target-id");
+    const received: Message[] = [];
+    outsideTarget.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+
+    const delivery = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const reader = createMessageReader((message) => {
+        if (typeof message === "object" && message !== null && "type" in message && message.type === "delivery_failed") {
+          raw.socket.off("data", reader);
+          resolve(message as Record<string, unknown>);
+        }
+      }, reject);
+      raw.socket.on("data", reader);
+    });
+    raw.writeMessage(raw.socket, {
+      type: "send",
+      to: "exact-outside-target-id",
+      targetId: "exact-outside-target-id",
+      targetEpoch: target.endpointEpoch,
+      message: {
+        id: "exact-cross-scope",
+        timestamp: Date.now(),
+        content: { text: "must not cross the scope boundary" },
+      },
+    });
+
+    const result = await delivery;
+    assert.equal(result.code, "E_TARGET_NOT_FOUND");
+    assert.equal(result.retryable, false);
+    assert.equal(result.outcomeKnown, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(received, []);
+  } finally {
+    raw.socket.destroy();
+    await outsideTarget.disconnect().catch(() => undefined);
     await cleanup();
   }
 });
