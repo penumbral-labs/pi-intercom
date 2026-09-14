@@ -59,8 +59,14 @@ export type AskEdgeCapacity = { ok: true } | AskEdgeCapacityRefusal;
 export const MAX_PENDING_ASK_EDGES_PER_SESSION = 16;
 export const ASK_REPLY_AUTHORIZATION_RETENTION_MS = STALE_ASK_RETENTION_MS;
 
-function pairKey(from: string, to: string): string {
-  return `${from}\0${to}`;
+// The pair and asker indexes are scoped too, so the abstraction isolates scopes on its own rather
+// than relying on callers to pass scope-embedded party keys.
+function pairKey(scopeId: string | undefined, from: string, to: string): string {
+  return `${scopeId ?? ""}\0${from}\0${to}`;
+}
+
+function askerKey(scopeId: string | undefined, from: string): string {
+  return `${scopeId ?? ""}\0${from}`;
 }
 
 // Message IDs are caller-controlled, so per-message broker state must be keyed by routing scope as
@@ -130,7 +136,7 @@ export class AskEdges {
     for (const edge of replaced) {
       if (edge.from === from) replacedForAsker += 1;
     }
-    const askerCountAfterReplacement = (this.activeByAsker.get(from) ?? 0) - replacedForAsker;
+    const askerCountAfterReplacement = (this.activeByAsker.get(askerKey(scopeId, from)) ?? 0) - replacedForAsker;
     if (askerCountAfterReplacement >= this.maxPerSession) {
       return { ok: false, reason: "Too many pending intercom asks from this session" };
     }
@@ -140,7 +146,7 @@ export class AskEdges {
   // Adds an edge, replacing any edge already stored under the same scope and message id.
   add(scopeId: string | undefined, messageId: string, from: string, to: string, now = Date.now()): void {
     this.delete(scopeId, messageId);
-    const key = pairKey(from, to);
+    const key = pairKey(scopeId, from, to);
     this.edges.set(scopedMessageKey(scopeId, messageId), {
       messageId,
       from,
@@ -152,7 +158,7 @@ export class AskEdges {
       insertionOrder: this.nextInsertionOrder++,
     });
     this.activeCount += 1;
-    this.increment(this.activeByAsker, from);
+    this.increment(this.activeByAsker, askerKey(scopeId, from));
     this.increment(this.activeByPair, key);
   }
 
@@ -172,7 +178,7 @@ export class AskEdges {
     }
     if (edge.active) this.decrement(this.activeByPair, edge.pairKey);
     edge.to = nextTo;
-    edge.pairKey = pairKey(edge.from, nextTo);
+    edge.pairKey = pairKey(edge.scopeId, edge.from, nextTo);
     if (edge.active) this.increment(this.activeByPair, edge.pairKey);
     return true;
   }
@@ -182,7 +188,7 @@ export class AskEdges {
   // `excludingMessageId` omits one edge from consideration, so replying to an ask does not count
   // that same ask as the blocking reverse edge.
   hasReverse(scopeId: string | undefined, from: string, to: string, excludingMessageId?: string): boolean {
-    const reverse = pairKey(to, from);
+    const reverse = pairKey(scopeId, to, from);
     let count = this.activeByPair.get(reverse) ?? 0;
     if (excludingMessageId !== undefined) {
       const excluded = this.edges.get(scopedMessageKey(scopeId, excludingMessageId));
@@ -271,7 +277,7 @@ export class AskEdges {
 
   private releaseActive(edge: StoredAskEdge): void {
     this.activeCount -= 1;
-    this.decrement(this.activeByAsker, edge.from);
+    this.decrement(this.activeByAsker, askerKey(edge.scopeId, edge.from));
     this.decrement(this.activeByPair, edge.pairKey);
   }
 

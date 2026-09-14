@@ -275,10 +275,18 @@ test("the same message id in two scopes is two independent edges", () => {
   assert.equal(edges.rekeyTarget("team-1", "shared-id", "team-1-replacement"), true);
   assert.equal(edges.get("team-2", "shared-id")?.to, "team-2-target");
   assert.equal(edges.hasReverse("team-2", "team-2-target", "team-2-asker", "shared-id"), false);
-  assert.equal(edges.hasReverse("team-1", "team-2-target", "team-2-asker", "shared-id"), true, "another scope's id must not exclude this edge");
+  assert.equal(edges.hasReverse("team-1", "team-2-target", "team-2-asker"), false, "another scope's edges never form a mutual ask here");
   assert.equal(edges.delete("team-1", "shared-id"), true);
   assert.equal(edges.has("team-2", "shared-id"), true);
   assert.equal(edges.delete(undefined, "shared-id"), false);
+});
+
+test("per-session capacity is counted within one scope", () => {
+  const edges = new AskEdges(GLOBAL_CAP, 1);
+  edges.add("team-1", "a", "asker", "target", 1000);
+  assert.equal(edges.canAdd("team-1", "asker").ok, false, "the asker is at capacity in its own scope");
+  assert.equal(edges.canAdd("team-2", "asker").ok, true, "the same raw asker string in another scope starts from zero");
+  assert.equal(edges.canAdd(undefined, "asker").ok, true);
 });
 
 test("capacity replacement only discounts edges in the caller's scope", () => {
