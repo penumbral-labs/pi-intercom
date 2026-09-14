@@ -424,3 +424,103 @@ test("wire-level opaque flow remains private and ordinary traffic remains usable
     assert.equal((await sender.send("wire-receiver", { text: "ordinary-after-opaque" })).delivered, true);
   });
 });
+
+async function withIntercomScope<T>(scopeId: string | undefined, fn: () => T | Promise<T>): Promise<T> {
+  const previous = process.env.PI_INTERCOM_SCOPE_ID;
+  if (scopeId === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
+  else process.env.PI_INTERCOM_SCOPE_ID = scopeId;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
+    else process.env.PI_INTERCOM_SCOPE_ID = previous;
+  }
+}
+
+test("scoped opaque dispatch is invisible and unreachable from an out-of-scope session", { concurrency: false }, async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-intercom-opaque-scope-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const broker = spawn(process.execPath, [getTsxCliPath(), join(process.cwd(), "broker", "broker.ts")], {
+    cwd: process.cwd(),
+    env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  // Both receivers claim the same session ID. Only the routing scope distinguishes them, so this
+  // is the case that fails if opaque dispatch resolves endpoints by bare session ID.
+  const sharedReceiverId = "shared-opaque-receiver";
+  const alphaSender = new IntercomClient();
+  const alphaReceiver = new IntercomClient();
+  const outsideSender = new IntercomClient();
+  const outsideReceiver = new IntercomClient();
+  const clients = [alphaSender, alphaReceiver, outsideSender, outsideReceiver];
+  try {
+    await waitForBrokerReady(broker);
+    await withIntercomScope("alpha-scope", async () => {
+      await alphaReceiver.connect(registration("alpha-receiver", receiverNamespace, "receive"), sharedReceiverId);
+      await alphaSender.connect(registration("alpha-sender", senderNamespace, "send"), "alpha-sender");
+    });
+    await withIntercomScope(undefined, async () => {
+      await outsideReceiver.connect(registration("outside-receiver", receiverNamespace, "receive"), sharedReceiverId);
+      await outsideSender.connect(registration("outside-sender", senderNamespace, "send"), "outside-sender");
+    });
+
+    // A peer-capability probe resolves inside the querier's scope, so neither side learns the
+    // other's endpoint epoch even though they share a session ID.
+    const alphaCapability = await alphaSender.peerCapability(sharedReceiverId, receiverNamespace);
+    const outsideCapability = await outsideSender.peerCapability(sharedReceiverId, receiverNamespace);
+    assert.equal(alphaCapability.state, "present");
+    assert.equal(outsideCapability.state, "present");
+    assert.notEqual(alphaCapability.endpointEpoch, outsideCapability.endpointEpoch);
+
+    // A session ID that exists only in alpha-scope is unknown outside it, and a dispatch to it is
+    // refused rather than routed to any same-named unscoped peer.
+    assert.deepEqual(await outsideSender.peerCapability("alpha-sender", receiverNamespace), { state: "unknown" });
+    assert.deepEqual(await outsideSender.sendOpaqueDispatch(senderNamespace, {
+      requestId: "outside-to-alpha-only",
+      toSessionId: "alpha-sender",
+      recipientNamespace: receiverNamespace,
+      payload: { secret: sentinel },
+    }), { accepted: false, requestId: "outside-to-alpha-only", code: "unknown_exact_target" });
+
+    // The in-scope dispatch completes end to end, and the out-of-scope receiver holding the same
+    // session ID never sees the offer or any receipt for it.
+    const outsideFrames: OpaqueDispatchBrokerFrame[] = [];
+    const stopOutside = outsideReceiver.onOpaqueDispatch((frame) => outsideFrames.push(frame));
+    const offered = nextOffer(alphaReceiver);
+    const acceptedPromise = alphaSender.sendOpaqueDispatch(senderNamespace, {
+      requestId: "alpha-scoped-request",
+      toSessionId: sharedReceiverId,
+      recipientNamespace: receiverNamespace,
+      payload: { secret: sentinel },
+    });
+    const offer = await offered;
+    assert.equal(offer.toSessionId, sharedReceiverId);
+    assert.equal(offer.endpointEpoch, alphaCapability.endpointEpoch);
+    alphaReceiver.sendOpaqueReservationResult(offer.messageId, offer.reservationId, "reserved");
+    const accepted = await acceptedPromise;
+    assert.equal(accepted.accepted, true);
+    assert.deepEqual(await alphaReceiver.claimOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId), { claimed: true });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    stopOutside();
+    assert.deepEqual(outsideFrames, []);
+    assert.equal(JSON.stringify(outsideFrames).includes(sentinel), false);
+
+    // The out-of-scope receiver cannot settle the alpha reservation even with the exact message and
+    // reservation IDs: reservation authority is bound to the target inside its own scope.
+    const outsideClaim = await outsideReceiver.claimOpaqueDispatch(receiverNamespace, offer.messageId, offer.reservationId);
+    assert.deepEqual(outsideClaim, { claimed: false, code: "stale_reservation" });
+
+    // Ordinary routing in the out-of-scope space still reaches its own same-named receiver.
+    assert.equal((await outsideSender.listSessions()).some((session) => session.name === "alpha-receiver"), false);
+  } finally {
+    await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    if (broker.exitCode === null && broker.signalCode === null) {
+      broker.kill("SIGTERM");
+      await once(broker, "exit").catch(() => undefined);
+    }
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
