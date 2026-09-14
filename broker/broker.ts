@@ -8,7 +8,7 @@ import {
   createMessageReader,
   IntercomFrameTooLargeError,
 } from "./framing.ts";
-import { ASK_REPLY_AUTHORIZATION_RETENTION_MS, AskEdges } from "./ask-edges.ts";
+import { ASK_REPLY_AUTHORIZATION_RETENTION_MS, AskEdges, scopedMessageKey } from "./ask-edges.ts";
 import {
   isBoundedId,
   isExtensionCapability,
@@ -244,6 +244,8 @@ function ensurePendingAskRecordDir(): void {
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
   private askEdges = new AskEdges(MAX_SESSIONS * 4);
+  // Keyed by scopedMessageKey: message IDs are caller-controlled, so a same-id send in another
+  // scope must not overwrite, read, or delete this scope's route.
   private messageReceiptRoutes = new Map<string, MessageReceiptRoute>();
   private disconnectedSessions = new Map<string, DisconnectedSession>();
   private mailboxMessages: MailboxMessage[] = [];
@@ -809,7 +811,7 @@ class IntercomBroker {
           const target = targets[0];
           let ownedSupersededAskId: string | undefined;
           if (message.supersedes) {
-            const supersededRoute = this.messageReceiptRoutes.get(message.supersedes);
+            const supersededRoute = this.messageReceiptRoutes.get(scopedMessageKey(fromSession.scopeId, message.supersedes));
             if (!supersededRoute || supersededRoute.from !== currentKey || supersededRoute.to !== target.key) {
               writeMessage(socket, deliveryFailed(message.id, "Supersede target does not match a previous message from this sender to this receiver", "E_SUPERSEDE_TARGET"));
               break;
@@ -905,7 +907,7 @@ class IntercomBroker {
             this.askEdges.add(fromSession.scopeId, message.id, currentKey, target.key, Date.now());
             this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt);
           }
-          this.messageReceiptRoutes.set(message.id, { from: currentKey, to: target.key, createdAt: brokerReceivedAt });
+          this.messageReceiptRoutes.set(scopedMessageKey(fromSession.scopeId, message.id), { from: currentKey, to: target.key, createdAt: brokerReceivedAt });
           this.recordDelivery(currentKey, message.id, fingerprint, "socket_delivered");
           writeMessage(socket, delivered(message.id));
           break;
@@ -958,7 +960,7 @@ class IntercomBroker {
               }
               throw error;
             }
-            this.messageReceiptRoutes.set(message.id, { from: currentKey, to: liveMailboxTarget.key, createdAt: brokerReceivedAt });
+            this.messageReceiptRoutes.set(scopedMessageKey(fromSession.scopeId, message.id), { from: currentKey, to: liveMailboxTarget.key, createdAt: brokerReceivedAt });
           } else {
             this.queueMailboxMessage(fromSession, disconnectedTarget, message, brokerReceivedAt);
           }
@@ -989,8 +991,12 @@ class IntercomBroker {
           throw new Error("Invalid message_receipt message");
         }
         this.pruneMessageReceiptRoutes();
-        const route = this.messageReceiptRoutes.get(clientMessage.receipt.messageId);
         const receiver = this.sessions.get(currentKey);
+        // Routes are keyed by the sender's scope, and a message never crosses scopes, so the
+        // receiver's own scope is the only one that can hold its route.
+        const route = receiver
+          ? this.messageReceiptRoutes.get(scopedMessageKey(receiver.scopeId, clientMessage.receipt.messageId))
+          : undefined;
         const sender = route ? this.sessions.get(route.from) : undefined;
         if (route?.to === currentKey && receiver?.socket === socket && sender) {
           this.forwardMessageReceipt(sender.socket, receiver.info, clientMessage.receipt);
@@ -1032,7 +1038,9 @@ class IntercomBroker {
           writeMessage(socket, delivered(clientMessage.messageId));
           break;
         }
-        const route = this.messageReceiptRoutes.get(clientMessage.messageId);
+        const route = sender
+          ? this.messageReceiptRoutes.get(scopedMessageKey(sender.scopeId, clientMessage.messageId))
+          : undefined;
         const receiver = route ? this.sessions.get(route.to) : undefined;
         if (route?.from !== currentKey || sender?.socket !== socket || !receiver) {
           writeMessage(socket, deliveryFailed(clientMessage.messageId, "Message cannot be cancelled by this session"));
@@ -1503,7 +1511,7 @@ class IntercomBroker {
           this.askEdges.delete(entry.fromScopeId, entry.message.id);
         }
         this.emitBrokerReceipt(this.sessions.get(entry.fromKey)?.socket, entry.message.id, "expired", now);
-        this.messageReceiptRoutes.delete(entry.message.id);
+        this.messageReceiptRoutes.delete(scopedMessageKey(entry.fromScopeId, entry.message.id));
         this.updateDeliveryRecord(entry.fromKey, entry.message.id, "failed", "Mailbox delivery expired", "E_DELIVERY_EXPIRED");
         this.mailboxMessages.splice(index, 1);
       }
@@ -1519,7 +1527,7 @@ class IntercomBroker {
         this.askEdges.delete(evicted.fromScopeId, evicted.message.id);
       }
       this.emitBrokerReceipt(this.sessions.get(evicted.fromKey)?.socket, evicted.message.id, "expired", brokerReceivedAt);
-      this.messageReceiptRoutes.delete(evicted.message.id);
+      this.messageReceiptRoutes.delete(scopedMessageKey(evicted.fromScopeId, evicted.message.id));
       this.updateDeliveryRecord(evicted.fromKey, evicted.message.id, "failed", "Mailbox capacity evicted the delivery", "E_DELIVERY_EVICTED");
     }
     this.mailboxMessages.push({
@@ -1584,7 +1592,7 @@ class IntercomBroker {
             this.askEdges.delete(entry.fromScopeId, entry.message.id);
             this.removePendingAskRecord(entry.message.id, entry.fromScopeId);
           }
-          this.messageReceiptRoutes.delete(entry.message.id);
+          this.messageReceiptRoutes.delete(scopedMessageKey(entry.fromScopeId, entry.message.id));
           this.updateDeliveryRecord(
             entry.fromKey,
             entry.message.id,
@@ -1610,7 +1618,7 @@ class IntercomBroker {
         // Must go through the owner so the pair index follows the retarget.
         this.askEdges.rekeyTarget(entry.fromScopeId, entry.message.id, session.key);
       }
-      this.messageReceiptRoutes.set(entry.message.id, {
+      this.messageReceiptRoutes.set(scopedMessageKey(entry.fromScopeId, entry.message.id), {
         from: entry.fromKey,
         to: session.key,
         createdAt: now,
@@ -1686,17 +1694,17 @@ class IntercomBroker {
   }
 
   private pruneMessageReceiptRoutes(now = Date.now()): void {
-    for (const [messageId, route] of this.messageReceiptRoutes) {
+    for (const [routeKey, route] of this.messageReceiptRoutes) {
       if (now - route.createdAt > MESSAGE_RECEIPT_ROUTE_RETENTION_MS) {
-        this.messageReceiptRoutes.delete(messageId);
+        this.messageReceiptRoutes.delete(routeKey);
       }
     }
   }
 
   private clearMessageReceiptRoutesForSession(sessionKey: string): void {
-    for (const [messageId, route] of this.messageReceiptRoutes) {
+    for (const [routeKey, route] of this.messageReceiptRoutes) {
       if (route.from === sessionKey || route.to === sessionKey) {
-        this.messageReceiptRoutes.delete(messageId);
+        this.messageReceiptRoutes.delete(routeKey);
       }
     }
   }

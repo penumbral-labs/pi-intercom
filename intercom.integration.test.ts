@@ -884,6 +884,89 @@ test("broker keeps same-id asks in separate scopes independent", { concurrency: 
   }
 });
 
+test("broker routes same-id receipts to the sender in the receipt's own scope", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const clients: Array<InstanceType<typeof IntercomClient>> = [];
+  try {
+    const alphaSender = new IntercomClient();
+    const alphaReceiver = new IntercomClient();
+    const betaSender = new IntercomClient();
+    const betaReceiver = new IntercomClient();
+    clients.push(alphaSender, alphaReceiver, betaSender, betaReceiver);
+
+    const alphaReceipts: string[] = [];
+    const betaReceipts: string[] = [];
+    alphaSender.onMessageReceipt((from: SessionInfo, receipt) => {
+      if (receipt.messageId === "shared-receipt-id" && from.id !== BROKER_SESSION_ID) alphaReceipts.push(from.id);
+    });
+    betaSender.onMessageReceipt((from: SessionInfo, receipt) => {
+      if (receipt.messageId === "shared-receipt-id" && from.id !== BROKER_SESSION_ID) betaReceipts.push(from.id);
+    });
+
+    await connectClientWithScope(alphaSender, "receipt-alpha", "receipt-alpha-sender", "receipt-alpha-sender");
+    await connectClientWithScope(alphaReceiver, "receipt-alpha", "receipt-alpha-receiver", "receipt-alpha-receiver");
+    await connectClientWithScope(betaSender, "receipt-beta", "receipt-beta-sender", "receipt-beta-sender");
+    await connectClientWithScope(betaReceiver, "receipt-beta", "receipt-beta-receiver", "receipt-beta-receiver");
+
+    assert.equal((await alphaSender.send("receipt-alpha-receiver", { messageId: "shared-receipt-id", text: "alpha body" })).delivered, true);
+    // The later same-id send in another scope must not take over the first sender's route.
+    assert.equal((await betaSender.send("receipt-beta-receiver", { messageId: "shared-receipt-id", text: "beta body" })).delivered, true);
+
+    alphaReceiver.sendMessageReceipt({ messageId: "shared-receipt-id", status: "receiver_received", timestamp: Date.now() });
+    betaReceiver.sendMessageReceipt({ messageId: "shared-receipt-id", status: "receiver_received", timestamp: Date.now() });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.deepEqual(alphaReceipts, ["receipt-alpha-receiver"]);
+    assert.deepEqual(betaReceipts, ["receipt-beta-receiver"]);
+  } finally {
+    await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    await cleanup();
+  }
+});
+
+test("broker cancels a same-id message only for the sender's own scope", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const clients: Array<InstanceType<typeof IntercomClient>> = [];
+  try {
+    const alphaSender = new IntercomClient();
+    const alphaReceiver = new IntercomClient();
+    const betaSender = new IntercomClient();
+    const betaReceiver = new IntercomClient();
+    clients.push(alphaSender, alphaReceiver, betaSender, betaReceiver);
+
+    const alphaCancellations: string[] = [];
+    const betaCancellations: string[] = [];
+    alphaReceiver.onMessageControl((from: SessionInfo, control) => {
+      if (control.messageId === "shared-cancel-id" && control.action === "cancel") alphaCancellations.push(from.id);
+    });
+    betaReceiver.onMessageControl((from: SessionInfo, control) => {
+      if (control.messageId === "shared-cancel-id" && control.action === "cancel") betaCancellations.push(from.id);
+    });
+
+    await connectClientWithScope(alphaSender, "cancel-alpha", "cancel-alpha-sender", "cancel-alpha-sender");
+    await connectClientWithScope(alphaReceiver, "cancel-alpha", "cancel-alpha-receiver", "cancel-alpha-receiver");
+    await connectClientWithScope(betaSender, "cancel-beta", "cancel-beta-sender", "cancel-beta-sender");
+    await connectClientWithScope(betaReceiver, "cancel-beta", "cancel-beta-receiver", "cancel-beta-receiver");
+
+    assert.equal((await alphaSender.send("cancel-alpha-receiver", { messageId: "shared-cancel-id", text: "alpha body" })).delivered, true);
+    assert.equal((await betaSender.send("cancel-beta-receiver", { messageId: "shared-cancel-id", text: "beta body" })).delivered, true);
+
+    const alphaCancel = await alphaSender.cancelMessage("shared-cancel-id");
+    assert.equal(alphaCancel.delivered, true, `the first sender must still own its route: ${alphaCancel.reason ?? ""}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(alphaCancellations, ["cancel-alpha-sender"]);
+    assert.deepEqual(betaCancellations, [], "cancelling in one scope must not reach another scope's receiver");
+
+    assert.equal((await betaSender.cancelMessage("shared-cancel-id")).delivered, true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(betaCancellations, ["cancel-beta-sender"]);
+    assert.deepEqual(alphaCancellations, ["cancel-alpha-sender"]);
+  } finally {
+    await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    await cleanup();
+  }
+});
+
 test("broker rotates endpoint epochs and replays same message ids without duplicate delivery", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const replacement = new IntercomClient();
