@@ -1266,20 +1266,21 @@ class IntercomBroker {
     });
   }
 
-  private deliveryRecordKey(fromSessionId: string, messageId: string): string {
-    return JSON.stringify([fromSessionId, messageId]);
+  // Keyed by the sender's scoped session key, so one scope's replay history cannot answer another's.
+  private deliveryRecordKey(fromSessionKey: string, messageId: string): string {
+    return JSON.stringify([fromSessionKey, messageId]);
   }
 
   private replayOrRejectDelivery(
     socket: net.Socket,
-    fromSessionId: string,
+    fromSessionKey: string,
     messageId: string,
     fingerprint: string,
     operationId?: string,
     now = deliveryRecordNow(),
   ): boolean {
     this.pruneDeliveryRecords(now);
-    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
+    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionKey, messageId));
     if (!record) return false;
     if (record.fingerprint !== fingerprint) {
       writeMessage(socket, {
@@ -1320,7 +1321,7 @@ class IntercomBroker {
   }
 
   private recordDelivery(
-    fromSessionId: string,
+    fromSessionKey: string,
     messageId: string,
     fingerprint: string,
     state: DeliveryRecord["state"],
@@ -1335,7 +1336,7 @@ class IntercomBroker {
       if (oldest === undefined) break;
       this.deliveryRecords.delete(oldest);
     }
-    this.deliveryRecords.set(this.deliveryRecordKey(fromSessionId, messageId), {
+    this.deliveryRecords.set(this.deliveryRecordKey(fromSessionKey, messageId), {
       fingerprint,
       state,
       ...(reason ? { reason } : {}),
@@ -1351,8 +1352,8 @@ class IntercomBroker {
     }
   }
 
-  private updateDeliveryRecord(fromSessionId: string, messageId: string, state: DeliveryRecord["state"], reason?: string, code?: string): void {
-    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
+  private updateDeliveryRecord(fromSessionKey: string, messageId: string, state: DeliveryRecord["state"], reason?: string, code?: string): void {
+    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionKey, messageId));
     if (!record) return;
     record.state = state;
     record.reason = reason;
