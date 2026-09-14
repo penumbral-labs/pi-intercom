@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { MAX_PENDING_ASK_EDGES_PER_SESSION } from "./broker/ask-edges.ts";
@@ -552,12 +553,18 @@ function pendingAskRecordPath(messageId: string): string {
   return path.join(sharedHomeDir, ".pi", "agent", "intercom", "pending-asks", `${encodeURIComponent(messageId)}.json`);
 }
 
+// Mirrors the broker's scoped record path so a scoped ask can be inspected from the test process.
+function scopedPendingAskRecordPath(scopeId: string, messageId: string): string {
+  const scopeHash = createHash("sha256").update(scopeId).digest("hex");
+  return path.join(sharedHomeDir, ".pi", "agent", "intercom", "pending-asks", `${scopeHash}-${encodeURIComponent(messageId)}.json`);
+}
+
 function readPendingAskRecord(messageId: string): Record<string, unknown> {
   return JSON.parse(readFileSync(pendingAskRecordPath(messageId), "utf8")) as Record<string, unknown>;
 }
 
-async function waitForPendingAskRecordRemoved(messageId: string): Promise<void> {
-  const filePath = pendingAskRecordPath(messageId);
+async function waitForPendingAskRecordRemoved(messageId: string, scopeId?: string): Promise<void> {
+  const filePath = scopeId ? scopedPendingAskRecordPath(scopeId, messageId) : pendingAskRecordPath(messageId);
   const deadline = Date.now() + 1000;
   while (Date.now() < deadline) {
     if (!existsSync(filePath)) return;
@@ -804,6 +811,76 @@ test("broker scopes discovery, routing, mailbox, and presence", { concurrency: f
     await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
     if (broker.exitCode === null && broker.signalCode === null) broker.kill("SIGTERM");
     await once(broker, "exit").catch(() => undefined);
+  }
+});
+
+test("broker keeps same-id asks in separate scopes independent", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const clients: Array<InstanceType<typeof IntercomClient>> = [];
+  try {
+    const alphaAsker = new IntercomClient();
+    const alphaTarget = new IntercomClient();
+    const betaAsker = new IntercomClient();
+    const betaTarget = new IntercomClient();
+    clients.push(alphaAsker, alphaTarget, betaAsker, betaTarget);
+
+    const alphaAsked: Message[] = [];
+    const betaAsked: Message[] = [];
+    const alphaReplies: Message[] = [];
+    const betaReplies: Message[] = [];
+    alphaTarget.on("message", (_from: SessionInfo, message: Message) => alphaAsked.push(message));
+    betaTarget.on("message", (_from: SessionInfo, message: Message) => betaAsked.push(message));
+    alphaAsker.on("message", (_from: SessionInfo, message: Message) => alphaReplies.push(message));
+    betaAsker.on("message", (_from: SessionInfo, message: Message) => betaReplies.push(message));
+
+    await connectClientWithScope(alphaAsker, "ask-alpha", "ask-alpha-asker", "ask-alpha-asker");
+    await connectClientWithScope(alphaTarget, "ask-alpha", "ask-alpha-target", "ask-alpha-target");
+    await connectClientWithScope(betaAsker, "ask-beta", "ask-beta-asker", "ask-beta-asker");
+    await connectClientWithScope(betaTarget, "ask-beta", "ask-beta-target", "ask-beta-target");
+
+    assert.equal((await alphaAsker.send("ask-alpha-target", {
+      messageId: "shared-ask-id",
+      text: "alpha question",
+      expectsReply: true,
+    })).delivered, true);
+    const betaAsk = await betaAsker.send("ask-beta-target", {
+      messageId: "shared-ask-id",
+      text: "beta question",
+      expectsReply: true,
+    });
+    assert.equal(betaAsk.delivered, true, `a pending ask id in another scope must not block this ask: ${betaAsk.reason ?? ""}`);
+
+    await waitForReplyMessage(alphaAsked, "shared-ask-id");
+    await waitForReplyMessage(betaAsked, "shared-ask-id");
+    assert.equal(existsSync(scopedPendingAskRecordPath("ask-alpha", "shared-ask-id")), true);
+    assert.equal(existsSync(scopedPendingAskRecordPath("ask-beta", "shared-ask-id")), true);
+
+    assert.equal((await alphaTarget.send("ask-alpha-asker", {
+      messageId: "alpha-answer",
+      text: "alpha answer",
+      replyTo: "shared-ask-id",
+    })).delivered, true);
+    await waitForReplyMessage(alphaReplies, "alpha-answer");
+    await waitForPendingAskRecordRemoved("shared-ask-id", "ask-alpha");
+    assert.equal(
+      existsSync(scopedPendingAskRecordPath("ask-beta", "shared-ask-id")),
+      true,
+      "replying in one scope must not retire another scope's pending ask",
+    );
+
+    assert.equal((await betaTarget.send("ask-beta-asker", {
+      messageId: "beta-answer",
+      text: "beta answer",
+      replyTo: "shared-ask-id",
+    })).delivered, true);
+    await waitForReplyMessage(betaReplies, "beta-answer");
+    await waitForPendingAskRecordRemoved("shared-ask-id", "ask-beta");
+
+    assert.equal(alphaReplies.some((message) => message.id === "beta-answer"), false);
+    assert.equal(betaReplies.some((message) => message.id === "alpha-answer"), false);
+  } finally {
+    await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    await cleanup();
   }
 });
 

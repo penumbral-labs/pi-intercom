@@ -27,6 +27,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Oversized forwarded receipt details are replaced with a non-sensitive omission notice, or omitted entirely when needed, without leaking the original detail or disconnecting either peer.
 - Extension state commit outcomes are now fenced to the local registration generation that issued them, so a replacement registration cannot receive a disposed predecessor's result.
 - Lexically equivalent Windows agent-directory spellings now canonicalize to the same broker named-pipe path while agent directories that differ in component case remain isolated.
+- Pending ask edges are now keyed by routing scope and message ID, so a caller-controlled ask ID reused in another scope no longer collides with, replaces, or retires an unrelated scope's pending ask.
 
 ### Reconciled
 

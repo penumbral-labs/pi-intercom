@@ -1,4 +1,5 @@
 import { STALE_ASK_RETENTION_MS } from "../config.ts";
+import { scopedSessionKey } from "./opaque-dispatch.ts";
 
 // Sole owner of pending ask-edge state.
 //
@@ -36,6 +37,8 @@ export interface AskEdgeRemoval {
 }
 
 interface StoredAskEdge {
+  // Retained because the map is keyed by the scoped key, and bulk removals must report the raw id.
+  messageId: string;
   from: string;
   to: string;
   scopeId?: string;
@@ -58,6 +61,17 @@ export const ASK_REPLY_AUTHORIZATION_RETENTION_MS = STALE_ASK_RETENTION_MS;
 
 function pairKey(from: string, to: string): string {
   return `${from}\0${to}`;
+}
+
+// Message IDs are caller-controlled, so per-message broker state must be keyed by routing scope as
+// well: otherwise one scope can observe, replace, or evict another scope's entry for the same id.
+// Delegates to the session-key builder so scoped keys have exactly one encoding.
+export function scopedMessageKey(scopeId: string | undefined, messageId: string): string {
+  return scopedSessionKey(scopeId, messageId);
+}
+
+function removalOf(edge: StoredAskEdge): AskEdgeRemoval {
+  return { messageId: edge.messageId, ...(edge.scopeId ? { scopeId: edge.scopeId } : {}) };
 }
 
 export class AskEdges {
@@ -86,12 +100,12 @@ export class AskEdges {
     return this.replyOnlyCount;
   }
 
-  get(messageId: string): AskEdge | undefined {
-    return this.edges.get(messageId);
+  get(scopeId: string | undefined, messageId: string): AskEdge | undefined {
+    return this.edges.get(scopedMessageKey(scopeId, messageId));
   }
 
-  has(messageId: string): boolean {
-    return this.edges.has(messageId);
+  has(scopeId: string | undefined, messageId: string): boolean {
+    return this.edges.has(scopedMessageKey(scopeId, messageId));
   }
 
   // Whether adding an edge from `from` is allowed.
@@ -99,13 +113,13 @@ export class AskEdges {
   // `replacingMessageIds` names validated edges this add will retire after successful delivery.
   // Replacing active edges preserves global capacity, but preserves this asker's capacity only for
   // edges belonging to that asker. Reply-only authorizations do not affect active capacity.
-  canAdd(from: string, replacingMessageIds?: string | readonly string[]): AskEdgeCapacity {
+  canAdd(scopeId: string | undefined, from: string, replacingMessageIds?: string | readonly string[]): AskEdgeCapacity {
     const replacementIds = typeof replacingMessageIds === "string"
       ? [replacingMessageIds]
       : replacingMessageIds ?? [];
     const replaced = new Set<StoredAskEdge>();
     for (const messageId of replacementIds) {
-      const edge = this.edges.get(messageId);
+      const edge = this.edges.get(scopedMessageKey(scopeId, messageId));
       if (edge?.active) replaced.add(edge);
     }
     const replacedActiveCount = replaced.size;
@@ -123,11 +137,12 @@ export class AskEdges {
     return { ok: true };
   }
 
-  // Adds an edge, replacing any edge already stored under the same message id.
-  add(messageId: string, from: string, to: string, now = Date.now(), scopeId?: string): void {
-    this.delete(messageId);
+  // Adds an edge, replacing any edge already stored under the same scope and message id.
+  add(scopeId: string | undefined, messageId: string, from: string, to: string, now = Date.now()): void {
+    this.delete(scopeId, messageId);
     const key = pairKey(from, to);
-    this.edges.set(messageId, {
+    this.edges.set(scopedMessageKey(scopeId, messageId), {
+      messageId,
       from,
       to,
       ...(scopeId ? { scopeId } : {}),
@@ -141,15 +156,8 @@ export class AskEdges {
     this.increment(this.activeByPair, key);
   }
 
-  delete(messageId: string): boolean {
-    const edge = this.edges.get(messageId);
-    if (!edge) {
-      return false;
-    }
-    this.edges.delete(messageId);
-    if (edge.active) this.releaseActive(edge);
-    else this.replyOnlyCount -= 1;
-    return true;
+  delete(scopeId: string | undefined, messageId: string): boolean {
+    return this.deleteKey(scopedMessageKey(scopeId, messageId));
   }
 
   // Repoints an existing edge at a new target, keeping the pair index consistent.
@@ -157,8 +165,8 @@ export class AskEdges {
   // Mailbox redelivery can hand a queued ask to a different session than the one it was addressed
   // to (a reconnect under a new session id resolving to the same mailbox identity). Rewriting
   // `edge.to` directly would leave the pair counters describing the old target.
-  rekeyTarget(messageId: string, nextTo: string): boolean {
-    const edge = this.edges.get(messageId);
+  rekeyTarget(scopeId: string | undefined, messageId: string, nextTo: string): boolean {
+    const edge = this.edges.get(scopedMessageKey(scopeId, messageId));
     if (!edge || edge.to === nextTo) {
       return false;
     }
@@ -173,11 +181,11 @@ export class AskEdges {
   //
   // `excludingMessageId` omits one edge from consideration, so replying to an ask does not count
   // that same ask as the blocking reverse edge.
-  hasReverse(from: string, to: string, excludingMessageId?: string): boolean {
+  hasReverse(scopeId: string | undefined, from: string, to: string, excludingMessageId?: string): boolean {
     const reverse = pairKey(to, from);
     let count = this.activeByPair.get(reverse) ?? 0;
     if (excludingMessageId !== undefined) {
-      const excluded = this.edges.get(excludingMessageId);
+      const excluded = this.edges.get(scopedMessageKey(scopeId, excludingMessageId));
       if (excluded?.active && excluded.pairKey === reverse) {
         count -= 1;
       }
@@ -190,10 +198,12 @@ export class AskEdges {
   // records can be removed without scanning their directory on every send.
   expireActiveOlderThan(maxAgeMs: number, now = Date.now()): AskEdgeRemoval[] {
     const expired: AskEdgeRemoval[] = [];
-    for (const [messageId, edge] of this.edges) {
+    const reported = new Set<string>();
+    for (const [key, edge] of this.edges) {
       if (edge.active && now - edge.createdAt > maxAgeMs) {
         this.deactivate(edge);
-        expired.push({ messageId, ...(edge.scopeId ? { scopeId: edge.scopeId } : {}) });
+        reported.add(key);
+        expired.push(removalOf(edge));
       }
     }
     if (this.replyOnlyCount <= this.maxReplyOnly) return expired;
@@ -201,12 +211,12 @@ export class AskEdges {
     const replyOnly = Array.from(this.edges.entries())
       .filter(([, edge]) => !edge.active)
       .sort(([, left], [, right]) => left.createdAt - right.createdAt || left.insertionOrder - right.insertionOrder);
-    for (const [messageId, edge] of replyOnly) {
+    for (const [key, edge] of replyOnly) {
       if (this.replyOnlyCount <= this.maxReplyOnly) break;
-      const scopeId = edge.scopeId;
-      this.delete(messageId);
-      if (!expired.some((entry) => entry.messageId === messageId)) {
-        expired.push({ messageId, ...(scopeId ? { scopeId } : {}) });
+      const removal = removalOf(edge);
+      this.deleteKey(key);
+      if (!reported.has(key)) {
+        expired.push(removal);
       }
     }
     return expired;
@@ -214,9 +224,9 @@ export class AskEdges {
 
   // Drops reply authorization older than `maxAgeMs`.
   pruneOlderThan(maxAgeMs: number, now = Date.now()): void {
-    for (const [messageId, edge] of this.edges) {
+    for (const [key, edge] of this.edges) {
       if (now - edge.createdAt > maxAgeMs) {
-        this.delete(messageId);
+        this.deleteKey(key);
       }
     }
   }
@@ -224,11 +234,11 @@ export class AskEdges {
   // Drops every edge where `sessionKey` is either party and returns their message IDs.
   deleteForSession(sessionKey: string): AskEdgeRemoval[] {
     const deleted: AskEdgeRemoval[] = [];
-    for (const [messageId, edge] of this.edges) {
+    for (const [key, edge] of this.edges) {
       if (edge.from === sessionKey || edge.to === sessionKey) {
-        const scopeId = edge.scopeId;
-        this.delete(messageId);
-        deleted.push({ messageId, ...(scopeId ? { scopeId } : {}) });
+        const removal = removalOf(edge);
+        this.deleteKey(key);
+        deleted.push(removal);
       }
     }
     return deleted;
@@ -240,6 +250,17 @@ export class AskEdges {
     this.activeByPair.clear();
     this.activeCount = 0;
     this.replyOnlyCount = 0;
+  }
+
+  private deleteKey(key: string): boolean {
+    const edge = this.edges.get(key);
+    if (!edge) {
+      return false;
+    }
+    this.edges.delete(key);
+    if (edge.active) this.releaseActive(edge);
+    else this.replyOnlyCount -= 1;
+    return true;
   }
 
   private deactivate(edge: StoredAskEdge): void {
