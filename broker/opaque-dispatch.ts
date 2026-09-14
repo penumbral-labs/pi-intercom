@@ -22,11 +22,9 @@ const OPAQUE_CONSUMER_REASONS = new Set<OpaqueDispatchReason>([
 
 export interface OpaqueEndpoint {
   sessionId: string;
-  /**
-   * Routing scope the endpoint registered under (`PI_INTERCOM_SCOPE_ID`), absent for the default
-   * unscoped space. Session IDs are only unique within a scope — a stable ID reused in two scopes
-   * yields the same ID — so every dispatch identity comparison pairs the ID with this scope.
-   */
+  // Routing scope the endpoint registered under (`PI_INTERCOM_SCOPE_ID`), absent for the default
+  // unscoped space. Session IDs are only unique within a scope — a stable ID reused in two scopes
+  // yields the same ID — so every dispatch identity comparison pairs the ID with this scope.
   scopeId?: string;
   endpointEpoch: string;
   info: SessionInfo;
@@ -83,7 +81,7 @@ interface Reservation {
 interface RecordState {
   key: string;
   digest: string;
-  /** Scope shared by origin and target; a dispatch never crosses a scope boundary. */
+  // Scope shared by origin and target; a dispatch never crosses a scope boundary.
   scopeId?: string;
   originSessionId: string;
   senderNamespace: string;

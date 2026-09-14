@@ -1370,10 +1370,8 @@ class IntercomBroker {
     return true;
   }
 
-  /**
-   * Resolves an opaque dispatch endpoint inside one routing scope. An out-of-scope session ID
-   * resolves to `undefined`, so reservations, claims, and receipts cannot cross a scope boundary.
-   */
+  // Resolves an opaque dispatch endpoint inside one routing scope. An out-of-scope session ID
+  // resolves to `undefined`, so reservations, claims, and receipts cannot cross a scope boundary.
   private opaqueEndpoint(sessionId: string, scopeId: string | undefined): OpaqueEndpoint | undefined {
     this.pruneDisconnectedSessions();
     const sessionKey = scopedSessionKey(scopeId, sessionId);
