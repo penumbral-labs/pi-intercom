@@ -176,16 +176,18 @@ function hasRole(endpoint: OpaqueEndpoint | undefined, namespace: string, role: 
     && extension.opaqueDispatch?.version === 1 && extension.opaqueDispatch.roles.includes(role)));
 }
 
-function scopedSessionId(scopeId: string | undefined, sessionId: string): string {
+// Broker and opaque dispatch must key sessions identically or a scoped record can resolve to the
+// wrong live endpoint, so both import this one builder.
+export function scopedSessionKey(scopeId: string | undefined, sessionId: string): string {
   return JSON.stringify([scopeId ?? null, sessionId]);
 }
 
 function principalKey(scopeId: string | undefined, sessionId: string, namespace: string): string {
-  return `${scopedSessionId(scopeId, sessionId)}\0${namespace}`;
+  return `${scopedSessionKey(scopeId, sessionId)}\0${namespace}`;
 }
 
 function targetKey(scopeId: string | undefined, sessionId: string, namespace: string): string {
-  return `${scopedSessionId(scopeId, sessionId)}\0${namespace}`;
+  return `${scopedSessionKey(scopeId, sessionId)}\0${namespace}`;
 }
 
 function isRecordOrigin(record: RecordState, endpoint: OpaqueEndpoint): boolean {
@@ -333,7 +335,7 @@ export class OpaqueDispatchManager {
     if (origin.sessionId === frame.toSessionId) return void reject("self_dispatch_unsupported");
     const canonical = canonicalizeOpaquePayload(frame.payload);
     if (!canonical.ok) return void reject(canonical.code);
-    const key = `${scopedSessionId(origin.scopeId, origin.sessionId)}\0${frame.senderNamespace}\0${frame.requestId}`;
+    const key = `${scopedSessionKey(origin.scopeId, origin.sessionId)}\0${frame.senderNamespace}\0${frame.requestId}`;
     const digest = fingerprint(canonical.json, frame.toSessionId, frame.recipientNamespace, frame.supersedesMessageId);
     const existing = this.records.get(key);
     if (existing) {

@@ -23,15 +23,13 @@ import { STALE_ASK_RETENTION_MS } from "../config.ts";
 export interface AskEdge {
   readonly from: string;
   readonly to: string;
-  /** Routing scope both parties registered under, absent for the default unscoped routing space. */
+  // Routing scope both parties registered under; absent for the default unscoped routing space.
   readonly scopeId?: string;
   readonly createdAt: number;
 }
 
-/**
- * An edge that left the map, with the scope needed to locate its durable pending-ask record.
- * Bulk removals can span scopes, so the scope cannot be supplied by the caller.
- */
+// An edge that left the map, with the scope needed to locate its durable pending-ask record.
+// Bulk removals can span scopes, so the scope cannot be supplied by the caller.
 export interface AskEdgeRemoval {
   readonly messageId: string;
   readonly scopeId?: string;

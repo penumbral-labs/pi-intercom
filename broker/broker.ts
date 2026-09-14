@@ -54,7 +54,7 @@ import type {
 } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
-import { OpaqueDispatchManager, writeOpaqueTo, type OpaqueEndpoint } from "./opaque-dispatch.ts";
+import { OpaqueDispatchManager, scopedSessionKey, writeOpaqueTo, type OpaqueEndpoint } from "./opaque-dispatch.ts";
 import { pruneDisconnectedSessions } from "./disconnected-sessions.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
@@ -191,10 +191,6 @@ function normalizeScopeId(value: unknown): string | undefined {
 
 function sameScope(a: string | undefined, b: string | undefined): boolean {
   return a === b;
-}
-
-function scopedSessionKey(scopeId: string | undefined, sessionId: string): string {
-  return JSON.stringify([scopeId ?? null, sessionId]);
 }
 
 function scopedExtensionKey(scopeId: string | undefined, namespace: string): string {
