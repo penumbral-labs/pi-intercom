@@ -1,0 +1,49 @@
+import { STALE_ASK_RETENTION_MS } from "./config.ts";
+
+export type StaleAskTier = "cancelled" | "superseded" | "timed_out";
+
+interface StaleAskEntry {
+  sessionId: string;
+  tier: StaleAskTier;
+  recordedAt: number;
+}
+
+export const MAX_STALE_ASKS = 256;
+export { STALE_ASK_RETENTION_MS };
+
+export class StaleAsks {
+  private entries = new Map<string, StaleAskEntry>();
+
+  record(messageId: string, sessionId: string, tier: StaleAskTier, now = Date.now()): void {
+    this.prune(now);
+    this.entries.delete(messageId);
+    this.entries.set(messageId, { sessionId, tier, recordedAt: now });
+    while (this.entries.size > MAX_STALE_ASKS) {
+      const oldest = this.entries.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.entries.delete(oldest);
+    }
+  }
+
+  classify(messageId: string, sessionId: string, now = Date.now()): StaleAskTier | undefined {
+    this.prune(now);
+    const entry = this.entries.get(messageId);
+    return entry?.sessionId === sessionId ? entry.tier : undefined;
+  }
+
+  delete(messageId: string): void {
+    this.entries.delete(messageId);
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  private prune(now: number): void {
+    for (const [messageId, entry] of this.entries) {
+      if (now - entry.recordedAt > STALE_ASK_RETENTION_MS) {
+        this.entries.delete(messageId);
+      }
+    }
+  }
+}

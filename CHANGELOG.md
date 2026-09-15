@@ -4,6 +4,76 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+
+- Added bounded opaque dispatch with exact session/namespace routing, synchronous reservation, durable claim reconciliation, typed receipts, and broker-mediated payload custody.
+- Exposed broker-owned endpoint epochs to registered clients, opaque offers, and peer capability results.
+
+### Changed
+
+- Clients now advertise atomic supersede support. The broker sends one combined control-and-message frame to capable clients and preserves the established two-frame wire shape for older clients.
+- The documented 1 MiB message ceiling now explicitly covers the full broker-enriched wire frame, so authored content must leave room for routing, timestamp, and supersede metadata.
+- Late replies now follow the ask's abandonment reason: replies after cancellation or successful supersession by either `ask` or plain `send` are dropped, while replies after a plain timeout remain visible with a stale-reply warning. Timed-out asks no longer block reverse asks or consume active ask capacity, reply-only authorization is globally bounded with oldest-first eviction, and a rejected superseding delivery leaves the earlier ask live.
+- Opaque dispatch now retains temporary disconnected custody only long enough to report `mailbox_queued` followed by a deterministic `endpoint_epoch_changed` receipt on reconnect; every reconnect rotates the endpoint epoch and never transfers queued custody. Expired disconnected endpoints are pruned before capability lookup or send admission.
+- Opaque sends resolve endpoint epochs through the opaque capability channel and retry one admission-time `target_rebound` with the same idempotent request ID. A terminal endpoint-rotation result remains bound to that request ID for the tombstone lifetime, so sending work to the replacement endpoint requires a new request ID.
+- Opaque receipt acknowledgements are cumulative by sequence; reconnect replay includes only unacknowledged receipts. At global capacity, admission may evict the oldest queued record across principals with an `expired` / `limit_exceeded` receipt.
+
+### Fixed
+
+- Periodic pending-ask cleanup failures are contained and logged instead of terminating the broker, including benign per-entry disappearance races.
+- Replacement opaque offers abort the overwritten reservation with the neutral `stale_reservation` reason rather than implying that the dispatch was superseded.
+- Oversized session-list responses now reject only their correlated request through `sessions_failed` without disconnecting a healthy client or failing unrelated requests and liveness probes.
+- Mailbox deliveries that exceed the frame limit after broker metadata is added now terminalize with `E_DELIVERY_TOO_LARGE` instead of lingering for replay.
+- Oversized forwarded receipt details are replaced with a non-sensitive omission notice, or omitted entirely when needed, without leaking the original detail or disconnecting either peer.
+- Extension state commit outcomes are now fenced to the local registration generation that issued them, so a replacement registration cannot receive a disposed predecessor's result.
+- Lexically equivalent Windows agent-directory spellings now canonicalize to the same broker named-pipe path while agent directories that differ in component case remain isolated.
+- Pending ask edges are now keyed by routing scope and message ID, so a caller-controlled ask ID reused in another scope no longer collides with, replaces, or retires an unrelated scope's pending ask.
+- Message receipt and cancellation routes are now keyed by routing scope and message ID, so a same-ID send in another scope no longer misroutes the original receiver's receipts, blocks the original sender's cancellation, or lets one scope's mailbox expiry drop another scope's active route.
+
+### Reconciled
+
+- Reconciled with upstream v0.13.0. Absorbed scoped routing through `PI_INTERCOM_SCOPE_ID`, the consent-aware extension outbox API (`intercom:outbox-request` / `intercom:outbox-result`), the `/alias` command, the guard against non-reply `send` to a different target during an inbound-ask turn, the hardened Windows broker launcher, and upstream's removal of `toolVisibility` (the config key is still accepted and ignored, with no reveal path).
+- Scoped routing composes with opaque dispatch: reservations, claims, offers, receipts, peer-capability probes, and endpoint custody all resolve inside the sender's scope, so a scoped dispatch is invisible and unreachable from an out-of-scope session. Ask edges and durable pending-ask records carry the owning scope.
+- An exact-target `send` whose target is absent from the sender's scope now fails terminally with `E_TARGET_NOT_FOUND` instead of the retryable `E_TARGET_REBOUND`; `E_TARGET_REBOUND` is now reserved for a target that is present but has rotated its endpoint epoch.
+
+## [0.13.0] - 2026-09-02
+
+### Highlights
+- You can now give the current session a friendly alias from pi-intercom.
+- Aliases show up right away in the session list, messages, replies, overlays, and incoming-message displays.
+- Windows broker startup is more reliable with non-ASCII profile paths and stricter Windows Script Host setups.
+
+### Added
+- Added `/alias <name>` plus the interactive `/alias` and `/alias menu` forms for naming the current session. Thanks to [@yceachan](https://github.com/yceachan) for issue #122.
+
+### Fixed
+- Fixed hidden Windows broker startup when the user profile path contains non-ASCII characters or Windows Script Host cannot infer the VBScript engine. Thanks to [@maelo1028](https://github.com/maelo1028) for issue #121 and [@Agustin-Prieto](https://github.com/Agustin-Prieto) for issue #123.
+
+## [0.12.1] - 2026-08-29
+
+### Highlights
+- Replies to inbound asks are now harder to send to the wrong local session by mistake.
+- The `intercom` tool now stays in the active tool set, which avoids a late-session prompt-cache reset when intercom first becomes useful.
+- Existing configs that still mention `toolVisibility` keep loading; the old setting is simply ignored.
+
+### Fixed
+- Refuse non-reply `send` calls to a different target during a turn triggered by an inbound ask, preventing CWD hierarchy or roster guesses from misdirecting replies. Thanks to [@yceachan](https://github.com/yceachan) for issue #117.
+
+### Removed
+- Removed `toolVisibility` and the `after-first-use` reveal path. The generic `intercom` schema and prompt snippet now stay stable for provider prompt caches, and existing `toolVisibility` config keys are ignored. Thanks to [@XWIlluDelu](https://github.com/XWIlluDelu) for issue #118.
+
+## [0.12.0] - 2026-08-22
+
+### Highlights
+- Extensions can now ask pi-intercom to send a message through the current session without losing user consent, sender attribution, or delivery feedback.
+- Teams can isolate intercom traffic with `PI_INTERCOM_SCOPE_ID`, so unrelated sessions do not see or receive each other's scoped messages.
+- The generic `intercom` tool can stay hidden until it is first useful, keeping quiet sessions less cluttered.
+
+### Added
+- Added a consent-aware extension outbox API with `intercom:outbox-request` and `intercom:outbox-result` events for notify-only same-process extension sends. Outbox sends honor `confirmSend`, always return a terminal result for valid request IDs, use scoped target resolution, and leave attributed sender-side transcript traces. Thanks to [@elecnix](https://github.com/elecnix) for #110.
+- Added opt-in broker-enforced routing scopes through `PI_INTERCOM_SCOPE_ID`. Scoped sessions only see, route, recover mailbox messages, receive presence events, and use extension-bus owner, publish, and state traffic with sessions in the exact same opaque scope. Unscoped sessions keep existing behavior. Thanks to [@YeungKC](https://github.com/YeungKC) for issue #112.
+- Added opt-in `after-first-use` visibility for the generic `intercom` tool, keeping its model schema and prompt out of unused sessions until an inbound message, overlay send, or bundled skill load reveals it. Broker reception and the child-only `contact_supervisor` tool remain available while it is hidden. Thanks to [@XWIlluDelu](https://github.com/XWIlluDelu) for PR #111.
+
 ## [0.11.0] - 2026-08-19
 
 ### Highlights

@@ -1,5 +1,6 @@
-import { chmodSync, mkdirSync, readFileSync } from "fs";
-import { isAbsolute, join, resolve } from "path";
+import { createHash } from "crypto";
+import { chmodSync, mkdirSync, readFileSync, realpathSync } from "fs";
+import { isAbsolute, join, resolve, win32 } from "path";
 import { homedir } from "os";
 
 export const INTERCOM_DIR_MODE = 0o700;
@@ -16,6 +17,30 @@ export interface BrokerTcpEndpoint {
 }
 
 export type BrokerConnectTarget = string | BrokerTcpEndpoint;
+
+// Canonical Windows spelling used for both the readable pipe segment and its collision-resistant
+// suffix. On Windows, realpath adopts the filesystem's canonical component spelling: ordinary
+// case-insensitive aliases converge while per-directory case-sensitive names remain distinct.
+// Explicit win32 lexical fallback keeps missing paths and cross-platform callers deterministic.
+function normalizeWindowsAgentDir(agentDir: string, platform: NodeJS.Platform = process.platform): string {
+  let canonicalInput = agentDir;
+  if (platform === "win32") {
+    try {
+      canonicalInput = realpathSync.native(agentDir);
+    } catch {
+      // The agent directory may not have been created yet; lexical normalization remains stable.
+    }
+  }
+  const normalized = win32.normalize(canonicalInput);
+  const root = win32.parse(normalized).root;
+  const canonical = root.toLowerCase() + normalized.slice(root.length);
+  return canonical.length > root.length ? canonical.replace(/[\\/]+$/, "") : canonical;
+}
+
+function pipeAgentDirHash(normalizedAgentDir: string): string {
+  // Hex is a Windows-valid pipe token; do not expose the drive-letter colon in the identity suffix.
+  return createHash("sha256").update(normalizedAgentDir).digest("hex").slice(0, 16);
+}
 
 function sanitizePipeSegment(value: string): string {
   return value
@@ -67,7 +92,9 @@ export function getBrokerSocketPath(
   agentDir: string = getAgentDirPath(),
 ): string {
   if (platform === "win32") {
-    return `\\\\.\\pipe\\pi-intercom-${sanitizePipeSegment(agentDir)}`;
+    const normalizedAgentDir = normalizeWindowsAgentDir(agentDir, platform);
+    const readable = sanitizePipeSegment(normalizedAgentDir).slice(0, 128).replace(/-+$/, "") || "default";
+    return `\\\\.\\pipe\\pi-intercom-${readable}-${pipeAgentDirHash(normalizedAgentDir)}`;
   }
 
   return join(getIntercomDirPath(agentDir), "broker.sock");

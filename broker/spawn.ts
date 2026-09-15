@@ -120,13 +120,13 @@ export function isBrokerHealthOkMessage(message: unknown, requestId: string): bo
     && response.version === INTERCOM_PROTOCOL_VERSION;
 }
 
-function writeWindowsHiddenLauncher(
+export function writeWindowsHiddenLauncher(
   commandLine: string,
   launcherPath: string = getWindowsHiddenLauncherPath(),
 ): string {
   ensureIntercomRuntimeDir(dirname(launcherPath));
-  writeFileSync(launcherPath, getWindowsHiddenLauncherScript(commandLine), {
-    encoding: "utf-8",
+  writeFileSync(launcherPath, `\uFEFF${getWindowsHiddenLauncherScript(commandLine)}`, {
+    encoding: "utf16le",
     mode: INTERCOM_RUNTIME_FILE_MODE,
   });
   restrictIntercomRuntimeFile(launcherPath);
@@ -147,7 +147,7 @@ export function getBrokerLaunchSpec(
     return {
       kind: "windows-launcher",
       command: "wscript.exe",
-      args: [launcherPath],
+      args: ["//E:VBScript", launcherPath],
       launcherPath,
       launcherCommandLine: getWindowsBrokerCommandLine(brokerPath, extensionDir, nodePath, brokerCommand, brokerArgs),
       captureStartupStderr: false,
@@ -229,7 +229,8 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
       return cause === undefined ? new Error(errorMessage) : new Error(errorMessage, { cause });
     };
     child.stderr?.on("data", rememberBrokerStderr);
-    child.stderr?.unref();
+    const startupStderr = child.stderr as (typeof child.stderr & { unref?: () => void }) | null;
+    startupStderr?.unref?.();
     child.unref();
 
     await new Promise<void>((resolve, reject) => {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -38,9 +38,10 @@ test("getIntercomDirPath points at the intercom runtime directory under the agen
   assert.equal(getIntercomDirPath("/tmp/pi-agent"), join("/tmp/pi-agent", "intercom"));
 });
 
-test("getBrokerSocketPath uses named pipe on Windows", () => {
+test("getBrokerSocketPath uses a Windows-safe named-pipe token", () => {
   const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh/.pi/agent");
   assert.match(pipePath, /^\\\\\.\\pipe\\pi-intercom-/);
+  assert.doesNotMatch(pipePath.slice("\\\\.\\pipe\\".length), /[<>:"/\\|?*]/);
   assert.doesNotMatch(pipePath, /broker\.sock$/);
 });
 
@@ -149,4 +150,83 @@ test("runtime permission helpers skip chmod on Windows paths", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("getBrokerSocketPath suffixes the Windows pipe with a safe normalized-input token", () => {
+  const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh/.pi/agent");
+  assert.match(pipePath, /^\\\\\.\\pipe\\pi-intercom-.*-[0-9a-f]{16}$/);
+});
+
+test("getBrokerSocketPath distinguishes agent dirs that sanitize to the same segment", () => {
+  // Both inputs sanitize to "c-a-b", so only the hash separates them.
+  const first = getBrokerSocketPath("win32", "C:/a/b");
+  const second = getBrokerSocketPath("win32", "C:/a-b");
+  assert.match(first, /pi-intercom-c-a-b-[0-9a-f]{16}$/);
+  assert.match(second, /pi-intercom-c-a-b-[0-9a-f]{16}$/);
+  assert.notEqual(first, second);
+});
+
+test("getBrokerSocketPath applies lexical Windows path equivalence cross-platform", () => {
+  const canonical = getBrokerSocketPath("win32", "C:/a/b");
+  assert.equal(canonical, getBrokerSocketPath("win32", "C:\\a\\b"));
+  assert.equal(canonical, getBrokerSocketPath("win32", "C:\\a\\.\\x\\..\\b\\"));
+});
+
+test("getBrokerSocketPath canonicalizes Windows drive-letter case", () => {
+  assert.equal(
+    getBrokerSocketPath("win32", "C:\\work\\Agent"),
+    getBrokerSocketPath("win32", "c:\\work\\Agent"),
+  );
+});
+
+test("getBrokerSocketPath canonicalizes UNC server and share case", () => {
+  assert.equal(
+    getBrokerSocketPath("win32", "\\\\Server\\Share\\work\\Agent"),
+    getBrokerSocketPath("win32", "\\\\server\\share\\work\\Agent"),
+  );
+});
+
+test("getBrokerSocketPath uses filesystem-canonical component case on Windows", () => {
+  const originalNative = realpathSync.native;
+  realpathSync.native = ((path: Parameters<typeof realpathSync.native>[0]) => String(path).toLowerCase()) as typeof realpathSync.native;
+  try {
+    assert.equal(
+      getBrokerSocketPath("win32", "C:\\work\\Agent"),
+      getBrokerSocketPath("win32", "c:\\WORK\\agent"),
+    );
+  } finally {
+    realpathSync.native = originalNative;
+  }
+});
+
+test("getBrokerSocketPath preserves case-sensitive Windows path component identity", () => {
+  const originalNative = realpathSync.native;
+  realpathSync.native = ((path: Parameters<typeof realpathSync.native>[0]) => String(path)) as typeof realpathSync.native;
+  try {
+    assert.notEqual(
+      getBrokerSocketPath("win32", "C:\\work\\Agent"),
+      getBrokerSocketPath("win32", "C:\\work\\agent"),
+    );
+    assert.notEqual(
+      getBrokerSocketPath("win32", "\\\\server\\share\\work\\Agent"),
+      getBrokerSocketPath("win32", "\\\\server\\share\\work\\agent"),
+    );
+  } finally {
+    realpathSync.native = originalNative;
+  }
+});
+
+test("getBrokerSocketPath bounds deep Windows agent directories", () => {
+  const pipePath = getBrokerSocketPath("win32", `C:\\${"deep-segment\\".repeat(40)}agent`);
+  assert.ok(pipePath.length <= 256, `named-pipe path must fit Windows limits, got ${pipePath.length}`);
+  assert.match(pipePath, /-[0-9a-f]{16}$/);
+});
+
+test("getBrokerSocketPath preserves distinct Windows paths after normalization", () => {
+  assert.notEqual(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "C:/a/c"));
+  assert.notEqual(getBrokerSocketPath("win32", "C:/a/b"), getBrokerSocketPath("win32", "D:/a/b"));
+  assert.notEqual(
+    getBrokerSocketPath("win32", "\\\\server-a\\share\\agent"),
+    getBrokerSocketPath("win32", "\\\\server-b\\share\\agent"),
+  );
 });

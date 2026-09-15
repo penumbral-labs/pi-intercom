@@ -8,6 +8,7 @@ import {
   resolveTargetInCwd,
   waitForProjectSession,
   type HerdrClient,
+  type HerdrResult,
 } from "./project-agent.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -75,11 +76,15 @@ test("openProjectPane opens a Herdr pane and runs pi in the project", async () =
   mkdirSync(project);
   const calls: string[][] = [];
   const client: HerdrClient = {
-    async run(args) {
+    // Matches HerdrClient.run's generic signature. The production caller fixes T per call site
+    // (string for --version, a pane shape for pane split), so the fixture yields its canned value
+    // as that T rather than widening the interface.
+    async run<T = unknown>(args: string[]): Promise<HerdrResult<T>> {
       calls.push(args);
-      if (args[0] === "--version") return { ok: true, data: "herdr 0.7.5" };
-      if (args[0] === "pane" && args[1] === "split") return { ok: true, data: { pane: { id: "pane-1" } } };
-      if (args[0] === "pane" && args[1] === "run") return { ok: true, data: {} };
+      const ok = (data: unknown): HerdrResult<T> => ({ ok: true, data: data as T });
+      if (args[0] === "--version") return ok("herdr 0.7.5");
+      if (args[0] === "pane" && args[1] === "split") return ok({ pane: { id: "pane-1" } });
+      if (args[0] === "pane" && args[1] === "run") return ok({});
       return { ok: false, error: { code: "VALIDATION_ERROR", message: `unexpected ${args.join(" ")}` } };
     },
   };

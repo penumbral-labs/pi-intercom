@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createMessageReader, writeMessage } from "./framing.ts";
+import {
+  createMessageReader,
+  writeMessage,
+  writeMessages,
+  validateFrameBytes,
+  MAX_FRAME_BYTES,
+  IntercomFrameTooLargeError,
+} from "./framing.ts";
 
 function framePayload(payload: Buffer): Buffer {
   const header = Buffer.alloc(4);
@@ -111,4 +118,152 @@ test("writeMessage emits frames accepted by createMessageReader", () => {
   reader(Buffer.concat(chunks));
 
   assert.deepEqual(messages, [{ ok: true }]);
+});
+
+test("writeMessage refuses an oversized frame before writing any bytes", () => {
+  const chunks: Buffer[] = [];
+  const socket = { write: (chunk: Buffer) => { chunks.push(chunk); return true; } };
+  const envelope = Buffer.byteLength(JSON.stringify({ text: "" }), "utf-8");
+  const tooLarge = "x".repeat(MAX_FRAME_BYTES - envelope + 1);
+
+  assert.throws(
+    () => writeMessage(socket as never, { text: tooLarge }),
+    (error: unknown) => error instanceof IntercomFrameTooLargeError && error.length === MAX_FRAME_BYTES + 1,
+  );
+  assert.deepEqual(chunks, [], "no partial frame may reach the socket");
+});
+
+test("writeMessage still writes a frame exactly at the cap", () => {
+  const chunks: Buffer[] = [];
+  const socket = { write: (chunk: Buffer) => { chunks.push(chunk); return true; } };
+  const envelope = Buffer.byteLength(JSON.stringify({ text: "" }), "utf-8");
+  const exact = "x".repeat(MAX_FRAME_BYTES - envelope);
+
+  writeMessage(socket as never, { text: exact });
+
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0]!.readUInt32BE(0), MAX_FRAME_BYTES);
+  assert.equal(chunks[0]!.length, 4 + MAX_FRAME_BYTES);
+});
+
+// A socket stand-in that records every write, so "zero bytes written" is directly observable.
+function recordingSocket() {
+  const writes: Buffer[] = [];
+  return {
+    writes,
+    socket: {
+      write(chunk: Buffer) {
+        writes.push(Buffer.from(chunk));
+        return true;
+      },
+    } as unknown as import("net").Socket,
+  };
+}
+
+function frameBytes(payloadLength: number, declaredLength = payloadLength): Buffer {
+  const buf = Buffer.alloc(4 + payloadLength, 0x61);
+  buf.writeUInt32BE(declaredLength, 0);
+  return buf;
+}
+
+test("validateFrameBytes rejects a declared length above the cap", () => {
+  assert.throws(
+    () => validateFrameBytes(frameBytes(16, MAX_FRAME_BYTES + 1)),
+    (error: unknown) => error instanceof IntercomFrameTooLargeError && error.length === MAX_FRAME_BYTES + 1,
+  );
+});
+
+test("validateFrameBytes rejects a forged small header over a large body", () => {
+  // Header claims 8 bytes; the buffer actually carries 4096. A writer trusting the header would
+  // emit the whole body, and the peer would read the surplus as the start of the next frame.
+  assert.throws(() => validateFrameBytes(frameBytes(4096, 8)), /declares 8 bytes but buffer carries 4096/);
+});
+
+test("validateFrameBytes rejects a truncated body", () => {
+  assert.throws(() => validateFrameBytes(frameBytes(16, 64)), /declares 64 bytes but buffer carries 16/);
+});
+
+test("validateFrameBytes rejects a buffer too short to hold a header", () => {
+  assert.throws(() => validateFrameBytes(Buffer.alloc(3)), /truncated/);
+});
+
+test("validateFrameBytes accepts a frame exactly at the cap", () => {
+  assert.doesNotThrow(() => validateFrameBytes(frameBytes(MAX_FRAME_BYTES)));
+});
+
+test("an oversize message writes zero bytes", () => {
+  const { writes, socket } = recordingSocket();
+  assert.throws(
+    () => writeMessage(socket, { padding: "x".repeat(MAX_FRAME_BYTES) }),
+    IntercomFrameTooLargeError,
+  );
+  assert.equal(writes.length, 0, "no write may occur when encoding fails");
+});
+
+test("writeMessages emits ordinary messages in order as one unit", () => {
+  const { writes, socket } = recordingSocket();
+  writeMessages(socket, { seq: 1 }, { seq: 2 });
+  assert.equal(writes.length, 2);
+  const decode = (buf: Buffer) => JSON.parse(buf.subarray(4).toString("utf-8"));
+  assert.deepEqual(decode(writes[0]!), { seq: 1 });
+  assert.deepEqual(decode(writes[1]!), { seq: 2 });
+});
+
+test("framing exports no raw or structural frame capability", async () => {
+  const framing = await import("./framing.ts");
+  for (const name of ["writeFrame", "writeEncodedFrames", "encodeFrame", "EncodedFrame"]) {
+    assert.equal(name in framing, false, `${name} must not be exported`);
+  }
+  const exported = Object.keys(framing).filter((key) => /^write/.test(key)).sort();
+  assert.deepEqual(exported, ["writeMessage", "writeMessages"]);
+});
+
+test("plain objects cannot forge frames through the ordinary-message sink", () => {
+  const { writes, socket } = recordingSocket();
+  const forgedBytes = frameBytes(16, MAX_FRAME_BYTES + 1);
+  writeMessages(socket, { toValidatedBytes: () => forgedBytes });
+
+  assert.equal(writes.length, 1);
+  assert.notDeepEqual(writes[0], forgedBytes);
+  assert.deepEqual(JSON.parse(writes[0]!.subarray(4).toString("utf-8")), {});
+});
+
+test("runtime constructors cannot mint writable frames", async () => {
+  const framing = await import("./framing.ts");
+  assert.equal((framing as Record<string, unknown>).EncodedFrame, undefined);
+  assert.equal((framing as Record<string, unknown>).encodeFrame, undefined);
+});
+
+test("subclasses cannot override frame bytes through the ordinary-message sink", () => {
+  const { writes, socket } = recordingSocket();
+  const forgedBytes = frameBytes(16, MAX_FRAME_BYTES + 1);
+  class ForgedFrame {
+    toValidatedBytes(): Buffer {
+      return forgedBytes;
+    }
+  }
+
+  writeMessages(socket, new ForgedFrame());
+
+  assert.equal(writes.length, 1);
+  assert.notDeepEqual(writes[0], forgedBytes);
+  assert.deepEqual(JSON.parse(writes[0]!.subarray(4).toString("utf-8")), {});
+});
+
+test("an oversized second message causes zero writes", () => {
+  const { writes, socket } = recordingSocket();
+  assert.throws(
+    () => writeMessages(socket, { seq: 1 }, { padding: "x".repeat(MAX_FRAME_BYTES) }),
+    IntercomFrameTooLargeError,
+  );
+  assert.equal(writes.length, 0, "a valid leading message must not be written when a later message is oversized");
+});
+
+test("a malformed second message causes zero writes", () => {
+  const { writes, socket } = recordingSocket();
+  const circular: { self?: unknown } = {};
+  circular.self = circular;
+
+  assert.throws(() => writeMessages(socket, { seq: 1 }, circular), TypeError);
+  assert.equal(writes.length, 0, "a valid leading message must not be written when a later message cannot encode");
 });

@@ -1,18 +1,73 @@
 import type { Socket } from "net";
 
-const MAX_FRAME_BYTES = 1024 * 1024;
+export const MAX_FRAME_BYTES = 1024 * 1024;
 
 /**
- * Write a length-prefixed message to a socket.
- * Format: 4-byte big-endian length + JSON payload
+ * Thrown by writeMessage when an encoded frame would exceed the wire cap.
+ *
+ * Distinguishable so callers can contain an oversize frame at the specific write site
+ * instead of letting it reach the peer, whose reader would reject the length prefix and
+ * tear down an otherwise healthy connection.
  */
-export function writeMessage(socket: Socket, msg: unknown): void {
+export class IntercomFrameTooLargeError extends Error {
+  constructor(readonly length: number, readonly maxFrameBytes: number = MAX_FRAME_BYTES) {
+    super(`Intercom frame length ${length} exceeds maximum ${maxFrameBytes} bytes`);
+    this.name = "IntercomFrameTooLargeError";
+  }
+}
+
+// Validate that a buffer really is one whole legal frame: a 4-byte header, a declared length
+// within the cap, and a body of exactly that length with nothing trailing. Pure, so it can be
+// tested directly and reused without granting any ability to write.
+//
+// Exported as a predicate rather than as part of a writer on purpose. A validator cannot be
+// used to put bytes on a socket, so exposing it opens no bypass of the frame cap.
+export function validateFrameBytes(bytes: Buffer): void {
+  if (bytes.length < 4) {
+    throw new Error(`Intercom frame is truncated: ${bytes.length} bytes cannot contain a length header`);
+  }
+  const declaredLength = bytes.readUInt32BE(0);
+  if (declaredLength > MAX_FRAME_BYTES) {
+    throw new IntercomFrameTooLargeError(declaredLength);
+  }
+  if (bytes.length !== 4 + declaredLength) {
+    throw new Error(
+      `Intercom frame header declares ${declaredLength} bytes but buffer carries ${bytes.length - 4}`,
+    );
+  }
+}
+
+// Encode one ordinary message into a complete length-prefixed frame without exposing the frame.
+// Format: 4-byte big-endian length + JSON payload.
+function encodeFrameBytes(msg: unknown): Buffer {
   const json = JSON.stringify(msg);
   const payloadLength = Buffer.byteLength(json, "utf-8");
+  if (payloadLength > MAX_FRAME_BYTES) {
+    throw new IntercomFrameTooLargeError(payloadLength);
+  }
   const frame = Buffer.allocUnsafe(4 + payloadLength);
   frame.writeUInt32BE(payloadLength, 0);
   frame.write(json, 4, payloadLength, "utf-8");
-  socket.write(frame);
+  validateFrameBytes(frame);
+  return frame;
+}
+
+// Encode and validate every ordinary message before writing the first frame. Keeping encoded
+// buffers private means callers cannot supply raw or structurally forged frames, and a bad later
+// message leaves the socket untouched rather than emitting a partial sequence.
+export function writeMessages(socket: Socket, ...messages: unknown[]): void {
+  const frames = messages.map(encodeFrameBytes);
+  for (const frame of frames) {
+    socket.write(frame);
+  }
+}
+
+// Write one length-prefixed message to a socket.
+//
+// Throws IntercomFrameTooLargeError before writing any bytes when the payload exceeds
+// MAX_FRAME_BYTES, so a partial frame is never emitted.
+export function writeMessage(socket: Socket, msg: unknown): void {
+  writeMessages(socket, msg);
 }
 
 /**
